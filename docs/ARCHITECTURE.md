@@ -128,11 +128,27 @@ cannot do (single-GPU-era allocator assumptions; see ENGINE.md §6 autopsy).
 ggml-cuda supports graph capture; tandem's fixed-shape decode step is designed
 to stay capture-legal (no shape churn on the hot path).
 
-**Multi-GPU split.** Start exactly like prod: row/tensor split 50/50 via
-ggml_backend_sched, NCCL-free, `NCCL_P2P_DISABLE` semantics respected
-(host-bounce transfers; PHB topology). Only after M3 parity: profile the
-all-reduce and consider a pipelined host-bounce replacement. NVLink is a
-user-hardware lever, not a software assumption.
+**Multi-GPU.** Two modes, both implemented:
+
+- *Layer split* (`Device::CudaSplit`): contiguous layer ranges per device,
+  ggml_backend_sched moves activations. Simple and correct; makes the 27B
+  runnable. Slow, because the GPUs alternate rather than share each token.
+- *Tensor parallel* (`Device::CudaTensorParallel`): ggml's meta device wraps
+  both GPUs and presents one backend, so tandem keeps its fast path while
+  every matrix is sliced. This is prod's `-sm tensor`. tandem supplies the
+  split classification (`split.rs`, unit-tested offline against the real 27B
+  shapes) and ggml inserts the all-reduce.
+
+The user owns **no NVLink bridge**, and GeForce P2P is driver-disabled, so
+all inter-GPU traffic is PCIe host-bounce — permanently. Design accordingly:
+prefer one reduction per split point over per-layer activation handoff, and
+never assume peer memory.
+
+Two constraints the meta backend imposes on graph construction, learned on
+hardware: a split tensor's per-device extents must sum exactly to its own
+extent (it asserts), and it cannot map a split axis through a
+stride-reordered view — so cache reads are built with monotonically
+increasing strides and then permuted, never viewed into permuted form.
 
 ## 6. Later, surgical kernel work (only after profiles demand it)
 
