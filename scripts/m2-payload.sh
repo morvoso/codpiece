@@ -46,7 +46,7 @@ done
 for r in 1 2; do
   echo "-- oracle rep $r"
   oracle -m "$MODEL_C" -p "The capital of France is" -n 256 --temp 0 -ngl 999 \
-    --no-warmup --ignore-eos --no-display-prompt 2>&1 >/dev/null \
+    -fa on --no-warmup --ignore-eos --no-display-prompt 2>&1 >/dev/null \
     | grep -E "prompt eval time|[^a-z]eval time"
 done
 

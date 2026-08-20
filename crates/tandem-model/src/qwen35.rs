@@ -218,6 +218,23 @@ struct CachedStep {
     galloc: ffi::ggml_gallocr_t,
     bucket: i64,
     greedy: bool,
+    /// Host staging buffers, owned for the graph's lifetime: async uploads
+    /// must not reference stack temporaries.
+    host: HostStaging,
+}
+
+/// Per-step input staging. Reused every decode step (no per-token allocation)
+/// and stable in memory so ggml_backend_tensor_set_async is sound.
+struct HostStaging {
+    tokens: Vec<i32>,
+    pos: Vec<i32>,
+    mask_f16: Vec<u16>,
+    row_ids: Vec<i64>,
+    /// how many leading mask cells are already visible (0.0); the rest are
+    /// -inf, so each step only needs to flip the newest cell
+    mask_visible: usize,
+    /// out_ids is constant for cached decode; upload it exactly once
+    out_ids_uploaded: bool,
 }
 
 impl Drop for CachedStep {
@@ -599,16 +616,67 @@ impl Qwen35 {
                     ffi::ggml_free(built.ctx);
                     return Err(ModelError::Load("decode graph alloc".into()));
                 }
-                session.cached = Some(CachedStep { built, galloc, bucket, greedy });
+                let host = HostStaging {
+                    tokens: vec![0i32; 1],
+                    pos: vec![0i32; 4],
+                    mask_f16: vec![0xFC00u16; bucket as usize],
+                    row_ids: vec![0i64; 1],
+                    mask_visible: 0,
+                    out_ids_uploaded: false,
+                };
+                session.cached = Some(CachedStep { built, galloc, bucket, greedy, host });
             }
         }
-        let cached = session.cached.as_ref().unwrap();
+        let n_past = session.n_past;
+        let cached = session.cached.as_mut().unwrap();
         unsafe {
-            self.fill_inputs(&cached.built, &[token], session.n_past, &[0]);
-            let row: [i64; 1] = [session.n_past as i64];
-            ffi::ggml_backend_tensor_set(cached.built.row_ids, row.as_ptr().cast(), 0, 8);
-            self.compute(cached.built.gf, n_threads)?;
-            Ok(self.read_out(&cached.built, 1))
+            let backend = self.weights.backend();
+            let b = &cached.built;
+            let h = &mut cached.host;
+
+            // Inputs are uploaded ASYNC into the compute stream and never read
+            // back before the graph runs, so no per-upload device sync: the
+            // stream ordering is the synchronization. Only the final output
+            // read (4 bytes for greedy) synchronizes.
+            h.tokens[0] = token as i32;
+            ffi::ggml_backend_tensor_set_async(backend, b.inp_tokens, h.tokens.as_ptr().cast(), 0, 4);
+
+            let p = n_past as i32;
+            h.pos[0] = p;
+            h.pos[1] = p;
+            h.pos[2] = p;
+            h.pos[3] = 0;
+            ffi::ggml_backend_tensor_set_async(backend, b.inp_pos, h.pos.as_ptr().cast(), 0, 16);
+
+            h.row_ids[0] = n_past as i64;
+            ffi::ggml_backend_tensor_set_async(backend, b.row_ids, h.row_ids.as_ptr().cast(), 0, 8);
+
+            // Mask: only the newly visible cells changed since the last step.
+            let want_visible = (n_past + 1).min(h.mask_f16.len());
+            if want_visible > h.mask_visible {
+                for c in h.mask_visible..want_visible {
+                    h.mask_f16[c] = 0;
+                }
+                let off = h.mask_visible * 2;
+                let len = (want_visible - h.mask_visible) * 2;
+                ffi::ggml_backend_tensor_set_async(
+                    backend,
+                    b.kq_mask,
+                    h.mask_f16.as_ptr().add(h.mask_visible).cast(),
+                    off,
+                    len,
+                );
+                h.mask_visible = want_visible;
+            }
+
+            if !h.out_ids_uploaded {
+                let zero = [0i32; 1];
+                ffi::ggml_backend_tensor_set(b.out_ids, zero.as_ptr().cast(), 0, 4);
+                h.out_ids_uploaded = true;
+            }
+
+            self.compute(b.gf, n_threads)?;
+            Ok(self.read_out(b, 1))
         }
     }
 
