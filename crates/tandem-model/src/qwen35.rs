@@ -229,6 +229,8 @@ impl DebugToggles {
 enum StepOut {
     Logits(Vec<f32>),
     Token(u32),
+    /// in-graph argmax at several positions
+    Tokens(Vec<u32>),
 }
 
 enum StateSrc {
@@ -270,6 +272,8 @@ struct CachedStep {
     galloc: ffi::ggml_gallocr_t,
     bucket: i64,
     greedy: bool,
+    /// tokens per step this graph was built for (1 = decode, n_spec+1 = verify)
+    t_len: i64,
     /// Host staging buffers, owned for the graph's lifetime: async uploads
     /// must not reference stack temporaries.
     host: HostStaging,
@@ -563,7 +567,7 @@ impl Qwen35 {
             false,
         )? {
             StepOut::Logits(l) => Ok(l),
-            StepOut::Token(_) => unreachable!(),
+            _ => unreachable!("stateless forward returns logits"),
         }
     }
 
@@ -580,7 +584,7 @@ impl Qwen35 {
     ) -> Result<Vec<f32>, ModelError> {
         match self.step_impl(session, tokens, out_positions, n_threads, false)? {
             StepOut::Logits(l) => Ok(l),
-            StepOut::Token(_) => unreachable!("logits requested"),
+            _ => unreachable!("logits requested"),
         }
     }
 
@@ -596,6 +600,7 @@ impl Qwen35 {
         let in_graph = self.weights.can_sample_in_graph();
         match self.step_impl(session, tokens, &last, n_threads, in_graph)? {
             StepOut::Token(t) => Ok(t),
+            StepOut::Tokens(v) => Ok(*v.last().unwrap()),
             StepOut::Logits(l) => Ok(argmax(&l)),
         }
     }
@@ -619,8 +624,10 @@ impl Qwen35 {
         // The cached-graph fast path assumes one backend and a frozen
         // allocation; split models go through the scheduler every step.
         let cacheable = self.weights.sched().is_none();
-        let out = if cacheable && tokens.len() == 1 && out_positions == [0] && session.fa {
-            self.step_cached(session, tokens[0], n_threads, greedy)?
+        let wants_all = out_positions.len() == tokens.len()
+            && out_positions.iter().enumerate().all(|(i, p)| *p == i as i32);
+        let out = if cacheable && session.fa && (out_positions == [0] || wants_all) {
+            self.step_cached(session, tokens, n_threads, greedy)?.0
         } else {
             let view = session.view();
             let galloc = session.galloc;
@@ -708,6 +715,9 @@ impl Qwen35 {
         if b.greedy {
             let mut ids = vec![0i32; n_out];
             ffi::ggml_backend_tensor_get(b.out, ids.as_mut_ptr().cast(), 0, n_out * 4);
+            if n_out > 1 {
+                return StepOut::Tokens(ids.into_iter().map(|v| v as u32).collect());
+            }
             StepOut::Token(ids[n_out - 1] as u32)
         } else {
             let mut logits = vec![0f32; self.hp.n_vocab as usize * n_out];
@@ -880,6 +890,28 @@ impl Qwen35 {
         }
         let out_positions: Vec<i32> = (0..tokens.len() as i32).collect();
         let greedy = self.weights.can_sample_in_graph();
+
+        // A speculative round has a FIXED shape, so its graph can be built
+        // once per KV bucket and replayed like the T=1 decode graph. That
+        // matters more than it sounds: measured on the 27B, a round that
+        // rebuilds the 64-layer trunk graph costs ~38 ms against ~26 ms for
+        // a replayed one — the rebuild, not the drafting, was the overhead.
+        if session.fa && self.weights.sched().is_none() {
+            let (out, hidden) = self.step_cached(session, tokens, n_threads, greedy)?;
+            session.n_past += tokens.len();
+            let preds = match out {
+                StepOut::Tokens(ids) => ids,
+                StepOut::Token(t) => vec![t],
+                StepOut::Logits(l) => {
+                    let nv = self.hp.n_vocab as usize;
+                    (0..tokens.len())
+                        .map(|i| argmax(&l[i * nv..(i + 1) * nv]))
+                        .collect()
+                }
+            };
+            return Ok((preds, hidden));
+        }
+
         let view = session.view();
         let galloc = session.galloc;
         session.cached = None;
@@ -1244,25 +1276,26 @@ impl Qwen35 {
     fn step_cached(
         &self,
         session: &mut Session,
-        token: u32,
+        tokens: &[u32],
         n_threads: i32,
         greedy: bool,
-    ) -> Result<StepOut, ModelError> {
-        let n_kv_exact = (session.n_past + 1) as i64;
+    ) -> Result<(StepOut, Vec<f32>), ModelError> {
+        let t_len = tokens.len() as i64;
+        let n_kv_exact = (session.n_past + tokens.len()) as i64;
         let kvb = kv_bucket();
         let bucket = (((n_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
         let stale = session
             .cached
             .as_ref()
-            .map(|c| c.bucket != bucket || c.greedy != greedy)
+            .map(|c| c.bucket != bucket || c.greedy != greedy || c.t_len != t_len)
             .unwrap_or(true);
         if stale {
             unsafe {
                 let built = self.build_inner(
-                    1,
+                    t_len,
                     bucket,
                     &StateSrc::Session(session.view()),
-                    1,
+                    t_len,
                     true,
                     0,
                     greedy,
@@ -1281,14 +1314,15 @@ impl Qwen35 {
                     return Err(ModelError::Load("decode graph alloc".into()));
                 }
                 let host = HostStaging {
-                    tokens: vec![0i32; 1],
-                    pos: vec![0i32; 4],
-                    mask_f16: vec![0xFC00u16; bucket as usize],
-                    row_ids: vec![0i64; 1],
+                    tokens: vec![0i32; t_len as usize],
+                    pos: vec![0i32; t_len as usize * 4],
+                    mask_f16: vec![0xFC00u16; bucket as usize * t_len as usize],
+                    row_ids: vec![0i64; t_len as usize],
                     mask_visible: 0,
-                    out_ids: vec![0i32; 1],
+                    out_ids: (0..t_len as i32).collect(),
                 };
-                session.cached = Some(CachedStep { built, galloc, bucket, greedy, host });
+                session.cached =
+                    Some(CachedStep { built, galloc, bucket, greedy, t_len, host });
             }
         }
         let n_past = session.n_past;
@@ -1302,18 +1336,31 @@ impl Qwen35 {
             // back before the graph runs, so no per-upload device sync: the
             // stream ordering is the synchronization. Only the final output
             // read (4 bytes for greedy) synchronizes.
-            h.tokens[0] = token as i32;
-            ffi::ggml_backend_tensor_set_async(backend, b.inp_tokens, h.tokens.as_ptr().cast(), 0, 4);
+            let t = tokens.len();
+            for (i, tk) in tokens.iter().enumerate() {
+                h.tokens[i] = *tk as i32;
+            }
+            ffi::ggml_backend_tensor_set_async(
+                backend, b.inp_tokens, h.tokens.as_ptr().cast(), 0, t * 4,
+            );
 
-            let p = n_past as i32;
-            h.pos[0] = p;
-            h.pos[1] = p;
-            h.pos[2] = p;
-            h.pos[3] = 0;
-            ffi::ggml_backend_tensor_set_async(backend, b.inp_pos, h.pos.as_ptr().cast(), 0, 16);
+            for i in 0..t {
+                let p = (n_past + i) as i32;
+                h.pos[i] = p;
+                h.pos[t + i] = p;
+                h.pos[2 * t + i] = p;
+                h.pos[3 * t + i] = 0;
+            }
+            ffi::ggml_backend_tensor_set_async(
+                backend, b.inp_pos, h.pos.as_ptr().cast(), 0, t * 4 * 4,
+            );
 
-            h.row_ids[0] = n_past as i64;
-            ffi::ggml_backend_tensor_set_async(backend, b.row_ids, h.row_ids.as_ptr().cast(), 0, 8);
+            for i in 0..t {
+                h.row_ids[i] = (n_past + i) as i64;
+            }
+            ffi::ggml_backend_tensor_set_async(
+                backend, b.row_ids, h.row_ids.as_ptr().cast(), 0, t * 8,
+            );
 
             // EVERY input is re-uploaded before EVERY compute. ggml's graph
             // allocator may place intermediates over an input's storage once
@@ -1322,11 +1369,15 @@ impl Qwen35 {
             // re-upload (out_ids "is constant"; the mask "only changed by one
             // cell") clobbered the out_ids index and aborted get_rows at
             // n_past 2333 — silent until the allocation happened to overlap.
-            let want_visible = (n_past + 1).min(h.mask_f16.len());
-            for c in h.mask_visible..want_visible {
-                h.mask_f16[c] = 0;
+            // causal window per query row; rows are contiguous in the mask
+            let nkv = b.n_kv as usize;
+            for q in 0..t {
+                let vis = (n_past + q + 1).min(nkv);
+                for c in 0..nkv {
+                    h.mask_f16[q * nkv + c] = if c < vis { 0 } else { 0xFC00 };
+                }
             }
-            h.mask_visible = want_visible;
+            h.mask_visible = n_past + t;
             ffi::ggml_backend_tensor_set_async(
                 backend,
                 b.kq_mask,
@@ -1340,11 +1391,16 @@ impl Qwen35 {
                 b.out_ids,
                 h.out_ids.as_ptr().cast(),
                 0,
-                4,
+                h.out_ids.len() * 4,
             );
 
             self.compute(b.gf, n_threads)?;
-            Ok(self.read_out(b, 1))
+            // the draft head consumes these, and they are already computed
+            let mut hidden = vec![0f32; self.hp.n_embd as usize * t];
+            ffi::ggml_backend_tensor_get(
+                b.h_out, hidden.as_mut_ptr().cast(), 0, hidden.len() * 4,
+            );
+            Ok((self.read_out(b, t), hidden))
         }
     }
 
