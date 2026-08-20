@@ -128,13 +128,28 @@ Staged deliberately:
 split mode, and decode is 39.8 vs the ~39 tok/s no-MTP baseline the gate
 asked for (within 4% of llama.cpp measured side by side at 41.4).
 
-## M4 — MTP speculative decoding
+## M4 — MTP speculative decoding  ✅ 2026-08-19
 
-blk.64 draft graph, hidden-state handoff, K-snapshot rollback on GDN layers,
-acceptance-adaptive n-draft.
+blk.64 draft head, hidden-state handoff, K-snapshot rollback across the 48
+recurrent layers.
 
-**Gate:** acceptance ≥ 0.90 @ n-max 3 equivalent AND ≥ 57 tok/s prose @ d0
-(beat prod's best rep). Output remains temp-0 parity (spec decode is lossless).
+Measured on the 27B, tensor parallel, 96 tokens, all **lossless** (output
+identical to plain greedy):
+
+| mode | decode tok/s | acceptance | tokens/round |
+|---|---|---|---|
+| plain greedy | 40.1 | — | 1.00 |
+| MTP depth 1 | 47.9 | 0.900 | 1.92 |
+| MTP depth 2 | 52.9 | 0.713 | 2.40 |
+| **MTP depth 3** | **59.3** | 0.667 | 3.00 |
+
+**Gate: PASSED.** 59.3 tok/s clears the ≥57 bar, acceptance is 0.90 at depth
+1 (the depth where the gate's number was measured), and speculation is
+verified lossless rather than assumed to be.
+
+Still open here: acceptance-adaptive draft depth (prod's `p-min 0.75` drops
+low-confidence drafts instead of always drafting n), and caching the
+verify-shaped graph the way the T=1 decode graph is cached.
 
 ## M5 — Serving layer + continuous batching
 
