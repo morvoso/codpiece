@@ -599,7 +599,7 @@ fn run_batch(
             r.seq_past += 1;
             // commit the token the round consumed, then choose the next one
             r.generated.push(r.last);
-            let piece = tok.decode(&r.generated, true);
+            let piece = tok.decode(&r.generated, false);
             r.text.clear();
             r.text.push_str(&piece);
             let mut reason: Option<&'static str> = None;
@@ -732,7 +732,10 @@ fn run_job(
     };
 
     let mut push = |ids: &[u32], text: &mut String| {
-        let piece = tok.decode(ids, true);
+        // render_special = false: strip control tokens like <|im_end|> from the
+        // user-visible text. The <think>/</think> tags are ordinary tokens and are
+        // kept, so the reasoning split is unaffected.
+        let piece = tok.decode(ids, false);
         text.clear();
         text.push_str(&piece);
     };
@@ -955,6 +958,10 @@ fn run_job(
 
         // commit the accepted drafts, then the token that follows them
         for d in round_drafts.iter().take(n_keep) {
+            if !req.ignore_eos && Some(*d) == tok.eos {
+                reason = "stop";
+                break 'outer;
+            }
             generated.push(*d);
             push(&generated, &mut text);
             if let Some(hit) = req.stop.iter().find_map(|s| text.find(s.as_str())) {
@@ -968,10 +975,6 @@ fn run_job(
             }
             if generated.len() >= req.max_tokens {
                 reason = "length";
-                break 'outer;
-            }
-            if !req.ignore_eos && Some(*d) == tok.eos {
-                reason = "stop";
                 break 'outer;
             }
         }
