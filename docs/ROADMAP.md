@@ -95,10 +95,27 @@ step, so fixed overheads matter far less there — profile at real scale.
 
 **Gate:** correctness ✅; speed ≥ oracle NOT met (93%).
 
-## M3 — Qwen3.8-27B, 2-GPU tensor split, single stream
+## M3 — Qwen3.8-27B on 2 GPUs  ◕ in progress 2026-08-19
 
-The real model: GDN + attention + IMROPE graph, f16 KV, 2-way row split via
-backend-sched, recurrent-state checkpointing, greedy decode. No MTP yet.
+The 27B is 29.3 GiB of weights; one 24 GiB card cannot hold it. Multi-GPU is
+therefore a correctness requirement, not a speed optimization.
+
+Staged deliberately:
+- [x] **M3a — layer split** (`Device::CudaSplit`, ggml_backend_sched):
+      weights placed per layer, scheduler inserts cross-device copies over
+      PCIe. Verified on the 0.8B: output identical to single-GPU.
+      Costs speed (113 vs 295 tok/s on the 0.8B — sched re-plans every step,
+      no cached graph, session state all on device 0) but it is the path
+      that makes the real model runnable at all.
+- [ ] M3b — 27B loaded and generating across both cards
+- [ ] M3c — parity vs prod llama.cpp (temp-0, short / 8K / 27K prompts)
+- [ ] M3d — placement fixes: session KV/state tensors on their layer's
+      device (today they all sit on device 0, doubling bus traffic for the
+      second half of the stack), cached decode graph under the scheduler
+- [ ] M3e — tensor parallel (`split.rs` classification + meta device), which
+      is what prod's `-sm tensor` uses and what makes single-stream decode
+      competitive. All-reduce must assume PCIe host-bounce forever: the user
+      confirmed there is no NVLink bridge on this machine.
 
 **Gate:** temp-0 parity vs prod build on 3 prompts (short, 8K, 27K) AND
 decode within 10% of llama.cpp-no-MTP baseline (~39 tok/s np1) at d0.
