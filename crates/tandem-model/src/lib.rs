@@ -17,8 +17,13 @@ pub mod meta;
 pub mod qwen35;
 pub mod split;
 
-/// Copy chunk size for streaming weights into backend buffers (bounds RSS).
-const COPY_CHUNK: usize = 32 << 20;
+/// Upper bound on the staging buffer: it grows to the largest tensor, since
+/// weights must be written to the backend in ONE call. Chunked writes are not
+/// an option under tensor parallelism — the meta backend slices each write
+/// across devices and requires whole "chunks" along the split axis
+/// (ggml-backend-meta.cpp: `size % chunk_size_full == 0`). For the 27B the
+/// largest tensor is the ~1.35 GiB embedding table.
+const MAX_STAGING: usize = 4 << 30;
 
 #[derive(Debug)]
 pub enum ModelError {
@@ -208,21 +213,25 @@ impl Weights {
                 buffers.push(buf);
             }
 
-            // Stream weight data from disk into the backend buffers.
-            let mut scratch = vec![0u8; COPY_CHUNK];
+            // Load weight data: one whole-tensor read, one whole-tensor write.
+            let mut scratch: Vec<u8> = Vec::new();
             let mut total = 0u64;
             let mut per_backend = vec![0u64; n_backends];
             for info in &gguf.tensors {
                 let t = tensors[&info.name];
                 let size = ffi::ggml_nbytes(t);
-                file.seek(SeekFrom::Start(gguf.data_start + info.offset))?;
-                let mut done = 0usize;
-                while done < size {
-                    let n = (size - done).min(COPY_CHUNK);
-                    file.read_exact(&mut scratch[..n])?;
-                    ffi::ggml_backend_tensor_set(t, scratch.as_ptr().cast(), done, n);
-                    done += n;
+                if size > MAX_STAGING {
+                    return Err(ModelError::Load(format!(
+                        "tensor {} is {size} bytes, above the staging cap",
+                        info.name
+                    )));
                 }
+                if scratch.len() < size {
+                    scratch.resize(size, 0);
+                }
+                file.seek(SeekFrom::Start(gguf.data_start + info.offset))?;
+                file.read_exact(&mut scratch[..size])?;
+                ffi::ggml_backend_tensor_set(t, scratch.as_ptr().cast(), 0, size);
                 total += size as u64;
                 per_backend[where_[&info.name]] += size as u64;
             }
