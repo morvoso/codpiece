@@ -7,6 +7,8 @@ edition = "2021"
 codpiece-ggml-sys = { path = "../codpiece-ggml-sys" }
 codpiece-gguf = { path = "../codpiece-gguf" }
 codpiece-model = { path = "../codpiece-model" }
+# decode only — resize/normalize are hand-ported from llama.cpp for parity
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [features]
 cuda = ["codpiece-ggml-sys/cuda", "codpiece-model/cuda"]

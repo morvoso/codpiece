@@ -21,6 +21,8 @@ use std::path::Path;
 use codpiece_ggml_sys as ffi;
 use codpiece_model::{Device, ModelError, Weights};
 
+pub mod preprocess;
+
 /// Vision hparams, read from mmproj GGUF metadata (`clip.vision.*`).
 #[derive(Debug, Clone)]
 pub struct VisionHparams {
