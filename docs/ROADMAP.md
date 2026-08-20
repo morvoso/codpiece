@@ -371,8 +371,21 @@ the output on both gray and rainbow patterns, attributable to op-fusion
 scheduling (the oracle's eval callback splits the graph per node; codpiece
 computes fused) — well under BF16 weight precision. `codpiece vision
 <mmproj> --pattern gray|rainbow` prints dumps diffable against the oracle.
-Remaining: preprocessing (decode/resize/normalize), trunk injection with
-vision M-RoPE positions, end-to-end gate + API surface.
+
+**Vision SHIPPED end to end (2026-08-20, same day).** Preprocessing ported
+from mtmd's dyn-size pipeline (smart-resize, PAD_CEIL bilinear, min-tokens
+1024 like prod); the trunk gained an embd-input graph (`step_embd`) with the
+Qwen-VL 2D M-RoPE rule and a block-visible mask; `Session::rope_off` carries
+the RoPE-vs-rows gap (images advance RoPE by max(nx,ny) only); image spans
+enter prompt history as content-hash pseudo-ids so prefix reuse is
+byte-correct; `/v1/chat/completions` takes `image_url` data: URLs; the ViT
+runs flash attention on CUDA (head size 72 has a kernel) because the non-FA
+KQ is >1 GiB at a 1024-token image and did not fit beside the 64K-context
+trunk. Gate (`scripts/vision-payload.sh`): the moon-landing front page
+through llama.cpp b10423 + mmproj and codpiece — both answer
+"MEN WALK ON MOON" from identically sized prompts; byline follow-up reads
+"John Noble Wilford"; text parity gates unchanged. Deployed: prod serves
+with `CODPIECE_MMPROJ`; llama.cpp is no longer needed for vision.
 
 ## Stretch — DFlash2 under multi-GPU
 

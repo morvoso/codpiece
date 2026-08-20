@@ -204,6 +204,11 @@ impl VisionModel {
         let kq_scale = 1.0f32 / (d_head as f32).sqrt();
         let f32t = ffi::ggml_type_GGML_TYPE_F32;
         let i32t = ffi::ggml_type_GGML_TYPE_I32;
+        // FA on CUDA (llama.cpp's clip default there — the memory difference
+        // decides whether big images fit at all); the exact non-FA path on
+        // CPU, where the parity harness runs. CODPIECE_VISION_NO_FA=1 forces
+        // the reference path everywhere.
+        let use_fa = !self.weights.is_cpu() && std::env::var("CODPIECE_VISION_NO_FA").is_err();
 
         let wt = |name: &str| self.weights.tensor(name).expect("checked at load");
         let blk = |il: usize, t: &str, wb: &str| {
@@ -359,21 +364,52 @@ impl VisionModel {
                 let q = rope(ctx, q, &mut sections);
                 let k = rope(ctx, k, &mut sections);
 
-                // non-FA attention, as the reference builds it
-                let qp = ffi::ggml_permute(ctx, q, 0, 2, 1, 3);
-                let kp = ffi::ggml_permute(ctx, k, 0, 2, 1, 3);
-                let vp = ffi::ggml_cont(ctx, ffi::ggml_permute(ctx, v, 1, 2, 0, 3));
-                let kq = ffi::ggml_mul_mat(ctx, kp, qp);
-                let kq = ffi::ggml_soft_max_ext(
-                    ctx,
-                    kq,
-                    std::ptr::null_mut(),
-                    kq_scale,
-                    0.0,
-                );
-                let kqv = ffi::ggml_mul_mat(ctx, vp, kq);
-                let mut o = ffi::ggml_permute(ctx, kqv, 0, 2, 1, 3);
-                o = ffi::ggml_cont_2d(ctx, o, n_embd, n_pos);
+                let mut o = if use_fa {
+                    // Flash attention, as llama.cpp's clip runs on CUDA (head
+                    // size 72 has a dedicated kernel). This is what makes big
+                    // images affordable: the non-FA path materializes an
+                    // n_pos^2 x n_head f32 KQ — over 1 GiB at a 1024-token
+                    // image — where FA streams it.
+                    let qp = ffi::ggml_permute(ctx, q, 0, 2, 1, 3);
+                    let kp = ffi::ggml_cast(
+                        ctx,
+                        ffi::ggml_permute(ctx, k, 0, 2, 1, 3),
+                        ffi::ggml_type_GGML_TYPE_F16,
+                    );
+                    let vp = ffi::ggml_cast(
+                        ctx,
+                        ffi::ggml_permute(ctx, v, 0, 2, 1, 3),
+                        ffi::ggml_type_GGML_TYPE_F16,
+                    );
+                    let cur = ffi::ggml_flash_attn_ext(
+                        ctx,
+                        qp,
+                        kp,
+                        vp,
+                        std::ptr::null_mut(),
+                        kq_scale,
+                        0.0,
+                        0.0,
+                    );
+                    ffi::ggml_flash_attn_ext_set_prec(cur, ffi::ggml_prec_GGML_PREC_F32);
+                    ffi::ggml_reshape_2d(ctx, cur, n_embd, n_pos)
+                } else {
+                    // exact non-FA reference path (the CPU parity harness)
+                    let qp = ffi::ggml_permute(ctx, q, 0, 2, 1, 3);
+                    let kp = ffi::ggml_permute(ctx, k, 0, 2, 1, 3);
+                    let vp = ffi::ggml_cont(ctx, ffi::ggml_permute(ctx, v, 1, 2, 0, 3));
+                    let kq = ffi::ggml_mul_mat(ctx, kp, qp);
+                    let kq = ffi::ggml_soft_max_ext(
+                        ctx,
+                        kq,
+                        std::ptr::null_mut(),
+                        kq_scale,
+                        0.0,
+                    );
+                    let kqv = ffi::ggml_mul_mat(ctx, vp, kq);
+                    let o = ffi::ggml_permute(ctx, kqv, 0, 2, 1, 3);
+                    ffi::ggml_cont_2d(ctx, o, n_embd, n_pos)
+                };
                 o = ffi::ggml_mul_mat(ctx, blk(il, "attn_out", "weight"), o);
                 o = ffi::ggml_add(ctx, o, blk(il, "attn_out", "bias"));
 
