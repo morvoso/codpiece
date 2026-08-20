@@ -125,8 +125,22 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         }
         // one execution: verifies [last, draft] and drafts the next round
         let batch = [last, draft];
-        // fixed shape every round, so the graph is built once and replayed
-        let (preds, drafts, _h) = match model.step_fused_cached(&mut session, &batch, threads) {
+        // The fused round is cacheable — one graph, fixed shape — but the
+        // tensor-parallel meta backend rejects a REPLAYED graph containing the
+        // draft tail, while replaying a trunk-only graph is fine. The
+        // difference is that the tail indexes the embedding table with a
+        // computed node (the in-graph argmax) rather than an input tensor.
+        // So the cached path is used where it is verified (CPU, single GPU)
+        // and TP rebuilds per round, which measured the same as running the
+        // draft as its own execution.
+        let res = if model.weights.is_tensor_parallel() {
+            model
+                .step_verify_drafting(&mut session, &batch, threads)
+                .map(|(p, d)| (p, d, Vec::new()))
+        } else {
+            model.step_fused_cached(&mut session, &batch, threads)
+        };
+        let (preds, drafts, _h) = match res {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("round: {e}");

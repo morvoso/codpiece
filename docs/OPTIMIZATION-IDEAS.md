@@ -32,8 +32,12 @@ I32 and `ggml_get_rows` consumes I32, so `embed(argmax(logits))` needs no host
 round-trip. The tail emits a draft per verified position — the one to use for
 each possible accept count — so the host simply picks.
 
-Status: lossless on CPU (acceptance 0.750, 1.79 tok/round). 27B measurement in
-progress.
+**Result: neutral on the 27B** — 49.56 tok/s fused vs 49.62 separate. That is
+a useful negative: it proves the draft was never the cost. Comparing round
+times located the real one instead (see below).
+
+Fusion is still the right shape, because it is what makes idea 4 possible:
+one graph per round has nothing to interleave with.
 
 ## 2. Copy one recurrent snapshot instead of K — NOT YET DONE
 
@@ -62,15 +66,45 @@ extra nodes on one launch rather than three launches.
 Expected: the tok/round of depth-3 (3.0 measured) at the round cost of
 depth-1. That is the single largest remaining item if idea 1 lands.
 
-## 4. Cache the verify graph per shape — BLOCKED
+## 1b. The actual per-round cost: rebuilding the trunk graph — PARTLY FIXED
 
-The T=1 decode graph is cached and replayed (worth +11 % via CUDA graph
-capture). The verify graph has a fixed shape per draft depth and could be
-cached the same way, but the tensor-parallel meta backend rejects a cached
-draft graph (`bcj.nodes[i]` null, ggml-backend-meta.cpp:1838). `TANDEM_MTP_CACHE=1`
-forces the path so the failure can be characterized: the open question is
-whether it breaks on first use or only when alternating with the trunk's own
-cached graph.
+Round times told the story the throughput numbers hid:
+
+| | round time |
+|---|---|
+| plain decode (replays a cached graph) | 26.3 ms |
+| speculative round (rebuilds the 64-layer trunk graph) | 37.9 ms |
+
+~11 ms per round, paid once regardless of draft depth, purely to construct
+and allocate a graph whose shape never changes. Caching it is worth more than
+anything about drafting.
+
+Implemented, and it works where it can be verified: **CPU fused+cached runs
+52.5–53.5 tok/s vs 47.2 plain**, lossless — and the CPU is where graph
+rebuilding is *cheap*, so this understates the GPU effect.
+
+Under tensor parallelism it is blocked (idea 4).
+
+## 4. Cache the verify graph per shape — BLOCKED under TP
+
+Two experiments narrowed this to a precise statement:
+
+- A cached **trunk-only** graph replays fine under TP — that is what plain
+  decode does at 38 tok/s.
+- A cached verify graph *interleaved* with per-draft graphs aborts.
+- A cached graph *containing the draft tail* also aborts, even though the
+  same graph works when rebuilt each round.
+
+So the rule is not "no caching under TP". The draft tail differs from
+everything else in the graph in one way: it indexes the embedding table with a
+**computed node** (the in-graph argmax) rather than an input tensor, and the
+meta backend appears not to keep that mapping valid across replays
+(`bcj.nodes[i]` null, ggml-backend-meta.cpp:1838).
+
+If that is the mechanism, the fix is to break the round into two cached
+graphs — trunk, then tail fed by an *input* token written from the host
+between them — trading one extra execution for a replayable pair. That is the
+next thing to try, and it is worth ~11 ms/round on the 27B.
 
 ## 5. Overlap the draft with the trunk on a second CUDA stream — SPECULATIVE
 
