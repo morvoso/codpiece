@@ -26,13 +26,225 @@ fn main() -> ExitCode {
         Some("spec") => cmd_spec(&args[1..]),
         Some("fused") => cmd_fused(&args[1..]),
         Some("stepcost") => cmd_stepcost(&args[1..]),
+        Some("serve") => cmd_serve(&args[1..]),
+        Some("batchtest") => cmd_batchtest(&args[1..]),
         _ => {
             eprintln!(
                 "usage: tandem inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
                  usage: tandem tokenize <file.gguf> [--special] [--pieces] < text\n\
-                 usage: tandem load <file.gguf>"
+                 usage: tandem load <file.gguf>\n\
+                 usage: tandem serve <file.gguf> [--host H] [--port P] [-c n_ctx] [--tp 0,1]"
             );
             ExitCode::from(2)
+        }
+    }
+}
+
+
+
+/// Correctness gate for batched decoding: the same prompt, decoded greedily through
+/// the ordinary single-sequence path and as every slot of an N-way batch, must produce
+/// identical tokens from every slot. Any cross-sequence contamination — a shared state
+/// slice, a mask reaching into a neighbour's KV region — shows up as a mismatch.
+fn cmd_batchtest(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut prompt = String::from("The capital of France is");
+    let mut n_gen = 24usize;
+    let mut threads = 8i32;
+    let mut n_batch = 3usize;
+    let mut seq_ctx = 1024usize;
+    let mut gpu: Option<i32> = None;
+    let mut tp: Option<Vec<i32>> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-p" => prompt = it.next().cloned().unwrap_or_default(),
+            "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(24),
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            "--batch" => n_batch = it.next().and_then(|s| s.parse().ok()).unwrap_or(3),
+            "--seq-ctx" => seq_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(1024),
+            "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            _ => {}
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: tandem batchtest <file.gguf> [-p prompt] [-n N] [--batch B] [--tp 0,1]");
+        return ExitCode::from(2);
+    };
+    let dev = match (&tp, gpu) {
+        (Some(ids), _) => tandem_model::Device::CudaTensorParallel(ids.clone()),
+        (None, Some(i)) => tandem_model::Device::Cuda(i),
+        (None, None) => tandem_model::Device::Cpu,
+    };
+    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), dev) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("batchtest: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
+    let prompt_ids = tok.encode(&prompt, true);
+
+    // reference: the ordinary single-sequence greedy path
+    let mut reference = Vec::new();
+    {
+        let mut sess = tandem_model::qwen35::Session::new_spec(&model, seq_ctx, 1)
+            .expect("single session");
+        let mut next = model
+            .step_greedy(&mut sess, &prompt_ids, threads)
+            .expect("single prefill");
+        for _ in 0..n_gen {
+            reference.push(next);
+            next = model.step_greedy(&mut sess, &[next], threads).expect("single step");
+        }
+    }
+
+    // batch: same prompt in every slot
+    let mut sess = tandem_model::qwen35::Session::new_spec(
+        &model,
+        n_batch * seq_ctx,
+        n_batch.saturating_sub(1).max(1),
+    )
+    .expect("batch session");
+    let mut lasts = vec![0u32; n_batch];
+    let mut pasts = vec![0usize; n_batch];
+    for slot in 0..n_batch {
+        let (id, _) = model
+            .step_seq_prefill(&mut sess, &prompt_ids, slot, seq_ctx, 0, false, threads)
+            .expect("seq prefill");
+        lasts[slot] = id;
+        pasts[slot] = prompt_ids.len();
+    }
+    let mut outs: Vec<Vec<u32>> = vec![Vec::new(); n_batch];
+    let t0 = std::time::Instant::now();
+    for _ in 0..n_gen {
+        for slot in 0..n_batch {
+            outs[slot].push(lasts[slot]);
+        }
+        let (preds, _) = model
+            .step_batch_decode(&mut sess, &lasts, &pasts, seq_ctx, false, threads)
+            .expect("batch step");
+        for slot in 0..n_batch {
+            pasts[slot] += 1;
+            lasts[slot] = preds[slot];
+        }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "batch decode: {} seqs x {} tok in {:.2}s = {:.1} tok/s aggregate ({:.1} ms/round)",
+        n_batch,
+        n_gen,
+        dt,
+        (n_batch * n_gen) as f64 / dt,
+        dt * 1000.0 / n_gen as f64
+    );
+
+    let mut ok = true;
+    for (slot, out) in outs.iter().enumerate() {
+        if out == &reference {
+            println!("slot {slot}: IDENTICAL to single-path reference");
+        } else {
+            ok = false;
+            let div = out
+                .iter()
+                .zip(&reference)
+                .position(|(a, b)| a != b)
+                .unwrap_or(out.len().min(reference.len()));
+            println!(
+                "slot {slot}: DIFFERS at token {div}: {:?} vs {:?}",
+                &out[div..(div + 3).min(out.len())],
+                &reference[div..(div + 3).min(reference.len())]
+            );
+        }
+    }
+    println!("reference text: {:?}", tok.decode(&reference, true));
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Serve the model over HTTP.
+fn cmd_serve(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut host = String::from("127.0.0.1");
+    let mut port = 8080u16;
+    let mut n_ctx = 8192usize;
+    let mut threads = 8i32;
+    // Fixed 3, not adaptive. Adaptive depth is implemented and available with
+    // `--depth 0`, but it has now measured neutral-or-worse three separate times —
+    // most recently 44.2 tok/s against 46.5 for fixed 3 on the box's own benchmark.
+    // It cannot price a depth it has not run, and paying to find out costs more than
+    // the choice is worth on this model.
+    let mut depth = 3usize;
+    let mut default_max_tokens = 512usize;
+    let mut draft_gate = 0.0f32;
+    let mut serve_max_depth = 3usize;
+    let mut gpu: Option<i32> = None;
+    let mut tp: Option<Vec<i32>> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--host" => host = it.next().cloned().unwrap_or(host),
+            "--port" => port = it.next().and_then(|s| s.parse().ok()).unwrap_or(port),
+            "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(n_ctx),
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads),
+            "--depth" => depth = it.next().and_then(|s| s.parse().ok()).unwrap_or(depth),
+            "--max-depth" => {
+                serve_max_depth = it.next().and_then(|s| s.parse().ok()).unwrap_or(3)
+            }
+            "--draft-gate" => {
+                draft_gate = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0)
+            }
+            "--max-tokens" => {
+                default_max_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(512)
+            }
+            "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            s => {
+                eprintln!("unknown arg: {s}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!(
+            "usage: tandem serve <file.gguf> [--host H] [--port P] [-c n_ctx] [-t threads]\n\
+             \x20      [--depth K|0=adaptive] [--max-depth M] [--draft-gate P]\n\
+             \x20      [--max-tokens N] [--tp 0,1 | --gpu N]"
+        );
+        return ExitCode::from(2);
+    };
+    match tandem_server::run(tandem_server::ServeConfig {
+        model_path: path.to_string(),
+        host,
+        port,
+        n_ctx,
+        threads,
+        tp,
+        gpu,
+        depth,
+        max_depth: serve_max_depth,
+        draft_gate,
+        default_max_tokens,
+    }) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("serve: {e}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -140,26 +352,45 @@ fn cmd_stepcost(args: &[String]) -> ExitCode {
 /// The host picks the one matching what it kept.
 ///
 /// Still lossless: drafts are only ever kept when they equal what the model
+
 /// itself produced.
 fn cmd_fused(args: &[String]) -> ExitCode {
     let mut path: Option<&str> = None;
     let mut prompt = String::from("The capital of France is");
+    let mut prompt_file: Option<String> = None;
     let mut n_gen = 64usize;
     let mut threads = 8i32;
     let mut n_ctx = 4096usize;
-    let mut depth = 1usize;
+    // Depth 3 is the best single setting across the prompts measured (62.8 / 68.4 /
+    // 89.3 tok/s on prose, code and arithmetic); depth 1 was only ever a starting point.
+    let mut depth = 3usize;
+    let mut adaptive = false;
+    // Three is the ceiling by default, not five: measured, depth 4 beat depth 3 by ~1%
+    // on the most predictable prompt and lost on the rest, while each extra depth adds
+    // graph shapes that each hold a compute buffer.
+    let mut max_depth = 3usize;
     let mut gpu: Option<i32> = None;
     let mut tp: Option<Vec<i32>> = None;
     let mut ignore_eos = false;
+    let mut force_path: Option<String> = None;
+    let mut n_cand = 0usize;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-p" => prompt = it.next().cloned().unwrap_or_default(),
+            "-f" => prompt_file = it.next().cloned(),
             "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(64),
             "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
-            "--depth" => depth = it.next().and_then(|s| s.parse().ok()).unwrap_or(1),
+            "--depth" => match it.next().map(|s| s.as_str()) {
+                Some("auto") => adaptive = true,
+                Some(v) => depth = v.parse().unwrap_or(3),
+                None => {}
+            },
+            "--max-depth" => max_depth = it.next().and_then(|s| s.parse().ok()).unwrap_or(3),
             "--ignore-eos" => ignore_eos = true,
+            "--path" => force_path = it.next().cloned(),
+            "--cand" => n_cand = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
             "--tp" => {
                 tp = it.next().map(|v| {
@@ -170,8 +401,19 @@ fn cmd_fused(args: &[String]) -> ExitCode {
             _ => {}
         }
     }
+    // A long-context prompt does not fit on a command line; read it from a file.
+    if let Some(f) = prompt_file.as_deref() {
+        match std::fs::read_to_string(f) {
+            Ok(t) => prompt = t,
+            Err(e) => {
+                eprintln!("read {f}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let Some(path) = path else {
-        eprintln!("usage: tandem fused <file.gguf> [-p prompt] [-n N] [--depth K] [--tp 0,1]");
+        eprintln!("usage: tandem fused <file.gguf> [-p prompt] [-n N] [--depth K] [--tp 0,1] [--path cached|rebuild] [--cand N]\n\
+             \x20      --depth auto [--max-depth M]  choose the chain length per round");
         return ExitCode::from(2);
     };
     let dev = match (&tp, gpu) {
@@ -187,7 +429,9 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         }
     };
     let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
-    let mut session = match tandem_model::qwen35::Session::new_spec(&model, n_ctx, depth) {
+    // Adaptive depth needs snapshot slots for the deepest chain it may choose.
+    let slots_for = if adaptive { max_depth } else { depth };
+    let mut session = match tandem_model::qwen35::Session::new_spec(&model, n_ctx, slots_for) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("fused: {e}");
@@ -195,36 +439,118 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         }
     };
 
-    let tp_mode = model.weights.is_tensor_parallel();
-    let round = |session: &mut tandem_model::qwen35::Session, batch: &[u32]| {
+    // The cached path builds each graph once and replays it; the rebuild path re-emits
+    // ~5000 nodes every round. Both are lossless — this only selects which one pays the
+    // build cost, and `rebuild` is kept as the A/B control.
+    let use_cached = match force_path.as_deref() {
+        Some("rebuild") => false,
+        _ => true,
+    };
+    eprintln!("fused: path={}", if use_cached { "cached" } else { "rebuild" });
+    let tp_mode = !use_cached;
+    let round = |session: &mut tandem_model::qwen35::Session,
+                 batch: &[u32],
+                 d: usize,
+                 cands: Option<&[i32]>,
+                 last_only: bool| {
         if tp_mode {
+            // The rebuild control always emits every position; keep its contract
+            // identical to the cached path by discarding all but the last. It is a
+            // debug path, so it still pays the full-width logits and is not usable at
+            // long context — that is exactly what `last_only` exists to avoid.
             model
-                .step_verify_drafting(session, batch, depth, threads)
-                .map(|(p, c)| (p, c))
+                .step_verify_drafting(session, batch, d, cands, threads)
+                .map(|(p, c)| {
+                    if last_only {
+                        let i = p.len() - 1;
+                        (vec![p[i]], c.into_iter().map(|r| vec![r[i]]).collect())
+                    } else {
+                        (p, c)
+                    }
+                })
         } else {
             model
-                .step_fused_cached(session, batch, depth, threads)
-                .map(|(p, c, _h)| (p, c))
+                .step_fused_cached(session, batch, d, cands, last_only, false, threads)
+                .map(|(p, c, _logits)| (p, c))
         }
     };
+    let mut picker = tandem_server::depth::DepthPicker::new(adaptive, depth, max_depth);
 
     let prompt_ids = tok.encode(&prompt, true);
     let t0 = std::time::Instant::now();
-    let (preds, chain) = match round(&mut session, &prompt_ids) {
-        Ok(v) => v,
+    let mut next_depth = picker.choose();
+    // Prefill: bulk through the trunk at a large chunk, then a short tail through the
+    // speculative round. The speculative graph's logits are n_vocab x chunk and will not
+    // allocate at 256 on a long context, so running the whole prompt through it forces a
+    // tiny chunk on the entire prefill — measured at 849 tok/s against 1331 for the same
+    // prompt trunk-only. Only the tail needs the draft head, to leave its cache warm and
+    // produce the first drafts.
+    const PREFILL_TAIL: usize = 64;
+    let bulk_chunk = tandem_server::engine::prefill_chunk_for(n_ctx);
+    let split = prompt_ids.len().saturating_sub(PREFILL_TAIL);
+    let mut preds;
+    let mut chain;
+    for chunk in prompt_ids[..split].chunks(bulk_chunk) {
+        if let Err(e) = model.step_greedy(&mut session, chunk, threads) {
+            eprintln!("prefill: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match round(&mut session, &prompt_ids[split..], next_depth, None, false) {
+        Ok(v) => {
+            preds = v.0;
+            chain = v.1;
+        }
         Err(e) => {
             eprintln!("prefill: {e}");
             return ExitCode::FAILURE;
         }
-    };
+    }
+    session.mtp_past += preds.len();
     let t_prefill = t0.elapsed().as_secs_f64();
-    session.mtp_past += prompt_ids.len();
+    // The prefill shapes are dead now, and at long context their compute buffers are
+    // the difference between decoding and running out of memory.
+    session.clear_fused_cache();
 
-    let last_idx = prompt_ids.len() - 1;
+    let last_idx = preds.len() - 1;
     let mut committed: Vec<u32> = vec![preds[last_idx]];
     // the chain gives this round's draft sequence, read at the last position
     let mut drafts: Vec<u32> = chain.iter().map(|c| c[last_idx]).collect();
+    next_depth = picker.choose();
+    drafts.truncate(next_depth);
     let (mut accepted, mut proposed, mut rounds) = (0usize, 0usize, 0usize);
+
+    // Candidate-restricted drafting: the DRAFT head projects onto a shortlist instead
+    // of all 248,320 rows. Verification always uses the full vocabulary, so a token the
+    // shortlist misses only costs that draft, never correctness.
+    //
+    // The shortlist is whatever the sequence itself has already used (text reuses its own
+    // vocabulary heavily) topped up with low ids, which in a BPE vocabulary are the
+    // common byte-level and early-merge tokens. TANDEM_CAND_DUMMY=1 fills it with 0..N
+    // to measure the mechanism's cost with acceptance deliberately destroyed.
+    let dummy_cand = std::env::var("TANDEM_CAND_DUMMY").as_deref() == Ok("1");
+    let build_cands = |ctx: &[u32], n: usize| -> Vec<i32> {
+        let mut out: Vec<i32> = Vec::with_capacity(n);
+        let mut seen = std::collections::HashSet::with_capacity(n * 2);
+        if !dummy_cand {
+            for t in ctx.iter().rev() {
+                if out.len() >= n {
+                    break;
+                }
+                if seen.insert(*t) {
+                    out.push(*t as i32);
+                }
+            }
+        }
+        let mut i = 0u32;
+        while out.len() < n {
+            if seen.insert(i) {
+                out.push(i as i32);
+            }
+            i += 1;
+        }
+        out
+    };
 
     let t1 = std::time::Instant::now();
     'outer: while committed.len() < n_gen {
@@ -234,13 +560,23 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         }
         let mut batch = vec![last];
         batch.extend_from_slice(&drafts);
-        let (preds, chain) = match round(&mut session, &batch) {
+        let cands = if n_cand > 0 {
+            let mut ctx = prompt_ids.clone();
+            ctx.extend_from_slice(&committed);
+            Some(build_cands(&ctx, n_cand))
+        } else {
+            None
+        };
+        let d = next_depth;
+        let t_round = std::time::Instant::now();
+        let (preds, chain) = match round(&mut session, &batch, d, cands.as_deref(), false) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("round: {e}");
                 return ExitCode::FAILURE;
             }
         };
+        let round_secs = t_round.elapsed().as_secs_f64();
         rounds += 1;
         proposed += drafts.len();
 
@@ -254,6 +590,8 @@ fn cmd_fused(args: &[String]) -> ExitCode {
             }
         }
         accepted += n_keep;
+        // the trial is over the drafts this batch actually carried
+        picker.observe(drafts.len(), d, n_keep, round_secs);
 
         for d in drafts.iter().take(n_keep) {
             committed.push(*d);
@@ -264,6 +602,13 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         committed.push(preds[n_keep]);
         // next round's drafts come from the chain at the accepted position
         drafts = chain.iter().map(|c| c[n_keep]).collect();
+        // Decide the next depth now and drop any drafts past it. A round's graph is
+        // shaped by (drafts carried in, chain length produced); letting those disagree
+        // turns M depths into an MxM matrix of shapes, each with its own compute
+        // buffer. Trimming costs a draft that was already computed and keeps a
+        // reduction free of transitional shapes entirely.
+        next_depth = picker.choose();
+        drafts.truncate(next_depth);
 
         let extra = drafts.len().saturating_sub(n_keep);
         let over = batch.len() - (n_keep + 1);
@@ -281,10 +626,12 @@ fn cmd_fused(args: &[String]) -> ExitCode {
 
     println!("{}", tok.decode(&committed, true));
     let rate = if proposed == 0 { 0.0 } else { accepted as f64 / proposed as f64 };
+    let dlabel = if adaptive { "auto".to_string() } else { depth.to_string() };
+    let picker_report = picker.report();
     eprintln!(
         "prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s) | \
-         fused depth {depth}: acceptance {accepted}/{proposed} = {rate:.3}, {rounds} rounds, \
-         {:.2} tok/round",
+         fused depth {dlabel}: acceptance {accepted}/{proposed} = {rate:.3}, {rounds} rounds, \
+         {:.2} tok/round{picker_report}",
         prompt_ids.len(),
         t_prefill,
         prompt_ids.len() as f64 / t_prefill,
@@ -777,6 +1124,8 @@ fn cmd_selftest(args: &[String]) -> ExitCode {
 fn cmd_gen(args: &[String]) -> ExitCode {
     let mut path: Option<&str> = None;
     let mut prompt = String::from("The capital of France is");
+    let mut sp = tandem_sample::SamplerParams::default();
+    let mut prompt_file: Option<String> = None;
     let mut n_gen = 16usize;
     let mut threads = 8i32;
     let mut n_ctx = 4096usize;
@@ -788,6 +1137,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     while let Some(a) = it.next() {
         match a.as_str() {
             "-p" => prompt = it.next().cloned().unwrap_or_default(),
+            "-f" => prompt_file = it.next().cloned(),
             "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(16),
             "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -802,6 +1152,17 @@ fn cmd_gen(args: &[String]) -> ExitCode {
                 })
             }
             "--ignore-eos" => ignore_eos = true,
+            "--temp" => sp.temp = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            "--top-k" => sp.top_k = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            "--top-p" => sp.top_p = it.next().and_then(|s| s.parse().ok()).unwrap_or(1.0),
+            "--min-p" => sp.min_p = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            "--repeat-penalty" => {
+                sp.penalty_repeat = it.next().and_then(|s| s.parse().ok()).unwrap_or(1.0)
+            }
+            "--repeat-last-n" => {
+                sp.penalty_last_n = it.next().and_then(|s| s.parse().ok()).unwrap_or(64)
+            }
+            "--seed" => sp.seed = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
             s if !s.starts_with('-') && path.is_none() => path = Some(s),
             s => {
@@ -810,8 +1171,22 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             }
         }
     }
+    // A long-context prompt does not fit on a command line; read it from a file.
+    if let Some(f) = prompt_file.as_deref() {
+        match std::fs::read_to_string(f) {
+            Ok(t) => prompt = t,
+            Err(e) => {
+                eprintln!("read {f}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let Some(path) = path else {
-        eprintln!("usage: tandem gen <file.gguf> [-p prompt] [-n tokens] [-t threads] [-c n_ctx]");
+        eprintln!(
+            "usage: tandem gen <file.gguf> [-p prompt|-f file] [-n tokens] [-t threads]\n\
+             \x20      [-c n_ctx] [--temp T] [--top-k K] [--top-p P] [--min-p P]\n\
+             \x20      [--repeat-penalty R] [--repeat-last-n N] [--seed S]"
+        );
         return ExitCode::from(2);
     };
 
@@ -857,17 +1232,58 @@ fn cmd_gen(args: &[String]) -> ExitCode {
 
     // prefill (single ubatch; chunk if longer than 512). Greedy sampling
     // happens inside the graph, so only the token id crosses the bus.
+    // Greedy keeps sampling inside the graph, so only a token id crosses the bus.
+    // Anything else needs the vocabulary on the host: ~1 MB per token, about 0.1 ms on
+    // this link against a ~26 ms step, which is why it is gated on the parameters rather
+    // than always paid.
+    let greedy = sp.is_greedy();
+    let mut sampler = tandem_sample::Sampler::new(sp.clone());
+    eprintln!(
+        "sampling: {}",
+        if greedy {
+            "greedy (in-graph argmax)".to_string()
+        } else {
+            format!(
+                "temp {:.2} top_k {} top_p {:.2} min_p {:.2} repeat {:.2} seed {}",
+                sp.temp, sp.top_k, sp.top_p, sp.min_p, sp.penalty_repeat, sp.seed
+            )
+        }
+    );
     let t0 = std::time::Instant::now();
     let mut next = 0u32;
-    for chunk in prompt_ids.chunks(512) {
-        next = match model.step_greedy(&mut session, chunk, threads) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("prefill: {e}");
-                return ExitCode::FAILURE;
+    let prefill_chunk: usize = std::env::var("TANDEM_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| tandem_server::engine::prefill_chunk_for(n_ctx));
+    sampler.accept_all(&prompt_ids);
+    for (ci, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
+        let last = (ci + 1) * prefill_chunk >= prompt_ids.len();
+        if greedy {
+            next = match model.step_greedy(&mut session, chunk, threads) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("prefill: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        } else {
+            // only the final chunk's distribution is sampled from
+            let outs = [(chunk.len() - 1) as i32];
+            match model.step(&mut session, chunk, &outs, threads) {
+                Ok(logits) => {
+                    if last {
+                        next = sampler.sample(&logits);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("prefill: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
-        };
+        }
     }
+    sampler.accept(next);
     let t_prefill = t0.elapsed().as_secs_f64();
 
     // decode
@@ -878,8 +1294,17 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         if !ignore_eos && Some(next) == tok.eos {
             break;
         }
-        next = match model.step_greedy(&mut session, &[next], threads) {
-            Ok(t) => t,
+        next = match (if greedy {
+            model.step_greedy(&mut session, &[next], threads)
+        } else {
+            model
+                .step(&mut session, &[next], &[0], threads)
+                .map(|logits| sampler.sample(&logits))
+        }) {
+            Ok(t) => {
+                sampler.accept(t);
+                t
+            }
             Err(e) => {
                 eprintln!("decode: {e}");
                 return ExitCode::FAILURE;

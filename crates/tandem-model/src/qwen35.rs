@@ -202,6 +202,15 @@ pub(crate) struct MtpTail {
     pub n_kv: i64,
     /// how many drafts to chain inside this one graph
     pub depth: usize,
+    /// Size of the candidate vocabulary the DRAFT head projects onto, or 0
+    /// for the full vocabulary.
+    ///
+    /// A draft only needs its argmax, so projecting onto a shortlist instead
+    /// of all 248k rows turns a 1.27 GiB read into a few tens of MB. It stays
+    /// lossless because verification always uses the FULL vocabulary: if the
+    /// true token is outside the shortlist the draft is simply wrong and gets
+    /// rejected, exactly like any other bad draft.
+    pub n_cand: i64,
 }
 
 /// Kernel-path bisect switches, kept from the CUDA debugging campaign.
@@ -235,6 +244,26 @@ enum StepOut {
     Tokens(Vec<u32>),
 }
 
+/// How a graph's tokens map onto sequences.
+///
+/// The attention layers, FFN and sampling are already per-token — position, mask row
+/// and KV write row are per-token inputs — so serving several sequences at once only
+/// changes the recurrent layers, whose state carries one slice per sequence.
+#[derive(Clone, Copy, PartialEq)]
+enum SeqMode {
+    /// All tokens belong to one sequence using recurrent-state slot 0 and the
+    /// K-snapshot rollback machinery. Everything before batching.
+    Single,
+    /// All tokens belong to one sequence, but its recurrent state lives in slot `.0`
+    /// of a shared batch session, and exactly one snapshot (the live state) is kept.
+    /// Used to prefill one sequence of a batch.
+    Slot(i64),
+    /// `t_len` tokens, one per sequence: token i is sequence i's next token, the
+    /// state's slot dimension is the sequence dimension, and the GDN op runs in its
+    /// `n_seqs` form with K = 1.
+    Batched,
+}
+
 enum StateSrc {
     /// Zero states, no KV cache, positions start at 0 (reference rig).
     Stateless,
@@ -254,12 +283,18 @@ struct Built {
     state_zero: *mut ffi::ggml_tensor,
     out_ids: *mut ffi::ggml_tensor,
     out: *mut ffi::ggml_tensor,
+    /// The trunk's logits before sampling. Kept readable even when the graph samples
+    /// in-place: verifying a draft above temperature 0 asks how likely the target was
+    /// to produce the drafted token, which needs the distribution, not the winner.
+    logits: *mut ffi::ggml_tensor,
     /// pre-LM-head hidden states at the requested positions (MTP input)
     h_out: *mut ffi::ggml_tensor,
     /// fused draft head outputs, when the MTP tail is attached
     draft_out: *mut ffi::ggml_tensor,
     /// chained drafts beyond the first, in order
     draft_chain: Vec<*mut ffi::ggml_tensor>,
+    /// candidate token ids the draft head projects onto (empty = full vocab)
+    cand_ids: *mut ffi::ggml_tensor,
     mtp_pos: *mut ffi::ggml_tensor,
     mtp_mask: *mut ffi::ggml_tensor,
     mtp_rows: *mut ffi::ggml_tensor,
@@ -308,6 +343,38 @@ impl Drop for CachedStep {
 /// Persistent per-sequence state: KV caches for attention layers, conv + GDN
 /// recurrent states for GDN layers. Lives in its own backend buffer, distinct
 /// from any compute buffer, so graph allocation can never reuse it.
+
+/// Report a graph's compute-buffer size when `TANDEM_TRACE_MEM=1`.
+///
+/// At long context the question "what actually does not fit" is otherwise guesswork:
+/// the weights and KV cache are easy to compute by hand, and everything left over is
+/// this.
+/// Window the draft head's KV cache reaches back over. `TANDEM_MTP_CTX` overrides.
+fn mtp_ctx_cap() -> usize {
+    std::env::var("TANDEM_MTP_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(16384)
+}
+
+pub(crate) unsafe fn trace_mem(what: &str, galloc: ffi::ggml_gallocr_t, n_kv: i64, t_len: i64) {
+    use std::sync::atomic::{AtomicI8, Ordering};
+    static ON: AtomicI8 = AtomicI8::new(-1);
+    let mut on = ON.load(Ordering::Relaxed);
+    if on < 0 {
+        on = i8::from(std::env::var("TANDEM_TRACE_MEM").as_deref() == Ok("1"));
+        ON.store(on, Ordering::Relaxed);
+    }
+    if on == 1 {
+        let bytes = ffi::ggml_gallocr_get_buffer_size(galloc, 0);
+        eprintln!(
+            "[mem] {what}: compute buffer {:.1} MiB (n_kv {n_kv}, t_len {t_len})",
+            bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+}
+
 pub struct Session {
     pub n_ctx_max: usize,
     pub n_past: usize,
@@ -318,6 +385,8 @@ pub struct Session {
     pub k_slots: i64,
     /// flash-attention path (untransposed V cache); TANDEM_NO_FA=1 disables
     pub fa: bool,
+    /// whether the caches live on the tensor-parallel meta device
+    tp: bool,
     ctx: *mut ffi::ggml_context,
     buffer: ffi::ggml_backend_buffer_t,
     /// scratch allocator for general (prefill / odd-shaped) steps
@@ -329,15 +398,50 @@ pub struct Session {
     /// KV cache for the single MTP draft block (blk.n_layer)
     mtp_k: *mut ffi::ggml_tensor,
     mtp_v: *mut ffi::ggml_tensor,
+    /// How far back the draft head's own KV cache reaches. Bounded independently of the
+    /// trunk's context, because it is an optimisation and not a correctness
+    /// requirement: every draft is verified against the full model, so a shorter window
+    /// can only cost acceptance. At 196K the unbounded version is 0.38 GiB per card,
+    /// which is most of the headroom that decides whether speculation fits at all.
+    pub mtp_ctx_max: usize,
     /// how many tokens the MTP block has consumed
     pub mtp_past: usize,
     /// MTP draft graph, rebuilt only when the KV bucket changes. Building it
     /// per draft cost ~6 ms on the 27B — several times the head's actual
     /// compute — and prevented CUDA-graph reuse.
     mtp_cached: Option<(crate::mtp_graph::MtpGraph, ffi::ggml_gallocr_t, i64)>,
-    /// the fused verify+draft graph, built per (bucket, mtp_bucket)
-    fused: Option<FusedStep>,
+    /// Fused verify+draft graphs, keyed by their shape. Adaptive depth moves between
+    /// depths round to round, and a switch also produces a transient shape (the batch
+    /// carries the old depth's drafts while the chain runs at the new depth), so this
+    /// is a small LRU rather than a single slot. Each entry owns a compute buffer, so
+    /// the cap is a VRAM decision as much as a hit-rate one.
+    fused: Vec<FusedStep>,
+    fused_clock: u64,
+    /// the one replayed graph of batched decoding, keyed by sequence count
+    batch_step: Option<BatchStep>,
     cached: Option<CachedStep>,
+    /// One rollback graph per rollback distance, kept for the life of the session.
+    /// Distance is a view offset, so it cannot be an input — but there are only
+    /// k_slots of them. Keeping the contexts alive matters for more than the build
+    /// cost: the meta backend keys its per-device tensor map on raw tensor pointers,
+    /// so a context that is freed and re-allocated every round hands the same
+    /// addresses to different tensors and silently aliases another graph's entries.
+    rollback: Vec<Option<RollbackGraph>>,
+    /// Contexts of superseded cached graphs, held until the session ends.
+    ///
+    /// Freeing one is not safe while the session lives: the meta backend keys its
+    /// per-device tensor map on raw tensor pointers, and a freed metadata context
+    /// hands the same addresses back to the next graph, which then aliases the dead
+    /// graph's entries. These are metadata-only (no_alloc) contexts of a few MB, and
+    /// a session supersedes a graph only when the KV bucket grows, so there are a
+    /// handful at most.
+    graveyard: Vec<*mut ffi::ggml_context>,
+}
+
+struct RollbackGraph {
+    ctx: *mut ffi::ggml_context,
+    gf: *mut ffi::ggml_cgraph,
+    galloc: ffi::ggml_gallocr_t,
 }
 
 impl Session {
@@ -413,13 +517,14 @@ impl Session {
             // second half's layers. Placing them per-layer is the next step
             // (tracked in ROADMAP M3).
             // MTP draft block: one attention layer with its own cache
+            let mtp_ctx_max = n_ctx_max.min(mtp_ctx_cap());
             let mtp_k = ffi::ggml_new_tensor_2d(
-                ctx, f16t, hp.head_k * hp.n_head_kv, n_ctx_max as i64,
+                ctx, f16t, hp.head_k * hp.n_head_kv, mtp_ctx_max as i64,
             );
             let mtp_v = if fa {
-                ffi::ggml_new_tensor_2d(ctx, f16t, hp.head_v * hp.n_head_kv, n_ctx_max as i64)
+                ffi::ggml_new_tensor_2d(ctx, f16t, hp.head_v * hp.n_head_kv, mtp_ctx_max as i64)
             } else {
-                ffi::ggml_new_tensor_2d(ctx, f16t, n_ctx_max as i64, hp.head_v * hp.n_head_kv)
+                ffi::ggml_new_tensor_2d(ctx, f16t, mtp_ctx_max as i64, hp.head_v * hp.n_head_kv)
             };
             name_it(mtp_k, format!("cache_k_l{}", hp.n_layer));
             name_it(mtp_v, format!("cache_v_l{}", hp.n_layer));
@@ -443,6 +548,7 @@ impl Session {
                 n_past: 0,
                 k_slots,
                 fa,
+                tp: model.weights.is_tensor_parallel(),
                 ctx,
                 buffer,
                 galloc,
@@ -452,9 +558,14 @@ impl Session {
                 gdn_state,
                 mtp_k,
                 mtp_v,
+                mtp_ctx_max,
                 mtp_past: 0,
                 mtp_cached: None,
-                fused: None,
+                fused: Vec::new(),
+                fused_clock: 0,
+                batch_step: None,
+                rollback: (0..=k_slots).map(|_| None).collect(),
+                graveyard: Vec::new(),
                 cached: None,
             })
         }
@@ -472,21 +583,58 @@ impl Session {
         }
     }
 
+    /// Drop every cached fused graph shape, freeing their compute buffers.
+    ///
+    /// Prefill builds shapes that decoding never uses again, and each one owns a
+    /// compute buffer holding a mask of `n_kv x chunk` and logits of `n_vocab x chunk`.
+    /// At short context that is noise; at 137K it is gigabytes, and it is what made a
+    /// speculative run fail to allocate 317 MiB while plain decoding at the same
+    /// context still had room.
+    pub fn clear_fused_cache(&mut self) {
+        for c in self.fused.drain(..) {
+            unsafe { ffi::ggml_gallocr_free(c.galloc) }
+            self.graveyard.push(c.built.ctx);
+        }
+    }
+
     pub fn reset(&mut self) {
         unsafe {
             ffi::ggml_backend_buffer_clear(self.buffer, 0);
         }
+        for r in self.rollback.iter_mut() {
+            if let Some(r) = r.take() {
+                unsafe {
+                    ffi::ggml_gallocr_free(r.galloc);
+                    ffi::ggml_free(r.ctx);
+                }
+            }
+        }
         self.cached = None;
         self.mtp_cached = None;
-        if let Some(c) = self.fused.take() {
-            unsafe {
-                ffi::ggml_gallocr_free(c.galloc);
-                ffi::ggml_free(c.built.ctx);
-            }
+        // Retire the cached graphs. Keeping them across a reset looks like the obvious
+        // optimisation — the shapes recur and the session tensors survive — but it
+        // crashes the process on the next speculative request, so something in the
+        // backend's per-graph state does not survive a reset the way the tensors do.
+        // Not chased further; the cost is a graph rebuild per request, and the note is
+        // here so the next attempt starts from "this was tried".
+        for c in self.fused.drain(..) {
+            unsafe { ffi::ggml_gallocr_free(c.galloc) }
+            self.graveyard.push(c.built.ctx);
+        }
+        if let Some(c) = self.batch_step.take() {
+            unsafe { ffi::ggml_gallocr_free(c.galloc) }
+            self.graveyard.push(c.built.ctx);
         }
         self.n_past = 0;
         self.mtp_past = 0;
     }
+}
+
+struct BatchStep {
+    built: Built,
+    galloc: ffi::ggml_gallocr_t,
+    t_len: i64,
+    want_logits: bool,
 }
 
 struct FusedStep {
@@ -495,11 +643,184 @@ struct FusedStep {
     bucket: i64,
     mtp_bucket: i64,
     t_len: i64,
+    /// how many positions the graph emits predictions for: `t_len`, or 1 for a prefill
+    n_out: i64,
+    n_cand: i64,
+    /// Chain length baked into the graph. Independent of `t_len` — the batch carries
+    /// however many drafts the PREVIOUS round produced, while this is how many the
+    /// current one will produce — so it has to be part of the key in its own right.
+    depth: usize,
+    used: u64,
+}
+
+/// How many fused graph shapes to keep. Adaptive depth settles on one depth but probes
+/// its neighbours, and each probe passes through a transitional shape, so a handful
+/// covers the churn. Each entry owns its own compute buffer, so this is a VRAM decision
+/// before it is a hit-rate one. Six is enough that a session bounded to three depths
+/// never evicts, which matters for more than hit rate: eviction frees a compute buffer
+/// the backend may still hold registrations against.
+const FUSED_CACHE: usize = 6;
+
+
+/// A session's state, lifted to host RAM.
+///
+/// This is the other half of fast conversations: in-session prefix reuse makes the
+/// *next* turn of the current conversation cheap, and a snapshot makes *returning* to a
+/// different conversation cheap — copy ~2 GiB back over PCIe (~0.1 s) instead of
+/// re-prefilling 32K tokens (~24 s). Only the used prefix of each cache is copied:
+/// the K/V tensors are allocated at full context, but their first `n_past` columns are
+/// contiguous, which is what makes the copy a single `tensor_get` per tensor.
+pub struct SessionSnapshot {
+    n_past: usize,
+    mtp_past: usize,
+    k: Vec<Vec<u8>>,
+    v: Vec<Vec<u8>>,
+    conv: Vec<Vec<u8>>,
+    gdn: Vec<Vec<u8>>,
+    mtp_k: Vec<u8>,
+    mtp_v: Vec<u8>,
+}
+
+impl SessionSnapshot {
+    pub fn nbytes(&self) -> usize {
+        self.k.iter().map(Vec::len).sum::<usize>()
+            + self.v.iter().map(Vec::len).sum::<usize>()
+            + self.conv.iter().map(Vec::len).sum::<usize>()
+            + self.gdn.iter().map(Vec::len).sum::<usize>()
+            + self.mtp_k.len()
+            + self.mtp_v.len()
+    }
+
+    pub fn n_past(&self) -> usize {
+        self.n_past
+    }
+}
+
+unsafe fn get_prefix(t: *mut ffi::ggml_tensor, cols: usize) -> Vec<u8> {
+    // The per-layer cache vectors are indexed by layer and null for the other layer
+    // kind — attention layers have no conv/gdn state, recurrent layers no KV.
+    if t.is_null() {
+        return Vec::new();
+    }
+    let bytes = cols * (*t).nb[1];
+    let mut buf = vec![0u8; bytes];
+    if bytes > 0 {
+        ffi::ggml_backend_tensor_get(t, buf.as_mut_ptr().cast(), 0, bytes);
+    }
+    buf
+}
+
+unsafe fn get_all(t: *mut ffi::ggml_tensor) -> Vec<u8> {
+    if t.is_null() {
+        return Vec::new();
+    }
+    let bytes = ffi::ggml_nbytes(t);
+    let mut buf = vec![0u8; bytes];
+    ffi::ggml_backend_tensor_get(t, buf.as_mut_ptr().cast(), 0, bytes);
+    buf
+}
+
+impl Session {
+    /// Copy this session's state to host RAM. `None` when the layout does not support
+    /// it (the non-flash-attention V cache stores token columns transposed, so its used
+    /// prefix is not contiguous — not worth supporting for a debug path).
+    pub fn snapshot(&self) -> Option<SessionSnapshot> {
+        if !self.fa {
+            return None;
+        }
+        // Not supported under tensor parallelism: the meta backend's split-tensor
+        // get/set handles axes 0 and 1 in three dimensions, and the GDN state is
+        // four-dimensional and split on axis 2 (GGML_ASSERT(tensor->ne[3] == 1) at
+        // ggml-backend-meta.cpp:1441). The TP path gets conversation switching from
+        // the session pool instead — whole sessions resident in VRAM, switched by
+        // pointer, which is faster than any copy could be.
+        if self.tp {
+            return None;
+        }
+        let whole = false;
+        unsafe {
+            Some(SessionSnapshot {
+                n_past: self.n_past,
+                mtp_past: self.mtp_past,
+                k: self
+                    .k_cache
+                    .iter()
+                    .map(|t| if whole { get_all(*t) } else { get_prefix(*t, self.n_past) })
+                    .collect(),
+                v: self
+                    .v_cache
+                    .iter()
+                    .map(|t| if whole { get_all(*t) } else { get_prefix(*t, self.n_past) })
+                    .collect(),
+                conv: self.conv_state.iter().map(|t| get_all(*t)).collect(),
+                gdn: self.gdn_state.iter().map(|t| get_all(*t)).collect(),
+                mtp_k: if whole {
+                    get_all(self.mtp_k)
+                } else {
+                    get_prefix(self.mtp_k, self.mtp_past)
+                },
+                mtp_v: if whole {
+                    get_all(self.mtp_v)
+                } else {
+                    get_prefix(self.mtp_v, self.mtp_past)
+                },
+            })
+        }
+    }
+
+    /// Load a snapshot back into this session, replacing whatever it held.
+    pub fn restore(&mut self, snap: &SessionSnapshot) {
+        self.reset();
+        unsafe {
+            for (t, buf) in self.k_cache.iter().zip(&snap.k) {
+                if !t.is_null() && !buf.is_empty() {
+                    ffi::ggml_backend_tensor_set(*t, buf.as_ptr().cast(), 0, buf.len());
+                }
+            }
+            for (t, buf) in self.v_cache.iter().zip(&snap.v) {
+                if !t.is_null() && !buf.is_empty() {
+                    ffi::ggml_backend_tensor_set(*t, buf.as_ptr().cast(), 0, buf.len());
+                }
+            }
+            for (t, buf) in self.conv_state.iter().zip(&snap.conv) {
+                if !t.is_null() && !buf.is_empty() {
+                    ffi::ggml_backend_tensor_set(*t, buf.as_ptr().cast(), 0, buf.len());
+                }
+            }
+            for (t, buf) in self.gdn_state.iter().zip(&snap.gdn) {
+                if !t.is_null() && !buf.is_empty() {
+                    ffi::ggml_backend_tensor_set(*t, buf.as_ptr().cast(), 0, buf.len());
+                }
+            }
+            if !snap.mtp_k.is_empty() {
+                ffi::ggml_backend_tensor_set(self.mtp_k, snap.mtp_k.as_ptr().cast(), 0, snap.mtp_k.len());
+            }
+            if !snap.mtp_v.is_empty() {
+                ffi::ggml_backend_tensor_set(self.mtp_v, snap.mtp_v.as_ptr().cast(), 0, snap.mtp_v.len());
+            }
+        }
+        self.n_past = snap.n_past;
+        self.mtp_past = snap.mtp_past;
+    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(c) = self.fused.take() {
+        for r in self.rollback.iter_mut() {
+            if let Some(r) = r.take() {
+                unsafe {
+                    ffi::ggml_gallocr_free(r.galloc);
+                    ffi::ggml_free(r.ctx);
+                }
+            }
+        }
+        for c in self.fused.drain(..) {
+            unsafe {
+                ffi::ggml_gallocr_free(c.galloc);
+                ffi::ggml_free(c.built.ctx);
+            }
+        }
+        if let Some(c) = self.batch_step.take() {
             unsafe {
                 ffi::ggml_gallocr_free(c.galloc);
                 ffi::ggml_free(c.built.ctx);
@@ -509,6 +830,9 @@ impl Drop for Session {
             unsafe { ffi::ggml_gallocr_free(ga) }
         }
         self.cached = None;
+        for ctx in self.graveyard.drain(..) {
+            unsafe { ffi::ggml_free(ctx) }
+        }
         unsafe {
             ffi::ggml_gallocr_free(self.galloc);
             ffi::ggml_backend_buffer_free(self.buffer);
@@ -774,6 +1098,10 @@ impl Qwen35 {
         }
         let hp = &self.hp;
         unsafe {
+            if let Some(r) = self.rollback_slot(session, n) {
+                return self.compute(r, n_threads);
+            }
+
             // Per recurrent layer: 2 copies plus 4 views — and a view is a
             // NODE in ggml, not a leaf. The 27B needs 48*6 = 288; sizing this
             // by hand is what overflowed the graph before.
@@ -789,13 +1117,6 @@ impl Qwen35 {
             if ctx.is_null() {
                 return Err(ModelError::Load("rollback ctx".into()));
             }
-            struct G(*mut ffi::ggml_context);
-            impl Drop for G {
-                fn drop(&mut self) {
-                    unsafe { ffi::ggml_free(self.0) }
-                }
-            }
-            let _g = G(ctx);
             let gf = ffi::ggml_new_graph_custom(ctx, n_nodes, false);
             for il in 0..hp.n_layer {
                 if !hp.is_recurrent(il) {
@@ -827,17 +1148,51 @@ impl Qwen35 {
                 );
                 ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, gdn_src, gdn_dst));
             }
+            // A dedicated allocator: sharing the session scratch allocator with the
+            // fused graph would hand both the same arena and invalidate whichever was
+            // allocated first.
+            let galloc = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
+                self.weights.backend(),
+            ));
+            if galloc.is_null() {
+                ffi::ggml_free(ctx);
+                return Err(ModelError::Load("rollback galloc".into()));
+            }
             if let Some(sched) = self.weights.sched() {
                 ffi::ggml_backend_sched_reset(sched);
                 if !ffi::ggml_backend_sched_alloc_graph(sched, gf) {
+                    ffi::ggml_gallocr_free(galloc);
+                    ffi::ggml_free(ctx);
                     return Err(ModelError::Load("rollback sched alloc".into()));
                 }
-            } else if !ffi::ggml_gallocr_alloc_graph(session.galloc, gf) {
+            } else if !ffi::ggml_gallocr_alloc_graph(galloc, gf) {
+                ffi::ggml_gallocr_free(galloc);
+                ffi::ggml_free(ctx);
                 return Err(ModelError::Load("rollback alloc".into()));
             }
+            if self.weights.sched().is_none() {
+                ffi::ggml_graph_set_new_uid(gf);
+            }
             self.compute(gf, n_threads)?;
+            // Only the allocator path may be replayed: a scheduler-allocated graph is
+            // invalidated by the next ggml_backend_sched_reset.
+            if self.weights.sched().is_none() && session.rollback.get(n).is_some() {
+                session.rollback[n] = Some(RollbackGraph { ctx, gf, galloc });
+            } else {
+                ffi::ggml_gallocr_free(galloc);
+                ffi::ggml_free(ctx);
+            }
         }
         Ok(())
+    }
+
+    /// The cached rollback graph for distance `n`, if it has been built already.
+    fn rollback_slot(
+        &self,
+        session: &Session,
+        n: usize,
+    ) -> Option<*mut ffi::ggml_cgraph> {
+        session.rollback.get(n).and_then(|s| s.as_ref()).map(|r| r.gf)
     }
 
     /// Trunk step that also returns the pre-LM-head hidden state, which the
@@ -1021,13 +1376,25 @@ impl Qwen35 {
     /// a cached verify with per-draft graphs aborts. Folding the draft head
     /// into the verify graph leaves exactly one graph per round, which is
     /// both cacheable and free of that interleaving.
+    /// One fused verify+draft round.
+    ///
+    /// `last_only` asks for predictions at just the final position instead of every
+    /// one. A decode round needs them all — that is what verification compares against
+    /// — but a prefill has nothing to verify, and asking for all of them materialises a
+    /// logits tensor of `n_vocab x n_prompt`: 26 GiB on a 27K-token prompt, which is
+    /// simply an allocation failure. It is the reason speculative decoding worked to
+    /// about 9K tokens of context and not beyond.
     pub fn step_fused_cached(
         &self,
         session: &mut Session,
         tokens: &[u32],
         depth: usize,
+        cands: Option<&[i32]>,
+        last_only: bool,
+        want_logits: bool,
         n_threads: i32,
     ) -> Result<(Vec<u32>, Vec<Vec<u32>>, Vec<f32>), ModelError> {
+        let n_cand = cands.map(|c| c.len() as i64).unwrap_or(0);
         if session.n_past + tokens.len() > session.n_ctx_max {
             return Err(ModelError::Load("context overflow".into()));
         }
@@ -1035,99 +1402,165 @@ impl Qwen35 {
             return Err(ModelError::Load("fused round needs in-graph sampling".into()));
         }
         let t_len = tokens.len() as i64;
+        let n_out = if last_only { 1 } else { t_len };
         let kvb = kv_bucket();
         let bucket = ((((session.n_past as i64 + t_len) + kvb - 1) / kvb) * kvb)
             .min(session.n_ctx_max as i64);
+        // The draft head's window is bounded, so when it fills, drop its history and
+        // start again. Only draft quality is affected — the verifier is unchanged — and
+        // acceptance recovers within a few rounds.
+        if session.mtp_past + tokens.len() > session.mtp_ctx_max {
+            session.mtp_past = 0;
+        }
         let mtp_bucket = ((((session.mtp_past as i64 + t_len) + kvb - 1) / kvb) * kvb)
-            .min(session.n_ctx_max as i64);
+            .min(session.mtp_ctx_max as i64);
 
         unsafe {
-            let stale = session
-                .fused
-                .as_ref()
-                .map(|c| c.bucket != bucket || c.mtp_bucket != mtp_bucket || c.t_len != t_len)
-                .unwrap_or(true);
-            if stale {
-                if let Some(c) = session.fused.take() {
-                    ffi::ggml_gallocr_free(c.galloc);
-                    ffi::ggml_free(c.built.ctx);
+            session.fused_clock += 1;
+            let hit = session.fused.iter().position(|c| {
+                c.bucket == bucket
+                    && c.mtp_bucket == mtp_bucket
+                    && c.t_len == t_len
+                    && c.n_out == n_out
+                    && c.n_cand == n_cand
+                    && c.depth == depth
+            });
+            let idx = match hit {
+                Some(i) => {
+                    session.fused[i].used = session.fused_clock;
+                    i
                 }
-                let tail = MtpTail {
-                    k_cache: session.mtp_k,
-                    v_cache: session.mtp_v,
-                    n_ctx_max: session.n_ctx_max,
-                    n_past: 0,
-                    n_kv: mtp_bucket,
-                    depth,
-                };
-                let built = self.build_inner(
-                    t_len,
-                    bucket,
-                    &StateSrc::Session(session.view()),
-                    t_len,
-                    /* use_set_rows */ true,
-                    0,
-                    /* greedy */ true,
-                    Some(tail),
-                )?;
-                let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
-                    self.weights.backend(),
-                ));
-                if ga.is_null() || !ffi::ggml_gallocr_alloc_graph(ga, built.gf) {
-                    return Err(ModelError::Load("fused graph alloc".into()));
+                None => {
+                    if session.fused.len() >= FUSED_CACHE {
+                        let victim = session
+                            .fused
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, c)| c.used)
+                            .map(|(i, _)| i)
+                            .unwrap();
+                        let c = session.fused.remove(victim);
+                        ffi::ggml_gallocr_free(c.galloc);
+                        session.graveyard.push(c.built.ctx);
+                    }
+                    let tail = MtpTail {
+                        k_cache: session.mtp_k,
+                        v_cache: session.mtp_v,
+                        n_ctx_max: session.n_ctx_max,
+                        n_past: 0,
+                        n_kv: mtp_bucket,
+                        depth,
+                        n_cand,
+                    };
+                    let built = self.build_inner(
+                        t_len,
+                        bucket,
+                        &StateSrc::Session(session.view()),
+                        n_out,
+                        /* use_set_rows */ true,
+                        0,
+                        /* greedy */ true,
+                        Some(tail),
+                        SeqMode::Single,
+                    )?;
+                    let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
+                        self.weights.backend(),
+                    ));
+                    if ga.is_null() || !ffi::ggml_gallocr_alloc_graph(ga, built.gf) {
+                        return Err(ModelError::Load(format!(
+                            "fused graph alloc failed (t_len {t_len}, depth {depth}, \
+                             {} shapes cached) — likely out of device memory",
+                            session.fused.len()
+                        )));
+                    }
+                    trace_mem("fused", ga, bucket, t_len);
+                    // Frozen from here on: give it an identity so the backend can tell
+                    // a replay from a new graph and skip rebuilding its per-device map.
+                    ffi::ggml_graph_set_new_uid(built.gf);
+                    session.fused.push(FusedStep {
+                        built,
+                        galloc: ga,
+                        bucket,
+                        mtp_bucket,
+                        t_len,
+                        n_out,
+                        n_cand,
+                        depth,
+                        used: session.fused_clock,
+                    });
+                    session.fused.len() - 1
                 }
-                session.fused = Some(FusedStep {
-                    built,
-                    galloc: ga,
-                    bucket,
-                    mtp_bucket,
-                    t_len,
-                });
-            }
-            let c = session.fused.as_ref().unwrap();
+            };
+            let c = &session.fused[idx];
             let b = &c.built;
             let t = tokens.len();
+            let no = n_out as usize;
+            // The draft head runs on the positions the trunk emits, so with `last_only`
+            // it sees one position and writes one KV entry — its own cache stays
+            // compacted while RoPE below still uses the true sequence positions.
+            let first_out = t - no;
 
-            let out_positions: Vec<i32> = (0..t as i32).collect();
+            let out_positions: Vec<i32> = (first_out..t).map(|i| i as i32).collect();
             self.fill_inputs(b, tokens, session.n_past, &out_positions);
             let rows: Vec<i64> = (0..t).map(|i| (session.n_past + i) as i64).collect();
             ffi::ggml_backend_tensor_set(b.row_ids, rows.as_ptr().cast(), 0, t * 8);
 
-            let mut mpos = vec![0i32; t * 4];
-            for i in 0..t {
-                let p = (session.n_past + i + 1) as i32;
+            let mut mpos = vec![0i32; no * 4];
+            for i in 0..no {
+                let p = (session.n_past + first_out + i + 1) as i32;
                 mpos[i] = p;
-                mpos[t + i] = p;
-                mpos[2 * t + i] = p;
+                mpos[no + i] = p;
+                mpos[2 * no + i] = p;
             }
             ffi::ggml_backend_tensor_set(b.mtp_pos, mpos.as_ptr().cast(), 0, mpos.len() * 4);
-            let mrows: Vec<i64> = (0..t).map(|i| (session.mtp_past + i) as i64).collect();
-            ffi::ggml_backend_tensor_set(b.mtp_rows, mrows.as_ptr().cast(), 0, t * 8);
+            let mrows: Vec<i64> = (0..no).map(|i| (session.mtp_past + i) as i64).collect();
+            ffi::ggml_backend_tensor_set(b.mtp_rows, mrows.as_ptr().cast(), 0, no * 8);
 
             let nkv = b.mtp_n_kv as usize;
-            let mut mask = vec![0xFC00u16; nkv * t];
-            for q in 0..t {
+            let mut mask = vec![0xFC00u16; nkv * no];
+            for q in 0..no {
                 for kv in 0..=(session.mtp_past + q).min(nkv - 1) {
                     mask[q * nkv + kv] = 0;
                 }
             }
             ffi::ggml_backend_tensor_set(b.mtp_mask, mask.as_ptr().cast(), 0, mask.len() * 2);
+            if let (Some(c), false) = (cands, b.cand_ids.is_null()) {
+                ffi::ggml_backend_tensor_set(b.cand_ids, c.as_ptr().cast(), 0, c.len() * 4);
+            }
 
             self.compute(b.gf, n_threads)?;
 
-            let mut preds = vec![0i32; t];
-            ffi::ggml_backend_tensor_get(b.out, preds.as_mut_ptr().cast(), 0, t * 4);
+            let mut preds = vec![0i32; no];
+            ffi::ggml_backend_tensor_get(b.out, preds.as_mut_ptr().cast(), 0, no * 4);
             let mut chain: Vec<Vec<u32>> = Vec::new();
             for tnsr in std::iter::once(b.draft_out).chain(b.draft_chain.iter().copied()) {
-                let mut ids = vec![0i32; t];
-                ffi::ggml_backend_tensor_get(tnsr, ids.as_mut_ptr().cast(), 0, t * 4);
-                chain.push(ids.into_iter().map(|v| v as u32).collect());
+                let mut ids = vec![0i32; no];
+                ffi::ggml_backend_tensor_get(tnsr, ids.as_mut_ptr().cast(), 0, no * 4);
+                // with a shortlist the argmax indexes the shortlist, not the vocab
+                chain.push(match cands {
+                    Some(c) => ids
+                        .into_iter()
+                        .map(|v| *c.get(v as usize).unwrap_or(&0) as u32)
+                        .collect(),
+                    None => ids.into_iter().map(|v| v as u32).collect(),
+                });
             }
-            let mut hidden = vec![0f32; self.hp.n_embd as usize * t];
-            ffi::ggml_backend_tensor_get(b.h_out, hidden.as_mut_ptr().cast(), 0, hidden.len() * 4);
+            // Only read the vocabulary back when a caller needs the distribution: it is
+            // n_vocab x n_out floats, ~4 MB at four positions, and greedy rounds have no
+            // use for it.
+            let mut logits = Vec::new();
+            if want_logits {
+                logits = vec![0f32; self.hp.n_vocab as usize * no];
+                ffi::ggml_backend_tensor_get(
+                    b.logits,
+                    logits.as_mut_ptr().cast(),
+                    0,
+                    logits.len() * 4,
+                );
+            }
 
             session.n_past += t;
-            Ok((preds.into_iter().map(|v| v as u32).collect(), chain, hidden))
+            Ok((preds.into_iter().map(|v| v as u32).collect(), chain, logits))
         }
     }
 
@@ -1145,8 +1578,10 @@ impl Qwen35 {
         session: &mut Session,
         tokens: &[u32],
         depth: usize,
+        cands: Option<&[i32]>,
         n_threads: i32,
     ) -> Result<(Vec<u32>, Vec<Vec<u32>>), ModelError> {
+        let n_cand = cands.map(|c| c.len() as i64).unwrap_or(0);
         if session.n_past + tokens.len() > session.n_ctx_max {
             return Err(ModelError::Load("context overflow".into()));
         }
@@ -1158,9 +1593,12 @@ impl Qwen35 {
         let n_out = tokens.len();
         let out_positions: Vec<i32> = (0..n_out as i32).collect();
         let kvb = kv_bucket();
+        if session.mtp_past + n_out > session.mtp_ctx_max {
+            session.mtp_past = 0;
+        }
         let mtp_kv_exact = (session.mtp_past + n_out) as i64;
         let mtp_n_kv =
-            (((mtp_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
+            (((mtp_kv_exact + kvb - 1) / kvb) * kvb).min(session.mtp_ctx_max as i64);
 
         let view = session.view();
         let galloc = session.galloc;
@@ -1173,6 +1611,7 @@ impl Qwen35 {
                 n_past: session.mtp_past,
                 n_kv: mtp_n_kv,
                 depth,
+                n_cand,
             };
             let built = self.build(
                 n_out as i64,
@@ -1233,6 +1672,10 @@ impl Qwen35 {
                 );
             }
 
+            if let (Some(c), false) = (cands, built.cand_ids.is_null()) {
+                ffi::ggml_backend_tensor_set(built.cand_ids, c.as_ptr().cast(), 0, c.len() * 4);
+            }
+
             self.compute(built.gf, n_threads)?;
 
             let mut preds = vec![0i32; n_out];
@@ -1243,7 +1686,13 @@ impl Qwen35 {
             {
                 let mut ids = vec![0i32; n_out];
                 ffi::ggml_backend_tensor_get(tnsr, ids.as_mut_ptr().cast(), 0, n_out * 4);
-                chain.push(ids.into_iter().map(|v| v as u32).collect());
+                chain.push(match cands {
+                    Some(c) => ids
+                        .into_iter()
+                        .map(|v| *c.get(v as usize).unwrap_or(&0) as u32)
+                        .collect(),
+                    None => ids.into_iter().map(|v| v as u32).collect(),
+                });
             }
             (preds.into_iter().map(|v| v as u32).collect::<Vec<u32>>(), chain)
         };
@@ -1460,6 +1909,7 @@ impl Qwen35 {
                     0,
                     greedy,
                     None,
+                    SeqMode::Single,
                 )?;
                 let galloc = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                     self.weights.backend(),
@@ -1473,6 +1923,8 @@ impl Qwen35 {
                     ffi::ggml_free(built.ctx);
                     return Err(ModelError::Load("decode graph alloc".into()));
                 }
+                trace_mem("decode", galloc, bucket, t_len);
+                ffi::ggml_graph_set_new_uid(built.gf);
                 let host = HostStaging {
                     tokens: vec![0i32; t_len as usize],
                     pos: vec![0i32; t_len as usize * 4],
@@ -1582,7 +2034,9 @@ impl Qwen35 {
                 (((n_kv_exact + kvb - 1) / kvb) * kvb).min(s.n_ctx_max as i64)
             }
         };
-        self.build_inner(t_len, n_kv, state, n_out, use_set_rows, n_past, greedy, mtp_tail)
+        self.build_inner(
+            t_len, n_kv, state, n_out, use_set_rows, n_past, greedy, mtp_tail, SeqMode::Single,
+        )
     }
 
     /// Build the forward graph. `n_past_views` is used ONLY by the
@@ -1598,6 +2052,7 @@ impl Qwen35 {
         n_past_views: usize,
         greedy: bool,
         mtp_tail: Option<MtpTail>,
+        seq: SeqMode,
     ) -> Result<Built, ModelError> {
         let hp = &self.hp;
 
@@ -1689,12 +2144,17 @@ impl Qwen35 {
                 let value_dim = hp.value_dim();
                 let head_v = hp.gdn_head_v();
 
+                // In Batched mode the graph's t_len tokens are one token from each of
+                // t_len sequences, and the GDN op wants the sequence axis in ne[3]:
+                // q,k,v,g,beta [S, H, n_tokens, n_seqs] with n_tokens = 1. The buffers
+                // are identical either way — these are contiguous reshapes.
+                let (rt, rs) = if seq == SeqMode::Batched { (1, t_len) } else { (t_len, 1) };
                 let qkv_mixed = ffi::ggml_mul_mat(ctx, l.wqkv, cur);
-                let qkv_mixed = ffi::ggml_reshape_3d(ctx, qkv_mixed, hp.conv_dim(), t_len, 1);
+                let qkv_mixed = ffi::ggml_reshape_4d(ctx, qkv_mixed, hp.conv_dim(), rt, rs, 1);
                 let z = ffi::ggml_mul_mat(ctx, l.wqkv_gate, cur);
 
                 let beta = ffi::ggml_mul_mat(ctx, l.ssm_beta, cur);
-                let beta = ffi::ggml_reshape_4d(ctx, beta, 1, hp.n_v_heads, t_len, 1);
+                let beta = ffi::ggml_reshape_4d(ctx, beta, 1, hp.n_v_heads, rt, rs);
                 let beta = ffi::ggml_sigmoid(ctx, beta);
 
                 let alpha = ffi::ggml_mul_mat(ctx, l.ssm_alpha, cur);
@@ -1702,21 +2162,31 @@ impl Qwen35 {
                 let alpha = ffi::ggml_add(ctx, alpha, as_f32(ctx, l.dt_bias));
                 let alpha = ffi::ggml_softplus(ctx, alpha);
                 let g = ffi::ggml_mul(ctx, alpha, as_f32(ctx, l.ssm_a));
-                let g = ffi::ggml_reshape_4d(ctx, g, 1, hp.n_v_heads, t_len, 1);
+                let g = ffi::ggml_reshape_4d(ctx, g, 1, hp.n_v_heads, rt, rs);
 
                 let (conv_in_state, gdn_in_state) = match state {
                     StateSrc::Stateless => (conv_zero, state_zero),
                     StateSrc::Session(_) if dbg_gdn_zero => (conv_zero, state_zero),
                     StateSrc::Session(s) => {
-                        // slot 0 is the live state
+                        // The slot dimension serves two masters: in Single mode slot 0
+                        // is the live state and the rest are rollback snapshots; in
+                        // Slot/Batched modes each slot is a different SEQUENCE's live
+                        // state.
+                        let (slot0, nslots) = match seq {
+                            SeqMode::Single => (0i64, 1i64),
+                            SeqMode::Slot(i) => (i, 1),
+                            SeqMode::Batched => (0, t_len),
+                        };
                         let c3 = ffi::ggml_view_3d(
-                            ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), 1,
-                            (*s.conv_state[il]).nb[1], (*s.conv_state[il]).nb[2], 0,
+                            ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), nslots,
+                            (*s.conv_state[il]).nb[1], (*s.conv_state[il]).nb[2],
+                            slot0 as usize * (*s.conv_state[il]).nb[2],
                         );
                         let s4 = ffi::ggml_view_4d(
-                            ctx, s.gdn_state[il], head_v, head_v, hp.n_v_heads, 1,
+                            ctx, s.gdn_state[il], head_v, head_v, hp.n_v_heads, nslots,
                             (*s.gdn_state[il]).nb[1], (*s.gdn_state[il]).nb[2],
-                            (*s.gdn_state[il]).nb[3], 0,
+                            (*s.gdn_state[il]).nb[3],
+                            slot0 as usize * (*s.gdn_state[il]).nb[3],
                         );
                         (c3, s4)
                     }
@@ -1726,25 +2196,60 @@ impl Qwen35 {
                 let conv_input = ffi::ggml_concat(ctx, conv_in_state, qkv_t, 0);
 
                 if let (StateSrc::Session(s), false) = (state, dbg_no_writes || dbg_gdn_zero) {
-                    // Snapshot slot s = the conv window ending s tokens back.
-                    let n_written = s.k_slots.min(t_len);
-                    for slot in 0..n_written {
-                        let idx = (*conv_input).ne[0] - (hp.d_conv - 1) - slot;
-                        if idx < 0 {
-                            break;
+                    match seq {
+                        SeqMode::Single => {
+                            // Snapshot slot s = the conv window ending s tokens back.
+                            let n_written = s.k_slots.min(t_len);
+                            for slot in 0..n_written {
+                                let idx = (*conv_input).ne[0] - (hp.d_conv - 1) - slot;
+                                if idx < 0 {
+                                    break;
+                                }
+                                let tail = ffi::ggml_view_3d(
+                                    ctx, conv_input,
+                                    hp.d_conv - 1, hp.conv_dim(), 1,
+                                    (*conv_input).nb[1], (*conv_input).nb[2],
+                                    row(idx),
+                                );
+                                let dst = ffi::ggml_view_3d(
+                                    ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), 1,
+                                    (*s.conv_state[il]).nb[1], (*s.conv_state[il]).nb[2],
+                                    slot as usize * (*s.conv_state[il]).nb[2],
+                                );
+                                ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, tail, dst));
+                            }
                         }
-                        let tail = ffi::ggml_view_3d(
-                            ctx, conv_input,
-                            hp.d_conv - 1, hp.conv_dim(), 1,
-                            (*conv_input).nb[1], (*conv_input).nb[2],
-                            row(idx),
-                        );
-                        let dst = ffi::ggml_view_3d(
-                            ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), 1,
-                            (*s.conv_state[il]).nb[1], (*s.conv_state[il]).nb[2],
-                            slot as usize * (*s.conv_state[il]).nb[2],
-                        );
-                        ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, tail, dst));
+                        SeqMode::Slot(slot) => {
+                            // one sequence, one live window, written to its own slot
+                            let idx = (*conv_input).ne[0] - (hp.d_conv - 1);
+                            let tail = ffi::ggml_view_3d(
+                                ctx, conv_input,
+                                hp.d_conv - 1, hp.conv_dim(), 1,
+                                (*conv_input).nb[1], (*conv_input).nb[2],
+                                row(idx),
+                            );
+                            let dst = ffi::ggml_view_3d(
+                                ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), 1,
+                                (*s.conv_state[il]).nb[1], (*s.conv_state[il]).nb[2],
+                                slot as usize * (*s.conv_state[il]).nb[2],
+                            );
+                            ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, tail, dst));
+                        }
+                        SeqMode::Batched => {
+                            // every sequence advanced one token: its new window is the
+                            // input shifted by one, all slots in one copy
+                            let tail = ffi::ggml_view_3d(
+                                ctx, conv_input,
+                                hp.d_conv - 1, hp.conv_dim(), t_len,
+                                (*conv_input).nb[1], (*conv_input).nb[2],
+                                row(1),
+                            );
+                            let dst = ffi::ggml_view_3d(
+                                ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), t_len,
+                                (*s.conv_state[il]).nb[1], (*s.conv_state[il]).nb[2], 0,
+                            );
+                            ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, tail, dst));
+                        }
                     }
                 }
 
@@ -1752,21 +2257,28 @@ impl Qwen35 {
                 let conv_out = ffi::ggml_silu(ctx, conv_out);
 
                 let nb1_qkv = row(hp.conv_dim());
+                // ne[2]/ne[3] carry (tokens, sequences); per-token stride is nb1_qkv
+                // either way, so only which axis it lands on changes
+                let (nb2_q, nb3_q) = if seq == SeqMode::Batched {
+                    (nb1_qkv, nb1_qkv)
+                } else {
+                    (nb1_qkv, nb1_qkv * t_len as usize)
+                };
                 let q = ffi::ggml_view_4d(
                     ctx, conv_out,
-                    hp.d_state, hp.n_k_heads, t_len, 1,
-                    row(hp.d_state), nb1_qkv, nb1_qkv * t_len as usize, 0,
+                    hp.d_state, hp.n_k_heads, rt, rs,
+                    row(hp.d_state), nb2_q, nb3_q, 0,
                 );
                 let k = ffi::ggml_view_4d(
                     ctx, conv_out,
-                    hp.d_state, hp.n_k_heads, t_len, 1,
-                    row(hp.d_state), nb1_qkv, nb1_qkv * t_len as usize,
+                    hp.d_state, hp.n_k_heads, rt, rs,
+                    row(hp.d_state), nb2_q, nb3_q,
                     key_dim as usize * elt,
                 );
                 let v = ffi::ggml_view_4d(
                     ctx, conv_out,
-                    head_v, hp.n_v_heads, t_len, 1,
-                    row(head_v), nb1_qkv, nb1_qkv * t_len as usize,
+                    head_v, hp.n_v_heads, rt, rs,
+                    row(head_v), nb2_q, nb3_q,
                     row(2 * key_dim),
                 );
 
@@ -1774,39 +2286,48 @@ impl Qwen35 {
                 let k = ffi::ggml_l2_norm(ctx, k, hp.rms_eps);
                 let v = ffi::ggml_cont(ctx, v);
 
-                let k_snap = match state {
-                    StateSrc::Session(s) => s.k_slots,
-                    StateSrc::Stateless => 1,
+                let k_snap = match (state, seq) {
+                    // rollback snapshots exist only in Single mode; a batch slot's
+                    // "snapshot 0" is simply its live state
+                    (StateSrc::Session(s), SeqMode::Single) => s.k_slots,
+                    _ => 1,
                 };
                 let gdn =
                     ffi::ggml_gated_delta_net(ctx, q, k, v, g, beta, gdn_in_state, k_snap);
 
                 let out = ffi::ggml_view_4d(
                     ctx, gdn,
-                    head_v, hp.n_v_heads, t_len, 1,
+                    head_v, hp.n_v_heads, rt, rs,
                     row(head_v), row(head_v * hp.n_v_heads),
-                    row(head_v * hp.n_v_heads * t_len), 0,
+                    row(head_v * hp.n_v_heads * rt), 0,
                 );
 
                 if let (StateSrc::Session(s), false) = (state, dbg_no_writes || dbg_gdn_zero) {
-                    // The op packs K state snapshots after the attention rows,
-                    // most recent first; copy the written ones into the
-                    // session's matching slots.
+                    // The op packs its state output after the attention rows. In Single
+                    // mode that is K snapshots for slots 0..K; in Slot/Batched modes it
+                    // is one live state per sequence, written to the matching slot(s).
                     let d = head_v * head_v * hp.n_v_heads;
-                    let n_written = s.k_slots.min(t_len);
+                    let (n_states, dst_slot0) = match seq {
+                        SeqMode::Single => (s.k_slots.min(t_len), 0i64),
+                        SeqMode::Slot(i) => (1, i),
+                        SeqMode::Batched => (t_len, 0),
+                    };
+                    // the states start after ALL attention rows; rt * rs == t_len in
+                    // every mode, so the offset is the same expression in both
                     let src = ffi::ggml_view_3d(
-                        ctx, gdn, d, 1, n_written,
+                        ctx, gdn, d, 1, n_states,
                         row(d), row(d),
                         row(head_v * hp.n_v_heads * t_len),
                     );
                     let dst = ffi::ggml_view_3d(
-                        ctx, s.gdn_state[il], d, 1, n_written,
-                        row(d), row(d), 0,
+                        ctx, s.gdn_state[il], d, 1, n_states,
+                        row(d), row(d),
+                        dst_slot0 as usize * (*s.gdn_state[il]).nb[3],
                     );
                     ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, src, dst));
                 }
 
-                let z4 = ffi::ggml_reshape_4d(ctx, z, head_v, hp.n_v_heads, t_len, 1);
+                let z4 = ffi::ggml_reshape_4d(ctx, z, head_v, hp.n_v_heads, rt, rs);
                 let normed = rms(ctx, out, l.ssm_norm);
                 let gated = ffi::ggml_mul(ctx, normed, ffi::ggml_silu(ctx, z4));
                 let flat =
@@ -1851,6 +2372,9 @@ impl Qwen35 {
         ffi::ggml_set_output(h_sel);
         ffi::ggml_build_forward_expand(gf, h_sel);
         cur = ffi::ggml_mul_mat(ctx, output_w, h_sel);
+        let logits_t = cur;
+        ffi::ggml_set_output(logits_t);
+        ffi::ggml_build_forward_expand(gf, logits_t);
         if greedy {
             // Sample in the graph: the readback becomes 4 bytes instead of
             // n_vocab floats (993 KB for this model), removing a full
@@ -1879,6 +2403,7 @@ impl Qwen35 {
         // batched drafts stay consistent with whatever prefix verification
         // ends up keeping.
         let mut draft_chain: Vec<*mut ffi::ggml_tensor> = Vec::new();
+        let mut cand_ids: *mut ffi::ggml_tensor = std::ptr::null_mut();
         let (mut draft_out, mut mtp_pos, mut mtp_mask, mut mtp_rows, mut mtp_n_kv) = (
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -1906,6 +2431,13 @@ impl Qwen35 {
             let mr = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I64, n_out);
             ffi::ggml_set_input(mr);
             mtp_rows = mr;
+            if tail.n_cand > 0 {
+                let ci = ffi::ggml_new_tensor_1d(
+                    ctx, ffi::ggml_type_GGML_TYPE_I32, tail.n_cand,
+                );
+                ffi::ggml_set_input(ci);
+                cand_ids = ci;
+            }
 
             // Chain the drafts inside this one graph. Each step feeds on the
             // previous step's own prediction and hidden state, so a depth-3
@@ -1949,8 +2481,20 @@ impl Qwen35 {
                 let hn = mx.shared_head_norm.unwrap_or(output_norm);
                 let h_next = rms(ctx, d, hn);
                 let head_w = mx.shared_head_head.unwrap_or(output_w);
-                let logits_d = ffi::ggml_mul_mat(ctx, head_w, h_next);
-                let ids = ffi::ggml_argmax(ctx, logits_d);
+                // Project the draft onto the shortlist when one is supplied:
+                // gathering n_cand rows costs a few tens of MB against the
+                // 1.27 GiB the full head reads, and the draft only needs its
+                // argmax. Verification below still uses the full head, so a
+                // token outside the shortlist just loses that draft.
+                let (logits_d, ids) = if cand_ids.is_null() {
+                    let l = ffi::ggml_mul_mat(ctx, head_w, h_next);
+                    (l, ffi::ggml_argmax(ctx, l))
+                } else {
+                    let sub = ffi::ggml_get_rows(ctx, head_w, cand_ids);
+                    let l = ffi::ggml_mul_mat(ctx, sub, h_next);
+                    (l, ffi::ggml_argmax(ctx, l))
+                };
+                let _ = logits_d;
                 ffi::ggml_set_output(ids);
                 ffi::ggml_build_forward_expand(gf, ids);
                 if step == 0 {
@@ -1974,9 +2518,11 @@ impl Qwen35 {
             state_zero,
             out_ids,
             out: cur,
+            logits: logits_t,
             h_out: h_sel,
             draft_out,
             draft_chain,
+            cand_ids,
             mtp_pos,
             mtp_mask,
             mtp_rows,
@@ -2192,6 +2738,294 @@ pub(crate) unsafe fn build_attn_block(
         let gated = ffi::ggml_mul(ctx, merged, ffi::ggml_sigmoid(ctx, gate));
         ffi::ggml_mul_mat(ctx, l.wo, gated)
 }
+
+
+
+    /// Zero one slot's recurrent state, making it a fresh sequence.
+    ///
+    /// Done through a graph rather than a host write because under tensor parallelism
+    /// the states are split across devices and the meta backend cannot write a slice of
+    /// a split 4-D tensor from the host (limit #4). `scale(view, 0)` copied back into
+    /// the view zeroes exactly the slot, on whatever device each shard lives.
+    pub fn zero_seq_slot(
+        &self,
+        session: &mut Session,
+        slot: usize,
+        n_threads: i32,
+    ) -> Result<(), ModelError> {
+        let hp = &self.hp;
+        unsafe {
+            let n_recr = (0..hp.n_layer).filter(|&il| hp.is_recurrent(il)).count();
+            let n_nodes = n_recr * 8 + 32;
+            let params = ffi::ggml_init_params {
+                mem_size: n_nodes * ffi::ggml_tensor_overhead()
+                    + ffi::ggml_graph_overhead_custom(n_nodes, false),
+                mem_buffer: std::ptr::null_mut(),
+                no_alloc: true,
+            };
+            let ctx = ffi::ggml_init(params);
+            if ctx.is_null() {
+                return Err(ModelError::Load("zero-slot ctx".into()));
+            }
+            struct G(*mut ffi::ggml_context);
+            impl Drop for G {
+                fn drop(&mut self) {
+                    unsafe { ffi::ggml_free(self.0) }
+                }
+            }
+            let _g = G(ctx);
+            let gf = ffi::ggml_new_graph_custom(ctx, n_nodes, false);
+            for il in 0..hp.n_layer {
+                if !hp.is_recurrent(il) {
+                    continue;
+                }
+                let cs = session.conv_state[il];
+                let gs = session.gdn_state[il];
+                let cv = ffi::ggml_view_3d(
+                    ctx, cs, (*cs).ne[0], (*cs).ne[1], 1,
+                    (*cs).nb[1], (*cs).nb[2], slot * (*cs).nb[2],
+                );
+                ffi::ggml_build_forward_expand(
+                    gf,
+                    ffi::ggml_cpy(ctx, ffi::ggml_scale(ctx, cv, 0.0), cv),
+                );
+                let gv = ffi::ggml_view_4d(
+                    ctx, gs, (*gs).ne[0], (*gs).ne[1], (*gs).ne[2], 1,
+                    (*gs).nb[1], (*gs).nb[2], (*gs).nb[3], slot * (*gs).nb[3],
+                );
+                ffi::ggml_build_forward_expand(
+                    gf,
+                    ffi::ggml_cpy(ctx, ffi::ggml_scale(ctx, gv, 0.0), gv),
+                );
+            }
+            if let Some(sched) = self.weights.sched() {
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, gf) {
+                    return Err(ModelError::Load("zero-slot sched alloc".into()));
+                }
+            } else {
+                session.cached = None;
+                if !ffi::ggml_gallocr_alloc_graph(session.galloc, gf) {
+                    return Err(ModelError::Load("zero-slot alloc".into()));
+                }
+            }
+            self.compute(gf, n_threads)
+        }
+    }
+
+    /// Prefill one sequence of a batch session.
+    ///
+    /// The session's caches are shared: sequence `slot` owns KV rows
+    /// `[slot * seq_ctx, (slot+1) * seq_ctx)` and recurrent-state slot `slot`. Returns
+    /// the argmax at the last position and, when `want_logits`, the full distribution.
+    pub fn step_seq_prefill(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        slot: usize,
+        seq_ctx: usize,
+        seq_past: usize,
+        want_logits: bool,
+        n_threads: i32,
+    ) -> Result<(u32, Vec<f32>), ModelError> {
+        assert!(seq_past + tokens.len() <= seq_ctx, "sequence overflows its region");
+        let base = slot * seq_ctx;
+        let t_len = tokens.len() as i64;
+        // every graph in batch mode attends over the whole combined cache, so the one
+        // decode graph and all prefill graphs agree on n_kv and can coexist
+        let n_kv = session.n_ctx_max as i64;
+        unsafe {
+            let built = self.build_inner(
+                t_len,
+                n_kv,
+                &StateSrc::Session(session.view()),
+                1,
+                /* use_set_rows */ true,
+                0,
+                /* greedy */ !want_logits,
+                None,
+                SeqMode::Slot(slot as i64),
+            )?;
+            struct G(*mut ffi::ggml_context);
+            impl Drop for G {
+                fn drop(&mut self) {
+                    unsafe { ffi::ggml_free(self.0) }
+                }
+            }
+            let _g = G(built.ctx);
+            let galloc = session.galloc;
+            session.cached = None;
+            if let Some(sched) = self.weights.sched() {
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, built.gf) {
+                    return Err(ModelError::Load("seq prefill sched alloc".into()));
+                }
+            } else if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
+                return Err(ModelError::Load("seq prefill alloc".into()));
+            }
+            self.fill_inputs_region(
+                &built,
+                tokens,
+                seq_past,
+                base,
+                &[(t_len - 1) as i32],
+            );
+            self.compute(built.gf, n_threads)?;
+            if want_logits {
+                let mut logits = vec![0f32; self.hp.n_vocab as usize];
+                ffi::ggml_backend_tensor_get(
+                    built.logits,
+                    logits.as_mut_ptr().cast(),
+                    0,
+                    logits.len() * 4,
+                );
+                Ok((argmax(&logits), logits))
+            } else {
+                let mut id = 0i32;
+                ffi::ggml_backend_tensor_get(built.out, (&mut id as *mut i32).cast(), 0, 4);
+                Ok((id as u32, Vec::new()))
+            }
+        }
+    }
+
+    /// One decode round for every active sequence of a batch session: token i advances
+    /// sequence i. Returns per-sequence argmaxes and, when `want_logits`, the
+    /// distributions. The graph is cached and replayed — its shape depends only on the
+    /// sequence count.
+    pub fn step_batch_decode(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        seq_pasts: &[usize],
+        seq_ctx: usize,
+        want_logits: bool,
+        n_threads: i32,
+    ) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
+        let n = tokens.len();
+        assert_eq!(n, seq_pasts.len());
+        let t_len = n as i64;
+        let n_kv = session.n_ctx_max as i64;
+        unsafe {
+            let stale = session
+                .batch_step
+                .as_ref()
+                .map(|c| c.t_len != t_len || c.want_logits != want_logits)
+                .unwrap_or(true);
+            if stale {
+                if let Some(c) = session.batch_step.take() {
+                    ffi::ggml_gallocr_free(c.galloc);
+                    session.graveyard.push(c.built.ctx);
+                }
+                let built = self.build_inner(
+                    t_len,
+                    n_kv,
+                    &StateSrc::Session(session.view()),
+                    t_len,
+                    /* use_set_rows */ true,
+                    0,
+                    /* greedy */ !want_logits,
+                    None,
+                    SeqMode::Batched,
+                )?;
+                let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
+                    self.weights.backend(),
+                ));
+                if ga.is_null() || !ffi::ggml_gallocr_alloc_graph(ga, built.gf) {
+                    return Err(ModelError::Load("batch decode alloc".into()));
+                }
+                ffi::ggml_graph_set_new_uid(built.gf);
+                session.batch_step = Some(BatchStep { built, galloc: ga, t_len, want_logits });
+            }
+            let c = session.batch_step.as_ref().unwrap();
+            let b = &c.built;
+
+            let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            ffi::ggml_backend_tensor_set(b.inp_tokens, toks_i32.as_ptr().cast(), 0, n * 4);
+            let mut pos = vec![0i32; n * 4];
+            for i in 0..n {
+                let p = seq_pasts[i] as i32;
+                pos[i] = p;
+                pos[n + i] = p;
+                pos[2 * n + i] = p;
+            }
+            ffi::ggml_backend_tensor_set(b.inp_pos, pos.as_ptr().cast(), 0, pos.len() * 4);
+            let rows: Vec<i64> = (0..n).map(|i| (i * seq_ctx + seq_pasts[i]) as i64).collect();
+            ffi::ggml_backend_tensor_set(b.row_ids, rows.as_ptr().cast(), 0, n * 8);
+            let nkv = n_kv as usize;
+            let mut mask = vec![0xFC00u16; nkv * n];
+            for (q, past) in seq_pasts.iter().enumerate() {
+                let base = q * seq_ctx;
+                for kv in base..=(base + past).min(nkv - 1) {
+                    mask[q * nkv + kv] = 0;
+                }
+            }
+            ffi::ggml_backend_tensor_set(b.kq_mask, mask.as_ptr().cast(), 0, mask.len() * 2);
+            let outs: Vec<i32> = (0..n as i32).collect();
+            ffi::ggml_backend_tensor_set(b.out_ids, outs.as_ptr().cast(), 0, n * 4);
+
+            self.compute(b.gf, n_threads)?;
+
+            let mut logits = Vec::new();
+            let preds = if want_logits {
+                logits = vec![0f32; self.hp.n_vocab as usize * n];
+                ffi::ggml_backend_tensor_get(
+                    b.logits,
+                    logits.as_mut_ptr().cast(),
+                    0,
+                    logits.len() * 4,
+                );
+                (0..n)
+                    .map(|i| {
+                        argmax(&logits[i * self.hp.n_vocab as usize
+                            ..(i + 1) * self.hp.n_vocab as usize])
+                    })
+                    .collect()
+            } else {
+                let mut ids = vec![0i32; n];
+                ffi::ggml_backend_tensor_get(b.out, ids.as_mut_ptr().cast(), 0, n * 4);
+                ids.into_iter().map(|v| v as u32).collect()
+            };
+            Ok((preds, logits))
+        }
+    }
+
+    /// `fill_inputs` for a sequence living in a region of a shared cache: positions are
+    /// sequence-relative, KV rows and the causal mask are region-offset.
+    unsafe fn fill_inputs_region(
+        &self,
+        b: &Built,
+        tokens: &[u32],
+        seq_past: usize,
+        base: usize,
+        out_positions: &[i32],
+    ) {
+        let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        ffi::ggml_backend_tensor_set(b.inp_tokens, toks_i32.as_ptr().cast(), 0, tokens.len() * 4);
+        let mut pos = vec![0i32; tokens.len() * 4];
+        for i in 0..tokens.len() {
+            let p = (seq_past + i) as i32;
+            pos[i] = p;
+            pos[tokens.len() + i] = p;
+            pos[2 * tokens.len() + i] = p;
+        }
+        ffi::ggml_backend_tensor_set(b.inp_pos, pos.as_ptr().cast(), 0, pos.len() * 4);
+        let rows: Vec<i64> = (0..tokens.len()).map(|i| (base + seq_past + i) as i64).collect();
+        ffi::ggml_backend_tensor_set(b.row_ids, rows.as_ptr().cast(), 0, rows.len() * 8);
+        let nkv = b.n_kv as usize;
+        let mut mask = vec![0xFC00u16; nkv * tokens.len()];
+        for q in 0..tokens.len() {
+            for kv in base..=(base + seq_past + q).min(nkv - 1) {
+                mask[q * nkv + kv] = 0;
+            }
+        }
+        ffi::ggml_backend_tensor_set(b.kq_mask, mask.as_ptr().cast(), 0, mask.len() * 2);
+        ffi::ggml_backend_tensor_set(
+            b.out_ids,
+            out_positions.as_ptr().cast(),
+            0,
+            out_positions.len() * 4,
+        );
+    }
 
     unsafe fn fill_inputs(&self, b: &Built, tokens: &[u32], n_past: usize, out_positions: &[i32]) {
         let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();

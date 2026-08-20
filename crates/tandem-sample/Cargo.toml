@@ -1,0 +1,7 @@
+[package]
+name = "tandem-sample"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

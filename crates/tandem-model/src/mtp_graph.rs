@@ -51,6 +51,12 @@ impl Drop for MtpGraph {
 
 impl Qwen35 {
     /// Tensors of the MTP block. Returns None when the file has no MTP head.
+    /// Whether this model carries an MTP draft head at all. Not every GGUF does, and a
+    /// server has to fall back to plain decoding rather than fail the request.
+    pub fn has_mtp(&self) -> bool {
+        self.mtp_layer().is_some()
+    }
+
     pub(crate) fn mtp_layer(&self) -> Option<(Layer, MtpExtras)> {
         let il = self.hp.n_layer;
         let l = self.layer_pub(il).ok()?;
