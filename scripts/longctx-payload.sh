@@ -12,9 +12,9 @@ M=/models/qwen38/Qwen3.8-27B-UD-Q8_K_XL.gguf
 run() {
   timeout 3600 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    -v $HOME/llm/tandem:/work \
-    --entrypoint /src/target/release/tandem tandem-builder "$@" >/tmp/lc_out.txt 2>/tmp/lc_err.txt
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    -v $HOME/llm/codpiece:/work \
+    --entrypoint /src/target/release/codpiece codpiece-builder "$@" >/tmp/lc_out.txt 2>/tmp/lc_err.txt
 }
 report() { # $1 label
   if grep -q "decode:" /tmp/lc_err.txt; then
@@ -25,7 +25,7 @@ report() { # $1 label
 }
 
 for CHARS in 4000 40000 110000; do
-  head -c $CHARS $HOME/llm/tandem/wiki.test.raw > $HOME/llm/tandem/lc_prompt.txt
+  head -c $CHARS $HOME/llm/codpiece/wiki.test.raw > $HOME/llm/codpiece/lc_prompt.txt
   echo "### prompt of $CHARS chars"
   run gen "$M" -f /work/lc_prompt.txt -n 32 -c 32768 --tp 0,1
   report "plain   "

@@ -31,19 +31,19 @@ if [ "$have" != "$PIN_COMMIT" ]; then
 fi
 echo "vendored llama.cpp @ $PIN_TAG ($PIN_COMMIT)"
 
-# tandem's fixes to the vendored ggml — the meta backend's graph-reuse lifetime
+# codpiece's fixes to the vendored ggml — the meta backend's graph-reuse lifetime
 # bugs, ggml_graph_set_new_uid(), and a flash-attention shape diagnostic. The
 # engine's measured numbers depend on these; a build without them is a different
 # engine. See notes/results-2026-08-19.md for what each hunk fixes.
-patch="$root/patches/ggml-tandem.patch"
+patch="$root/patches/ggml-codpiece.patch"
 if [ -f "$patch" ]; then
     if git -C "$dst" apply --check "$patch" 2>/dev/null; then
         git -C "$dst" apply "$patch"
-        echo "applied patches/ggml-tandem.patch"
+        echo "applied patches/ggml-codpiece.patch"
     elif git -C "$dst" apply --check --reverse "$patch" 2>/dev/null; then
-        echo "patches/ggml-tandem.patch already applied"
+        echo "patches/ggml-codpiece.patch already applied"
     else
-        echo "ERROR: patches/ggml-tandem.patch applies neither forward nor reverse" >&2
+        echo "ERROR: patches/ggml-codpiece.patch applies neither forward nor reverse" >&2
         exit 1
     fi
 fi

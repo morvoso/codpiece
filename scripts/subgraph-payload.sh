@@ -14,13 +14,13 @@ P="<|im_start|>user
 Hi<|im_end|>
 <|im_start|>assistant
 "
-go() { # $1 = label, rest = tandem args
+go() { # $1 = label, rest = codpiece args
   local label=$1; shift
   timeout 900 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
     -e GGML_META_TRACE_SUBGRAPHS=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder "$@" >/dev/null 2>/tmp/sg.txt
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder "$@" >/dev/null 2>/tmp/sg.txt
   echo "=== $label: $(grep -c '\[meta\] rebuild' /tmp/sg.txt) rebuilds ==="
   grep "\[meta\] rebuild" /tmp/sg.txt | sort | uniq -c | sort -rn | head -5
 }

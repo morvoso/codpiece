@@ -2,12 +2,12 @@
 # The server, end to end against the 27B.
 #
 # The gate that matters is the last one: a greedy request through HTTP must produce the
-# same text as `tandem gen` with the same prompt. Everything between the socket and the
+# same text as `codpiece gen` with the same prompt. Everything between the socket and the
 # sampler is new code, and that check exercises all of it at once.
 # Runs INSIDE bench-window.sh.
 set -u
 M=/models/qwen38/Qwen3.8-27B-UD-Q8_K_XL.gguf
-NAME=tandem-serve-test
+NAME=codpiece-serve-test
 PORT=8031
 
 # The reference has to be taken before the server starts: both hold the whole model,
@@ -18,16 +18,16 @@ Explain in three sentences why the sky is blue.<|im_end|>
 "
 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-  -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-  --entrypoint /src/target/release/tandem tandem-builder \
+  -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+  --entrypoint /src/target/release/codpiece codpiece-builder \
   gen "$M" -p "$PROMPT" -n 64 -c 8192 --tp 0,1 >/tmp/srv_cli.txt 2>/dev/null
 echo "cli reference: $(wc -c < /tmp/srv_cli.txt) bytes"
 
 docker rm -f $NAME >/dev/null 2>&1
 docker run -d --name $NAME --runtime nvidia \
   -e NVIDIA_VISIBLE_DEVICES=all -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-  -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-  -p $PORT:$PORT --entrypoint /src/target/release/tandem tandem-builder \
+  -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+  -p $PORT:$PORT --entrypoint /src/target/release/codpiece codpiece-builder \
   serve "$M" --host 0.0.0.0 --port $PORT -c 8192 --tp 0,1 >/dev/null
 
 ready=0
@@ -90,7 +90,7 @@ PROMPT="$PROMPT" python3 -c 'import json,os; print(json.dumps({"prompt": os.envi
 curl -s --max-time 300 -H 'Content-Type: application/json' --data-binary @/tmp/srv_body.json \
   http://localhost:$PORT/v1/completions \
   | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["choices"][0]["text"])' > /tmp/srv_http.txt
-# `tandem gen` prints its output with a trailing newline; the HTTP body has none.
+# `codpiece gen` prints its output with a trailing newline; the HTTP body has none.
 printf '%s' "$(cat /tmp/srv_cli.txt)"  > /tmp/srv_cli_n.txt
 printf '%s' "$(cat /tmp/srv_http.txt)" > /tmp/srv_http_n.txt
 if diff -q /tmp/srv_http_n.txt /tmp/srv_cli_n.txt >/dev/null; then

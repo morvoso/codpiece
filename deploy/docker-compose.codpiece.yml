@@ -1,0 +1,55 @@
+# Qwen3.8-27B on codpiece — 2x RTX 3090 (48 GiB total)
+#
+# codpiece is the from-scratch engine in ~/llm/codpiece/codpiece (Rust control
+# plane + vendored ggml b10423). This compose runs the release binary that
+# already lives inside the codpiece-builder image's bind mount.
+#
+# Priority order (owner, standing 2026-08-20): ACCURACY > SPEED > CONTEXT.
+#
+# WHAT THIS ENGINE DOES AND DOES NOT DO vs the llama.cpp default:
+#   + faster on text/code (greedy code ~68 vs 53 tok/s; short-prompt decode +38%)
+#   + warm multi-turn: turn 2 of a 32K conversation ~0.9s (prefix reuse + pool)
+#   + continuous batching: ~153 tok/s aggregate at 8-way concurrency
+#   + speculation at temperature, distribution-preserving (verified on the 27B)
+#   - NO VISION yet. An image request will not work. switch.sh llamacpp
+#     restores vision; that is why this engine is on-demand.
+#   All tunables are CODPIECE_-prefixed so llama.cpp's shared .env (CTX_SIZE=196608
+#   etc.) cannot bleed into this engine's config.
+#   - context 65536 here; raise CODPIECE_CTX for more, but speculation stops
+#     fitting past ~145K and decode falls toward 28 tok/s.
+#
+# Rollback is always: ./switch.sh llamacpp  (byte-exact, this file never edited)
+
+services:
+  codpiece:
+    image: codpiece-builder:latest
+    container_name: codpiece-qwen
+    restart: unless-stopped
+    runtime: nvidia
+    # NCCL's shared-memory transport needs a real /dev/shm under tensor parallel.
+    ipc: host
+    shm_size: "8gb"
+    ports:
+      - "0.0.0.0:${PORT:-8020}:8020"
+    volumes:
+      - ${CODPIECE_REPO:-./codpiece/codpiece}:/src:ro
+      - ${MODEL_DIR:-./models}:/models:ro
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NCCL_P2P_DISABLE: "1"
+      NCCL_SHM_DISABLE: "0"
+    entrypoint: /src/target/release/codpiece
+    command: >-
+      serve /models/qwen38/${MODEL_FILE:-Qwen3.8-27B-UD-Q8_K_XL.gguf}
+      --host 0.0.0.0
+      --port 8020
+      --alias ${SERVED_NAME:-qwen3.8-27b}
+      -c ${CODPIECE_CTX:-65536}
+      --tp ${CODPIECE_TP:-0,1}
+      --depth ${CODPIECE_DEPTH:-3}
+      --max-depth ${CODPIECE_MAX_DEPTH:-3}
+      --max-tokens ${CODPIECE_MAX_TOKENS:-2048}
+      --think-budget ${CODPIECE_THINK_BUDGET:-4096}
+      -t ${CODPIECE_THREADS:-16}

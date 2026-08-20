@@ -3,14 +3,14 @@
 llm-host (192.168.134.60) is a **production box**: it serves Qwen3.8-27B to
 the user's daemons 24/7 (`llama-qwen` container, port 8020) plus searxng,
 questboard, cloudflared. Both 3090s sit at ~95% VRAM while prod runs.
-These rules are absolute for all tandem work. They exist because every one of
+These rules are absolute for all codpiece work. They exist because every one of
 them was paid for in downtime (ENGINE.md §8).
 
 ## Hardware protection
 
 1. **Never raise power limits.** GPU0 is capped at 260 W by
    `gpu-powerlimit.service` because its fan sits against GPU1's backplate.
-   tandem never calls `nvidia-smi -pl`, never edits that service. (Raising to
+   codpiece never calls `nvidia-smi -pl`, never edits that service. (Raising to
    280–300 W is a *user-only* decision with temps watched.)
 2. **Temperature watchdog during any GPU work we initiate.** Poll
    `nvidia-smi --query-gpu=temperature.gpu,power.draw` every 10 s; abort the
@@ -32,7 +32,7 @@ them was paid for in downtime (ENGINE.md §8).
    - restore prod, verify `/health` + a 1-token completion, release lock
 5. **CPU-only work (builds, parsing, tokenizers) is allowed alongside prod**
    but nice'd: `nice -n 19`, build jobs ≤ 8, and never within a benchmark rep.
-6. **RAM budget:** prod's host prompt-cache wants up to 40 GiB. Keep tandem's
+6. **RAM budget:** prod's host prompt-cache wants up to 40 GiB. Keep codpiece's
    build+test RSS under 8 GiB while prod runs; check `free -h` first.
 7. **Kill by PID, never by pattern.** `pkill -f` has matched its own wrapper
    4 times on this box. Filter docker by container ID, never `ancestor=`.
@@ -42,9 +42,9 @@ them was paid for in downtime (ENGINE.md §8).
    cannot work otherwise, log every use in `notes/`, prefer rootless paths
    (docker group already works). Never edit system services, network config,
    or the power-limit service.
-10. **No prod config edits.** tandem gets its own compose file / port. The
+10. **No prod config edits.** codpiece gets its own compose file / port. The
     switch between prod engines stays `~/llm/switch.sh`'s job until M7 adds a
-    tandem profile *as a new file*.
+    codpiece profile *as a new file*.
 
 ## Benchmark discipline (for honest numbers, which is also safety)
 
@@ -63,8 +63,8 @@ them was paid for in downtime (ENGINE.md §8).
     check and only appeared on CUDA: all-f32 KV caches (undertested kernels)
     and an uninitialized device-side mask (CPU's sync fallback hid it).
     Any change touching buffers, layouts, or upload paths must run
-    `tandem selftest --gpu` in a bench window before it is believed.
-18. **Compare path-matched.** tandem-FA vs oracle `-fa on`; tandem non-FA vs
+    `codpiece selftest --gpu` in a bench window before it is believed.
+18. **Compare path-matched.** codpiece-FA vs oracle `-fa on`; codpiece non-FA vs
     `-fa off`. At fp16 both are correct and round differently; an unmatched
     comparison produces a fake regression.
 19. **Device memory is not zero.** Compute buffers hold whatever the

@@ -1,4 +1,4 @@
-# tandem roadmap
+# codpiece roadmap
 
 Every milestone has a **gate**: a measurable pass/fail check on llm-host.
 A milestone without a passed gate is not done. Speed numbers only count from
@@ -47,10 +47,10 @@ in this document measures.
 
 - [x] SSH + recon of llm-host (notes/recon-2026-08-19.md)
 - [x] Repo, workspace, safety protocol
-- [x] `tandem-gguf` parser + `tandem inspect`, validated against all four
+- [x] `codpiece-gguf` parser + `codpiece inspect`, validated against all four
       production GGUFs (27B Q8_K_XL, Q6_K_XL-v3, DFlash2 Q8, mmproj)
 - [x] qwen35 architecture fully mapped from GGUF metadata + llama.cpp source
-- [x] Vendored ggml pinned @ b10423; `tandem-ggml-sys` links and runs CPU
+- [x] Vendored ggml pinned @ b10423; `codpiece-ggml-sys` links and runs CPU
       graphs on both machines (portable-AVX2 build after a -march=native
       illegal-instruction lesson); CUDA sm_86 compile proven via the oracle
       container build on llm-host
@@ -83,7 +83,7 @@ Status 2026-08-19, all vs oracles built at b10423, CPU, GPU-blind:
 ## M1.5 — hygiene  ✅
 
 - [x] parity harness scripted (scripts/parity-gen.sh, path-matched oracle
-      via ORACLE_FA; TANDEM_SUBCMD selects stateless/session path).
+      via ORACLE_FA; CODPIECE_SUBCMD selects stateless/session path).
 - [x] tokenizer perf closed by measurement: 297K tokens in 0.37 s wall —
       the pretokenizer keeps BPE pieces tiny; no heap needed.
 - [x] SIGPIPE fixed. Builder image docker/builder.Dockerfile (CUDA devel +
@@ -111,7 +111,7 @@ Speed (0.8B BF16, GPU1, 256-token decode, ≥2 reps):
 | + flash attention | 247 | +3% |
 | + in-graph argmax (4-byte readback) | 265 | +7%; unlocked the next one |
 | + CUDA graphs (GGML_CUDA_GRAPHS=ON) | **295** | +11%; capture was compiled out AND masked by the logits copy |
-| llama.cpp b10423, same GPU/model/path | 317 | tandem = **93%** |
+| llama.cpp b10423, same GPU/model/path | 317 | codpiece = **93%** |
 
 Three levers that did NOT pay: async input uploads (0%), KV bucket 64/128
 (worse than 256 — rebuild cost), f32→f32 weight casts (already F32 in file).
@@ -133,7 +133,7 @@ Staged deliberately:
       Costs speed (113 vs 295 tok/s on the 0.8B — sched re-plans every step,
       no cached graph, session state all on device 0) but it is the path
       that makes the real model runnable at all.
-- [x] **M3b — the production 27B runs on tandem**: 29.3 GiB placed as
+- [x] **M3b — the production 27B runs on codpiece**: 29.3 GiB placed as
       16.57 + 12.72 GiB across the two 3090s, coherent generation,
       prefill 105 tok/s, decode 19.0 tok/s
 - [x] **M3c — 27B output IDENTICAL to llama.cpp**: short prompt under both
@@ -143,7 +143,7 @@ Staged deliberately:
       device (today they all sit on device 0, doubling bus traffic for the
       second half of the stack), cached decode graph under the scheduler
 - [x] **M3e — tensor parallel DONE**: `Device::CudaTensorParallel` over
-      ggml's meta device, tandem supplying the split classification.
+      ggml's meta device, codpiece supplying the split classification.
       **27B decode 39.8 tok/s (3 reps) vs llama.cpp's prod config 41.4
       (2 reps) = 96 %, output identical.** 2.1× the layer-split path.
 - [ ] M3d — remaining placement work: session KV/state per device under the
@@ -171,7 +171,7 @@ identical to plain greedy):
 
 Head to head against llama.cpp's own server running production's MTP config,
 3 reps each in one window, that first measurement read **llama.cpp 65.0 tok/s,
-tandem 59.2 (91 %)** — tandem *behind*, unlike the non-speculative case.
+codpiece 59.2 (91 %)** — codpiece *behind*, unlike the non-speculative case.
 
 **Re-measured 2026-08-20**, after fixing the graph-reuse bugs described in
 `docs/OPTIMIZATION-IDEAS.md` §4 (96 tokens, 3 reps, one window):
@@ -179,10 +179,10 @@ tandem 59.2 (91 %)** — tandem *behind*, unlike the non-speculative case.
 | engine | tok/s |
 |---|---|
 | llama.cpp b10423, prod MTP config | 64.52 / 64.78 / 64.28 |
-| tandem, fused round depth 2 | 64.51 / 64.47 / 64.49 |
-| **tandem, fused round depth 3** | **69.86 / 69.81 / 69.89** |
+| codpiece, fused round depth 2 | 64.51 / 64.47 / 64.49 |
+| **codpiece, fused round depth 3** | **69.86 / 69.81 / 69.89** |
 
-**Gate: PASSED.** tandem is level with llama.cpp at depth 2 and ~8 % ahead at
+**Gate: PASSED.** codpiece is level with llama.cpp at depth 2 and ~8 % ahead at
 depth 3, with output byte-identical to plain greedy decoding at every depth.
 The best depth is prompt-dependent — on a 160-token generation depth 2 led at
 64.3 while depth 3 gave 62.9 — so an adaptive depth is the obvious next step.
@@ -217,7 +217,7 @@ Everything through M4 was measured at `-c 4096`; production serves at 196K.
 - [x] **Production context reached for plain decode**: a 186,162-token prompt at
       `-c 200704`, 28.1 tok/s decode, 813 tok/s prefill. Scaling the prefill
       chunk was the whole fix.
-- [x] **Draft head's KV window bounded** (`TANDEM_MTP_CTX`, default 16384),
+- [x] **Draft head's KV window bounded** (`CODPIECE_MTP_CTX`, default 16384),
       lossless by construction since drafts are verified; moved the speculative
       ceiling from ~127K to 145K tokens.
 - [ ] **Speculation above ~145K**: blocked by `output.weight` (2.37 GiB) and
@@ -237,7 +237,7 @@ OpenAI-compatible `/v1/chat/completions` + `/completions` + `/slots`-style
 introspection, streaming, minijinja template from GGUF, reasoning_effort +
 thinking budget, official sampling presets, multi-stream continuous batching.
 
-- [x] **M5a — samplers** (`tandem-sample`, zero deps). temperature, top-k, top-p,
+- [x] **M5a — samplers** (`codpiece-sample`, zero deps). temperature, top-k, top-p,
       min-p, repeat/frequency/presence penalties, seeded xoshiro256++ draw.
       Filter semantics ported from llama.cpp's `llama-sampler.cpp` at the pin, so
       the same request parameters mean the same thing in both engines. 10 unit
@@ -249,14 +249,14 @@ thinking budget, official sampling presets, multi-stream continuous batching.
       *Parity note:* the draw cannot match llama.cpp token for token — it uses
       `std::mt19937` through `std::discrete_distribution`, whose stream is
       implementation-defined. Token-exact parity stays a temperature-0 claim.
-- [x] **M5b — HTTP server** (`tandem serve`, crate `tandem-server`).
+- [x] **M5b — HTTP server** (`codpiece serve`, crate `codpiece-server`).
       `/v1/chat/completions`, `/v1/completions`, `/health`, `/v1/models`,
       `/slots`, SSE streaming, CORS. Hand-written HTTP/1.1 on `std::net`; the
       chat template renders through minijinja with the pycompat shim, because
       Hugging Face templates call Python string methods that are not Jinja.
       7 tests against the production template pin its behaviour, including that
       `enable_thinking` opens a `<think>` block in the generation prompt.
-      **Gate: a greedy request over HTTP is byte-identical to `tandem gen`.**
+      **Gate: a greedy request over HTTP is byte-identical to `codpiece gen`.**
       Chat responses split `reasoning_content` from `content` in both shapes —
       non-streaming and SSE deltas (marker-across-chunks handled, 5 unit tests)
       — which is also what makes thinking-mode conversations warm across turns.
@@ -281,7 +281,7 @@ thinking budget, official sampling presets, multi-stream continuous batching.
       the dispatcher change). Compute-path details: `SeqMode::{Single, Slot, Batched}` through `build_inner`; the
       recurrent-state slot dimension doubles as the sequence dimension (batch
       mode does not speculate, so snapshots and sequences never coexist — the
-      `ne[3]` conflict dissolved). Correctness: `tandem batchtest` — every slot
+      `ne[3]` conflict dissolved). Correctness: `codpiece batchtest` — every slot
       of an N-way batch byte-identical to the single-path reference, on CPU and
       on the 27B under TP. Throughput: **173.5 tok/s aggregate at 8-way**
       (2048/seq), 165.0 at 8x8192 — the gate asked >150 against llama.cpp's
@@ -293,7 +293,7 @@ thinking budget, official sampling presets, multi-stream continuous batching.
       n_seqs]`), so the kernels are ready, but two things have to be settled
       first and both were found by reading rather than guessed:
 
-      1. **`ne[3]` is already taken.** The op wants it for `n_seqs`; tandem uses
+      1. **`ne[3]` is already taken.** The op wants it for `n_seqs`; codpiece uses
          it for the K recurrent snapshots that make rejected drafts undoable
          (`qwen35.rs:951` offsets a slot by `n * nb[3]`). A ggml tensor has four
          dimensions and speculation needs both. The way out is a state tensor
@@ -310,21 +310,21 @@ thinking budget, official sampling presets, multi-stream continuous batching.
       a queue, so the scheduler replaces `run_job` rather than reaching into the
       HTTP layer.
 
-**Gate:** `~/llm/bench/db2.py` runs unmodified against tandem ✅ (2026-08-20;
+**Gate:** `~/llm/bench/db2.py` runs unmodified against codpiece ✅ (2026-08-20;
 needed `/tokenize`, the `draft_n`/`draft_n_accepted`/`n_draft_calls` timings and
 `chat_template_kwargs`); 4-way aggregate > 150 tok/s (llama.cpp ~101) with f16
 KV at 196K — pending M5d; no request starvation (p95 TTFT < 2× p50 under 4-way).
 
 Single-stream baseline on that benchmark, temperature 1.0, 400 tokens:
 
-| depth | tandem prefill / decode | prod prefill / decode |
+| depth | codpiece prefill / decode | prod prefill / decode |
 |---|---|---|
 | 0 | 278.7 / **44.7** | **350.1** / 32.4 |
 | 32,000 | 820.1 / 48.7 | **1353.2** / **52.7** |
 
 Two gaps it measured: prefill is 25-65% slower (the fused prefill runs the draft
 head over every chunk), and acceptance under sampling is 0.35-0.45 against
-prod's 0.78 (prod declines to draft below `p-min 0.75`; tandem always drafts K).
+prod's 0.78 (prod declines to draft below `p-min 0.75`; codpiece always drafts K).
 
 ## M6 — Session cache tier (the 70× feature)  ◔ started 2026-08-20
 
@@ -340,7 +340,7 @@ prefix reuse for shared system prompts.
       resident on-device, longest-prefix slot match, LRU eviction. A/B/A
       alternation between two ~31K conversations on the 27B: return to A in
       **0.9 s** instead of 24.7. Two slots at 32K context, one above ~70K
-      (`TANDEM_SESSIONS` overrides). Chosen over the planned host-RAM tier
+      (`CODPIECE_SESSIONS` overrides). Chosen over the planned host-RAM tier
       because the split 4-D GDN state cannot be copied off-device under TP
       (meta backend limit #4) — and a pointer switch beats a PCIe copy anyway.
 - [x] **Host-RAM snapshot tier** for single-device deployments (where the
@@ -355,10 +355,10 @@ token-prefix hash).
 
 Vision (mmproj qwen3vl_merger tower), tool-call grammar constraints,
 `-np 2`-equivalent shared-pool policy, then the switch.sh profile so the box
-can A/B prod↔tandem in one command.
+can A/B prod↔codpiece in one command.
 
 **Gate:** Shodan's real workload (screenshots + tool calls) runs a full day
-on tandem with zero correctness incidents, then a measured week.
+on codpiece with zero correctness incidents, then a measured week.
 
 ## Stretch — DFlash2 under multi-GPU
 
@@ -376,9 +376,9 @@ ggml's meta backend. The model supplies ONE callback classifying each tensor
 by name into a `ggml_backend_meta_split_state` (row/col/segment splits; fused
 tensors like attn_qkv described as segments). llama's callback
 (`llama_meta_device_get_split_state`, llama-model.cpp:353) already covers the
-whole qwen35 tensor family incl. ssm_*. tandem M3 = port that classification
+whole qwen35 tensor family incl. ssm_*. codpiece M3 = port that classification
 + create the meta device + point Weights::load at it. Session caches/states
-also classified (their `cache_[kv]_l\d` patterns → tandem's own names).
+also classified (their `cache_[kv]_l\d` patterns → codpiece's own names).
 DFlash2's historical crash ("buffer Meta() cannot run the operation") was
-draft-model code colliding with this meta backend — tandem's drafter design
+draft-model code colliding with this meta backend — codpiece's drafter design
 must be meta-aware from day one.

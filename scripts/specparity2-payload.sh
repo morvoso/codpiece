@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Accuracy check, and the one that matters most for this engine.
 #
-# tandem's speculative sampling at temperature is meant to be distribution-preserving:
+# codpiece's speculative sampling at temperature is meant to be distribution-preserving:
 # the draft head proposes its argmax, so its distribution is a point mass, and accepting
 # with probability p(x0) — otherwise drawing from p with x0 removed — emits exactly p.
 # A unit test asserts that over 200k draws of a toy distribution. This asserts it on the
@@ -13,7 +13,7 @@
 # spec-vs-no-spec, and compares the two.
 set -u
 M=/models/qwen38/Qwen3.8-27B-UD-Q8_K_XL.gguf
-NAME=tandem-parity
+NAME=codpiece-parity
 N=${N:-200}
 TOKENS=${TOKENS:-20}
 
@@ -21,8 +21,8 @@ start() { # $1 = depth (0 = no speculation)
   docker rm -f $NAME >/dev/null 2>&1
   docker run -d --name $NAME --runtime nvidia \
     -e NVIDIA_VISIBLE_DEVICES=all -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    -p 8020:8020 --entrypoint /src/target/release/tandem tandem-builder \
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    -p 8020:8020 --entrypoint /src/target/release/codpiece codpiece-builder \
     serve "$M" --host 0.0.0.0 --port 8020 -c 8192 --tp 0,1 --depth "$1" >/dev/null
   for _ in $(seq 1 120); do
     [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8020/health || true)" = "200" ] && return 0

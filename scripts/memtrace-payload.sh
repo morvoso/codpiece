@@ -12,15 +12,15 @@ Say hello.<|im_end|>
 for C in 8192 65536 137216 200704; do
   echo "### -c $C  (KV per card: $(python3 -c "print(f'{$C*65536/2/2**30:.2f}')") GiB)"
   timeout 900 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
-    -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 -e TANDEM_TRACE_MEM=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder \
+    -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 -e CODPIECE_TRACE_MEM=1 \
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder \
     gen "$M" -p "$P" -n 4 -c $C --tp 0,1 >/dev/null 2>/tmp/m_err.txt
   grep -E "^\[mem\]" /tmp/m_err.txt | sort -u | sed 's/^/  /'
   timeout 900 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
-    -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 -e TANDEM_TRACE_MEM=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder \
+    -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 -e CODPIECE_TRACE_MEM=1 \
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder \
     fused "$M" -p "$P" -n 4 -c $C --depth 3 --tp 0,1 >/dev/null 2>/tmp/m_err.txt
   grep -E "^\[mem\]" /tmp/m_err.txt | sort -u | sed 's/^/  /'
 done

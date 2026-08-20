@@ -5,18 +5,18 @@
 # would cost without reuse, since its prompt is the same size to within a hundred
 # tokens. Turns 2 and 3 extend the conversation the way a coding chat does; with reuse
 # the engine prefills only each turn's suffix. llama.cpp's session cache is what gives
-# prod its 1.3 s revisit in the box's own records; this is tandem's equivalent.
+# prod its 1.3 s revisit in the box's own records; this is codpiece's equivalent.
 set -u
 M=/models/qwen38/Qwen3.8-27B-UD-Q8_K_XL.gguf
-NAME=tandem-reuse
-head -c 132000 $HOME/llm/tandem/wiki.test.raw > /tmp/reuse_seed.txt
-tail -c 132000 $HOME/llm/tandem/wiki.test.raw > /tmp/reuse_seed2.txt
+NAME=codpiece-reuse
+head -c 132000 $HOME/llm/codpiece/wiki.test.raw > /tmp/reuse_seed.txt
+tail -c 132000 $HOME/llm/codpiece/wiki.test.raw > /tmp/reuse_seed2.txt
 
 docker rm -f $NAME >/dev/null 2>&1
 docker run -d --name $NAME --runtime nvidia \
   -e NVIDIA_VISIBLE_DEVICES=all -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-  -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-  -p 8020:8020 --entrypoint /src/target/release/tandem tandem-builder \
+  -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+  -p 8020:8020 --entrypoint /src/target/release/codpiece codpiece-builder \
   serve "$M" --host 0.0.0.0 --port 8020 -c ${CTX:-32768} --tp 0,1 >/dev/null
 for _ in $(seq 1 120); do
   [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8020/health || true)" = "200" ] && break

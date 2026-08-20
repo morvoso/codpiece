@@ -17,8 +17,8 @@ run() { # $1 = outfile, rest = args
   local out=$1; shift
   timeout 1800 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder \
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder \
     gen "$M" -p "$P" -n 96 -c 4096 --tp 0,1 "$@" >"$out" 2>/tmp/sm_err.txt
   grep -oE "decode:.*" /tmp/sm_err.txt | tail -1
 }

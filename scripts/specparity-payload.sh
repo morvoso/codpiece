@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# On the Python prompt tandem's speculative round diverges from its own single-token
+# On the Python prompt codpiece's speculative round diverges from its own single-token
 # greedy decoding, identically on the cached and rebuilt paths. The suspicion is that
 # batched verification is not bit-identical to one-token-at-a-time decoding, so a
-# near-tied argmax can flip — inherent to speculative decoding rather than a tandem
+# near-tied argmax can flip — inherent to speculative decoding rather than a codpiece
 # bug. Test that claim against the incumbent: run llama.cpp greedy with and without
 # its own MTP speculation and diff.
 # Runs INSIDE bench-window.sh.
@@ -12,8 +12,8 @@ RAW="Write a Python function that merges two sorted lists."
 PROMPT=$'<|im_start|>user\n'"$RAW"$'<|im_end|>\n<|im_start|>assistant\n'
 
 serve() { # $1 = extra args
-  docker rm -f tandem-ref-server >/dev/null 2>&1
-  docker run -d --name tandem-ref-server --runtime nvidia --ipc=host --shm-size=8g \
+  docker rm -f codpiece-ref-server >/dev/null 2>&1
+  docker run -d --name codpiece-ref-server --runtime nvidia --ipc=host --shm-size=8g \
     -e NVIDIA_VISIBLE_DEVICES=all -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
     -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=0 \
     -v "$HOME/llm/models:/models" -p 8031:8080 \
@@ -23,7 +23,7 @@ serve() { # $1 = extra args
     $1 >/dev/null 2>&1
   for _ in $(seq 1 100); do
     [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:8031/health || true)" = "200" ] && return 0
-    docker ps --format '{{.Names}}' | grep -qx tandem-ref-server || { echo "  server died"; return 1; }
+    docker ps --format '{{.Names}}' | grep -qx codpiece-ref-server || { echo "  server died"; return 1; }
     sleep 3
   done
   echo "  server not healthy"; return 1
@@ -51,7 +51,7 @@ serve "" && ask /tmp/lc_plain.txt
 echo "== llama.cpp, prod MTP speculation, greedy =="
 serve "--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75" && ask /tmp/lc_spec.txt
 
-docker rm -f tandem-ref-server >/dev/null 2>&1
+docker rm -f codpiece-ref-server >/dev/null 2>&1
 
 echo "== does llama.cpp's own speculation change its greedy output? =="
 if diff -q /tmp/lc_plain.txt /tmp/lc_spec.txt >/dev/null 2>&1; then

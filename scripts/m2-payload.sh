@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# M2 bench payload: single-GPU CUDA correctness + decode speed, tandem vs
+# M2 bench payload: single-GPU CUDA correctness + decode speed, codpiece vs
 # llama.cpp b10423, Qwen3.5-0.8B-BF16. Runs INSIDE the locked bench window
 # (bench-window.sh) — prod is stopped, GPUs are ours. Everything pins to one
 # physical GPU via CUDA_VISIBLE_DEVICES so the comparison is apples-to-apples.
 set -u
 
-REPO=$HOME/llm/tandem/codpiece
+REPO=$HOME/llm/codpiece/codpiece
 GPU_SEL=${GPU_SEL:-1}
 MODEL_C=/models/qwen35-small/Qwen3.5-0.8B-BF16.gguf
 
-tdm() { # tandem (CUDA build) in the builder container
+tdm() { # codpiece (CUDA build) in the builder container
   docker run --rm --runtime nvidia \
     -e NVIDIA_VISIBLE_DEVICES=all -e "CUDA_VISIBLE_DEVICES=$GPU_SEL" \
-    -v "$REPO:/src" -v "$HOME/llm/models:/models" -v "$HOME/llm/tandem:/work" \
-    --entrypoint /src/target/release/tandem \
-    tandem-builder "$@"
+    -v "$REPO:/src" -v "$HOME/llm/models:/models" -v "$HOME/llm/codpiece:/work" \
+    --entrypoint /src/target/release/codpiece \
+    codpiece-builder "$@"
 }
 
 oracle() { # llama-completion (b10423 CUDA) — same GPU
   docker run --rm --runtime nvidia \
     -e NVIDIA_VISIBLE_DEVICES=all -e "CUDA_VISIBLE_DEVICES=$GPU_SEL" \
     -e LD_LIBRARY_PATH=/work/llama.cpp-b10423/build/bin \
-    -v "$HOME/llm/tandem:/work" -v "$HOME/llm/models:/models" \
+    -v "$HOME/llm/codpiece:/work" -v "$HOME/llm/models:/models" \
     --entrypoint /work/llama.cpp-b10423/build/bin/llama-completion \
     nvidia/cuda:13.0.0-devel-ubuntu24.04 "$@"
 }
@@ -31,16 +31,16 @@ The capital of France is<|im_end|>
 <|im_start|>assistant
 "
 
-echo "== [1/4] tandem selftest on CUDA (session vs stateless, on-GPU) =="
+echo "== [1/4] codpiece selftest on CUDA (session vs stateless, on-GPU) =="
 tdm selftest "$MODEL_C" --gpu 0
 
-echo "== [2/4] tandem ppl on CUDA, 4 chunks =="
+echo "== [2/4] codpiece ppl on CUDA, 4 chunks =="
 echo "   CPU reference: [1]10.3754,[2]16.5382,[3]16.4713,[4]16.2159"
 tdm ppl "$MODEL_C" -f /work/wiki.test.raw -c 512 --chunks 4 --gpu 0 2>/dev/null
 
 echo "== [3/4] decode speed, 256 tokens, 2 reps each =="
 for r in 1 2; do
-  echo "-- tandem rep $r"
+  echo "-- codpiece rep $r"
   tdm gen "$MODEL_C" -p "$PROMPT" -n 256 --ignore-eos --gpu 0 2>&1 >/dev/null | grep -E "prefill:"
 done
 for r in 1 2; do
@@ -59,6 +59,6 @@ if [ "$(norm "$T")" == "$(norm "$O")" ]; then
   echo "GPU GEN PARITY: IDENTICAL"
 else
   echo "GPU GEN PARITY: DIVERGENCE"
-  echo "--- tandem ---"; norm "$T" | head -6
+  echo "--- codpiece ---"; norm "$T" | head -6
   echo "--- oracle ---"; norm "$O" | head -6
 fi

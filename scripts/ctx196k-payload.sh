@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Production serves this model at 196K context. Everything tandem has been measured at
+# Production serves this model at 196K context. Everything codpiece has been measured at
 # so far is 4K, and M5's gate assumes 196K works. Run it: ~194K tokens of real text,
 # then decode, sampling VRAM while it runs.
 #
@@ -9,8 +9,8 @@
 # Runs INSIDE bench-window.sh.
 set -u
 M=/models/qwen38/Qwen3.8-27B-UD-Q8_K_XL.gguf
-head -c 800000 $HOME/llm/tandem/wiki.test.raw > $HOME/llm/tandem/lc_prompt.txt
-echo "prompt: $(wc -c < $HOME/llm/tandem/lc_prompt.txt) chars (~194K tokens at the 4.13 chars/token measured earlier)"
+head -c 800000 $HOME/llm/codpiece/wiki.test.raw > $HOME/llm/codpiece/lc_prompt.txt
+echo "prompt: $(wc -c < $HOME/llm/codpiece/lc_prompt.txt) chars (~194K tokens at the 4.13 chars/token measured earlier)"
 
 # sample VRAM while the run is in flight; the earlier payload sampled after exit and
 # only ever saw an empty card
@@ -23,10 +23,10 @@ echo "prompt: $(wc -c < $HOME/llm/tandem/lc_prompt.txt) chars (~194K tokens at t
 run() {
   timeout 3600 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -e TANDEM_PREFILL_CHUNK="${TANDEM_PREFILL_CHUNK:-}" \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    -v $HOME/llm/tandem:/work \
-    --entrypoint /src/target/release/tandem tandem-builder "$@" >/tmp/c_out.txt 2>/tmp/c_err.txt
+    -e CODPIECE_PREFILL_CHUNK="${CODPIECE_PREFILL_CHUNK:-}" \
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    -v $HOME/llm/codpiece:/work \
+    --entrypoint /src/target/release/codpiece codpiece-builder "$@" >/tmp/c_out.txt 2>/tmp/c_err.txt
 }
 report() {
   if grep -q "decode:" /tmp/c_err.txt; then
@@ -39,7 +39,7 @@ report() {
 }
 
 for CHUNK in 128 32; do
-  export TANDEM_PREFILL_CHUNK=$CHUNK
+  export CODPIECE_PREFILL_CHUNK=$CHUNK
   echo "-- prefill chunk $CHUNK --"
   run gen "$M" -f /work/lc_prompt.txt -n 32 -c 200704 --tp 0,1
   report "plain   "

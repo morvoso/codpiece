@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Head-to-head at matched settings: llama.cpp's own server running production's
-# MTP config, versus tandem's MTP speculative decoding. Same model, same GPUs,
+# MTP config, versus codpiece's MTP speculative decoding. Same model, same GPUs,
 # same context, same prompt. Runs INSIDE a locked bench window.
 set -u
 M=/models/qwen38/Qwen3.8-27B-UD-Q8_K_XL.gguf
@@ -9,11 +9,11 @@ PROMPT=$'<|im_start|>user\n'"$RAW"$'<|im_end|>\n<|im_start|>assistant\n'
 NPRED=${NPRED:-96}
 
 echo "== llama.cpp b10423 server, prod MTP config (-sm tensor, draft-mtp 3 / 0.75) =="
-docker rm -f tandem-ref-server >/dev/null 2>&1
+docker rm -f codpiece-ref-server >/dev/null 2>&1
 # ipc: host + a real /dev/shm are what make -sm tensor work in a container:
 # NCCL's shared-memory transport aborts in ncclGroupEnd() with Docker's
 # default 64 MiB. Prod's compose sets exactly this (docker-compose.llamacpp.yml).
-docker run -d --name tandem-ref-server --runtime nvidia \
+docker run -d --name codpiece-ref-server --runtime nvidia \
   --ipc=host --shm-size=8g \
   -e NVIDIA_VISIBLE_DEVICES=all -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=0 \
@@ -31,16 +31,16 @@ ready=0
 for _ in $(seq 1 100); do
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:8031/health || true)
     if [ "$code" = "200" ]; then ready=1; break; fi
-    if ! docker ps --format '{{.Names}}' | grep -qx tandem-ref-server; then
+    if ! docker ps --format '{{.Names}}' | grep -qx codpiece-ref-server; then
         echo "  reference server exited during startup:"
-        docker logs tandem-ref-server 2>&1 | grep -iE "error|abort|assert" | head -4
+        docker logs codpiece-ref-server 2>&1 | grep -iE "error|abort|assert" | head -4
         break
     fi
     sleep 3
 done
 if [ "$ready" != "1" ]; then
     echo "  reference server did not become healthy; logs:"
-    docker logs tandem-ref-server 2>&1 | tail -5
+    docker logs codpiece-ref-server 2>&1 | tail -5
 else
     python3 - "$PROMPT" "$NPRED" <<'PY'
 import json, sys, urllib.request
@@ -56,26 +56,26 @@ for rep in (1, 2, 3):
           % (rep, t.get("predicted_per_second", 0), t.get("predicted_n", 0)))
 PY
 fi
-docker rm -f tandem-ref-server >/dev/null 2>&1
+docker rm -f codpiece-ref-server >/dev/null 2>&1
 sleep 5
 
-tandem() { # $@ = subcommand and flags
+codpiece() { # $@ = subcommand and flags
     timeout 1800 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
       -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=0 \
-      -v "$HOME/llm/tandem/codpiece:/src" -v "$HOME/llm/models:/models" \
-      --entrypoint /src/target/release/tandem tandem-builder "$@" \
+      -v "$HOME/llm/codpiece/codpiece:/src" -v "$HOME/llm/models:/models" \
+      --entrypoint /src/target/release/codpiece codpiece-builder "$@" \
       >/dev/null 2>/tmp/hh.txt
     grep -oE 'decode:.*' /tmp/hh.txt
 }
 
-echo "== tandem, MTP speculative depth 3 (separate draft graphs) =="
+echo "== codpiece, MTP speculative depth 3 (separate draft graphs) =="
 for rep in 1 2 3; do
-    echo "  tandem spec-3   rep$rep: $(tandem spec "$M" -p "$PROMPT" -n "$NPRED" -c 4096 --spec 3 --tp 0,1)"
+    echo "  codpiece spec-3   rep$rep: $(codpiece spec "$M" -p "$PROMPT" -n "$NPRED" -c 4096 --spec 3 --tp 0,1)"
 done
 
-echo "== tandem, fused verify+draft chain, cached graphs =="
+echo "== codpiece, fused verify+draft chain, cached graphs =="
 for D in 2 3; do
     for rep in 1 2 3; do
-        echo "  tandem fused-d$D rep$rep: $(tandem fused "$M" -p "$PROMPT" -n "$NPRED" -c 4096 --depth $D --tp 0,1 --path cached)"
+        echo "  codpiece fused-d$D rep$rep: $(codpiece fused "$M" -p "$PROMPT" -n "$NPRED" -c 4096 --depth $D --tp 0,1 --path cached)"
     done
 done

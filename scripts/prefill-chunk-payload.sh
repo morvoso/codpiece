@@ -7,15 +7,15 @@
 # have taken when I made that change.
 set -u
 M=/models/qwen38/Qwen3.8-27B-UD-Q8_K_XL.gguf
-head -c 140000 $HOME/llm/tandem/wiki.test.raw > $HOME/llm/tandem/lc_prompt.txt
+head -c 140000 $HOME/llm/codpiece/wiki.test.raw > $HOME/llm/codpiece/lc_prompt.txt
 
 run() { # $1 = chunk
   timeout 1800 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -e TANDEM_PREFILL_CHUNK="$1" \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    -v $HOME/llm/tandem:/work \
-    --entrypoint /src/target/release/tandem tandem-builder "${@:2}" >/dev/null 2>/tmp/pc.txt
+    -e CODPIECE_PREFILL_CHUNK="$1" \
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    -v $HOME/llm/codpiece:/work \
+    --entrypoint /src/target/release/codpiece codpiece-builder "${@:2}" >/dev/null 2>/tmp/pc.txt
   grep -oE "prefill: [0-9]+ tok in [0-9.]+s \([0-9.]+ tok/s\)" /tmp/pc.txt | tail -1
 }
 

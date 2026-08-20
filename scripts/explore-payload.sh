@@ -13,8 +13,8 @@ M=/models/qwen38/Qwen3.8-27B-UD-Q8_K_XL.gguf
 run() {
   timeout 1800 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder "$@" >/tmp/out.txt 2>/tmp/n.txt
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder "$@" >/tmp/out.txt 2>/tmp/n.txt
 }
 rate() { grep -oE "\([0-9.]+ tok/s\)" /tmp/n.txt | tail -1 | tr -d '()'; }
 extra() { grep -oE "adaptive \[.*" /tmp/n.txt; }

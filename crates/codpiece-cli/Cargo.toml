@@ -1,0 +1,20 @@
+[package]
+name = "codpiece-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "codpiece"
+path = "src/main.rs"
+
+[dependencies]
+codpiece-gguf = { path = "../codpiece-gguf" }
+codpiece-tok = { path = "../codpiece-tok" }
+codpiece-model = { path = "../codpiece-model" }
+codpiece-sample = { path = "../codpiece-sample" }
+codpiece-server = { path = "../codpiece-server" }
+libc = "0.2"
+
+[features]
+cuda = ["codpiece-model/cuda", "codpiece-server/cuda"]

@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/tandem-gguf",
-    "crates/tandem-ggml-sys",
-    "crates/tandem-tok",
-    "crates/tandem-sample",
-    "crates/tandem-model",
-    "crates/tandem-server",
-    "crates/tandem-cli",
+    "crates/codpiece-gguf",
+    "crates/codpiece-ggml-sys",
+    "crates/codpiece-tok",
+    "crates/codpiece-sample",
+    "crates/codpiece-model",
+    "crates/codpiece-server",
+    "crates/codpiece-cli",
 ]
 
 [workspace.package]

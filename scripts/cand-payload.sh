@@ -15,9 +15,9 @@ Explain in three sentences why the sky is blue.<|im_end|>
 run() {
   timeout 1800 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -e TANDEM_CAND_DUMMY="${TANDEM_CAND_DUMMY:-}" \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder "$@" >/tmp/out.txt 2>/tmp/n.txt
+    -e CODPIECE_CAND_DUMMY="${CODPIECE_CAND_DUMMY:-}" \
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder "$@" >/tmp/out.txt 2>/tmp/n.txt
 }
 stat() { grep -oE "decode:.*" /tmp/n.txt | sed 's/decode: //'; }
 verdict() { diff -q /tmp/ref.txt /tmp/out.txt >/dev/null && echo LOSSLESS || echo MISMATCH; }
@@ -28,7 +28,7 @@ echo "plain decode:              $(stat)"
 run fused "$M" -p "$P" -n 160 -c 4096 --depth 2 --tp 0,1 --path rebuild
 echo "d2 full vocab [$(verdict)]: $(stat)"
 
-TANDEM_CAND_DUMMY=1 run fused "$M" -p "$P" -n 160 -c 4096 --depth 2 --tp 0,1 --path rebuild --cand 4096
+CODPIECE_CAND_DUMMY=1 run fused "$M" -p "$P" -n 160 -c 4096 --depth 2 --tp 0,1 --path rebuild --cand 4096
 echo "d2 static 4096 [$(verdict)]: $(stat)"
 
 for C in 2048 4096 16384; do

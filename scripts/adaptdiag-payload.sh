@@ -14,8 +14,8 @@ echo "=== $RAW ==="
 for MD in 3; do
   timeout 900 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder \
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder \
     fused "$M" -p "$P" -n 160 -c 4096 --depth auto --max-depth $MD --tp 0,1 \
     >/tmp/ad_out.txt 2>/tmp/ad_err.txt
   rc=$?

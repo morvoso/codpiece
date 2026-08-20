@@ -11,7 +11,7 @@ set -u
 LOCK=/tmp/llama-sweep.lock
 PROD_CONTAINER=llama-qwen
 PROD_URL=http://localhost:8020
-LOGDIR=$HOME/llm/tandem/logs
+LOGDIR=$HOME/llm/codpiece/logs
 TEMP_ABORT_C=83
 mkdir -p "$LOGDIR"
 STAMP=$(date +%Y%m%d-%H%M%S)

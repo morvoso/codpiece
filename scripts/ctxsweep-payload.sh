@@ -12,8 +12,8 @@ Say hello.<|im_end|>
 for C in 32768 65536 131072 200704; do
   timeout 900 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder \
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder \
     gen "$M" -p "$P" -n 8 -c $C --tp 0,1 >/tmp/s_out.txt 2>/tmp/s_err.txt
   rc=$?
   if grep -q "decode:" /tmp/s_err.txt; then

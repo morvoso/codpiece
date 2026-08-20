@@ -1,11 +1,11 @@
-# tandem architecture
+# codpiece architecture
 
 *Decision record. Started 2026-08-19. Everything here is falsifiable by the
 gates in ROADMAP.md.*
 
 ## 1. The one decision that shapes everything
 
-**tandem rebuilds the engine layer and inherits the kernel layer.**
+**codpiece rebuilds the engine layer and inherits the kernel layer.**
 
 ENGINE.md §7's scoping table is the argument: GDN/DeltaNet kernels are
 research-grade ("where forks go to die"), while every measured win on this box
@@ -14,7 +14,7 @@ orchestration (MTP 0.60→0.92 acceptance from *flags*, not kernels), cache
 policy (70× session revisit), template/sampling plumbing (2.4× felt latency).
 
 So: vendor ggml (MIT) at the exact tag production runs (**b10423**), link it as
-tandem's compute substrate, and own everything above it. Kernel-level work
+codpiece's compute substrate, and own everything above it. Kernel-level work
 happens later, surgically, where profiling proves a win (§6).
 
 What we verified ggml@b10423 already provides (read from the llama.cpp source
@@ -34,7 +34,7 @@ on llm-host, snapshots in `notes/reference/`):
 
 ## 2. Language: Rust control plane, C/CUDA compute plane
 
-The layer tandem rebuilds is a concurrency-heavy control plane: continuous
+The layer codpiece rebuilds is a concurrency-heavy control plane: continuous
 batching, cache eviction, rollback bookkeeping, streaming HTTP. These die by
 data race and use-after-free, which is Rust's home turf. The compute plane
 stays C/CUDA (vendored, pinned).
@@ -51,13 +51,13 @@ stays C/CUDA (vendored, pinned).
 ## 3. Crate map
 
 ```
-tandem-gguf      GGUF v2/v3 reader (no deps)                 [done]
-tandem-ggml-sys  bindgen FFI over vendored ggml, cmake build [m0]
-tandem-tok       BPE tokenizer + template engine             [m1]
-tandem-model     qwen35 graph builder (trunk + MTP graph)    [m1-m3]
-tandem-runtime   scheduler, KV/recurrent cache, spec decode  [m3-m6]
-tandem-server    OpenAI-compatible API, streaming, sessions  [m5]
-tandem-cli       inspect / run / bench                       [rolling]
+codpiece-gguf      GGUF v2/v3 reader (no deps)                 [done]
+codpiece-ggml-sys  bindgen FFI over vendored ggml, cmake build [m0]
+codpiece-tok       BPE tokenizer + template engine             [m1]
+codpiece-model     qwen35 graph builder (trunk + MTP graph)    [m1-m3]
+codpiece-runtime   scheduler, KV/recurrent cache, spec decode  [m3-m6]
+codpiece-server    OpenAI-compatible API, streaming, sessions  [m5]
+codpiece-cli       inspect / run / bench                       [rolling]
 ```
 
 ## 4. The model, as read from the production GGUF
@@ -66,7 +66,7 @@ tandem-cli       inspect / run / bench                       [rolling]
 `nextn.*` tensors). `full_attention_interval = 4`: layers 3,7,…,63 are full
 attention (16 with KV cache), the other 48 are GDN recurrent.
 
-Trunk GDN layer (from `notes/reference/qwen35.cpp`, tandem must reproduce
+Trunk GDN layer (from `notes/reference/qwen35.cpp`, codpiece must reproduce
 exactly):
 
 ```
@@ -91,7 +91,7 @@ KV per token: 4 heads × 256 × 2 (K,V) × 2 B = 64 KiB f16 across the 16 layers
 MTP graph (`blk.64`): `concat(rms_e(emb(tok)), rms_h(h_trunk)) → eh_proj
 [10240→5120] → one full-attention block (own KV cache) → shared output head`.
 llama.cpp drives it via `LLM_GRAPH_TYPE_DECODER_MTP` with hidden-state handoff
-(`t_h_nextn`) — tandem's runtime owns this handoff and the verify batching.
+(`t_h_nextn`) — codpiece's runtime owns this handoff and the verify batching.
 
 Recurrent session state is why session caching must be engine-native:
 48 layers × (conv state 3×10240 + GDN state 128×128×48) ≈ **~82 KiB/token-slot
@@ -101,7 +101,7 @@ equivalent** in the host tier (matches ENGINE.md's measured session overhead).
 
 **Continuous batching, one unified GPU pass per step.** llama.cpp's server
 runs slot-based `-np N` with a shared context; vLLM proves this box rewards
-real continuous batching (+245% at 4-way). tandem composes each step's ubatch
+real continuous batching (+245% at 4-way). codpiece composes each step's ubatch
 from whatever sequences are runnable: prefill chunks and decode tokens ride
 the same graph where shapes allow, MTP verify tokens batch with them.
 
@@ -113,7 +113,7 @@ the same graph where shapes allow, MTP verify tokens batch with them.
 3. Disk is out of scope until measurement demands it.
 
 Recurrent states make rollback checkpointing mandatory (can't recompute
-backwards): tandem checkpoints GDN+conv states every C tokens during prefill
+backwards): codpiece checkpoints GDN+conv states every C tokens during prefill
 (llama.cpp uses 32 checkpoints / 8192-token spacing as its default shape) and
 keeps K=n_spec+1 rolling snapshots during speculative decode — both mechanisms
 already supported by the fused op + our copy scheduling.
@@ -125,7 +125,7 @@ blocks) can slot in under multi-GPU, which llama.cpp PR-27342 structurally
 cannot do (single-GPU-era allocator assumptions; see ENGINE.md §6 autopsy).
 
 **Decode loop as CUDA graph.** Kernel-launch gaps are part of vLLM's edge;
-ggml-cuda supports graph capture; tandem's fixed-shape decode step is designed
+ggml-cuda supports graph capture; codpiece's fixed-shape decode step is designed
 to stay capture-legal (no shape churn on the hot path).
 
 **Multi-GPU.** Two modes, both implemented:
@@ -134,8 +134,8 @@ to stay capture-legal (no shape churn on the hot path).
   ggml_backend_sched moves activations. Simple and correct; makes the 27B
   runnable. Slow, because the GPUs alternate rather than share each token.
 - *Tensor parallel* (`Device::CudaTensorParallel`): ggml's meta device wraps
-  both GPUs and presents one backend, so tandem keeps its fast path while
-  every matrix is sliced. This is prod's `-sm tensor`. tandem supplies the
+  both GPUs and presents one backend, so codpiece keeps its fast path while
+  every matrix is sliced. This is prod's `-sm tensor`. codpiece supplies the
   split classification (`split.rs`, unit-tested offline against the real 27B
   shapes) and ggml inserts the all-reduce.
 
@@ -161,7 +161,7 @@ portable engine picks:
 - **The CPU is idle.** 24 threads and 62 GiB of RAM do nothing during a decode
   step, which is entirely GPU-bandwidth-bound.
 
-Consequences tandem acts on:
+Consequences codpiece acts on:
 
 **Replicate the LM head rather than split it** (`split.rs`). The memory-optimal
 choice column-splits `output.weight`, but then the vocabulary is spread across
@@ -204,7 +204,7 @@ The hybrid architecture forecloses the technique regardless of hardware.
 5. `reasoning_effort` + thinking-budget plumbing (prod runs budget 4096 with a
    budget-exhaustion message — replicate).
 
-## 8. What tandem does NOT do
+## 8. What codpiece does NOT do
 
 - No training, no quantization tooling (Unsloth's files are the input).
 - No CPU inference path beyond what correctness testing needs.

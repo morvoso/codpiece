@@ -79,6 +79,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "codpiece-cli"
+version = "0.0.1"
+dependencies = [
+ "codpiece-gguf",
+ "codpiece-model",
+ "codpiece-sample",
+ "codpiece-server",
+ "codpiece-tok",
+ "libc",
+]
+
+[[package]]
+name = "codpiece-ggml-sys"
+version = "0.0.1"
+dependencies = [
+ "bindgen",
+]
+
+[[package]]
+name = "codpiece-gguf"
+version = "0.0.1"
+
+[[package]]
+name = "codpiece-model"
+version = "0.0.1"
+dependencies = [
+ "codpiece-ggml-sys",
+ "codpiece-gguf",
+]
+
+[[package]]
+name = "codpiece-sample"
+version = "0.0.1"
+
+[[package]]
+name = "codpiece-server"
+version = "0.0.1"
+dependencies = [
+ "codpiece-gguf",
+ "codpiece-model",
+ "codpiece-sample",
+ "codpiece-tok",
+ "minijinja",
+ "minijinja-contrib",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "codpiece-tok"
+version = "0.0.1"
+dependencies = [
+ "codpiece-gguf",
+ "fancy-regex",
+]
+
+[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -318,63 +375,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tandem-cli"
-version = "0.0.1"
-dependencies = [
- "libc",
- "tandem-gguf",
- "tandem-model",
- "tandem-sample",
- "tandem-server",
- "tandem-tok",
-]
-
-[[package]]
-name = "tandem-ggml-sys"
-version = "0.0.1"
-dependencies = [
- "bindgen",
-]
-
-[[package]]
-name = "tandem-gguf"
-version = "0.0.1"
-
-[[package]]
-name = "tandem-model"
-version = "0.0.1"
-dependencies = [
- "tandem-ggml-sys",
- "tandem-gguf",
-]
-
-[[package]]
-name = "tandem-sample"
-version = "0.0.1"
-
-[[package]]
-name = "tandem-server"
-version = "0.0.1"
-dependencies = [
- "minijinja",
- "minijinja-contrib",
- "serde",
- "serde_json",
- "tandem-gguf",
- "tandem-model",
- "tandem-sample",
- "tandem-tok",
-]
-
-[[package]]
-name = "tandem-tok"
-version = "0.0.1"
-dependencies = [
- "fancy-regex",
- "tandem-gguf",
 ]
 
 [[package]]

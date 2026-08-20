@@ -1,0 +1,13 @@
+[package]
+name = "codpiece-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model weight loading and (soon) qwen35 graph construction on ggml."
+
+[dependencies]
+codpiece-gguf = { path = "../codpiece-gguf" }
+codpiece-ggml-sys = { path = "../codpiece-ggml-sys" }
+
+[features]
+cuda = ["codpiece-ggml-sys/cuda"]

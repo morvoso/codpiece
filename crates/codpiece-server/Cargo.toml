@@ -1,0 +1,18 @@
+[package]
+name = "codpiece-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+codpiece-gguf = { path = "../codpiece-gguf" }
+codpiece-tok = { path = "../codpiece-tok" }
+codpiece-model = { path = "../codpiece-model" }
+codpiece-sample = { path = "../codpiece-sample" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+minijinja = { version = "2", features = ["loader", "builtins"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+
+[features]
+cuda = ["codpiece-model/cuda"]

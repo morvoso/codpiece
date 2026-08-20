@@ -10,15 +10,15 @@ Write a Python function that merges two sorted lists.<|im_end|>
 run() {
   timeout 1800 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder "$@" >"$1.txt" 2>/tmp/n.txt
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder "$@" >"$1.txt" 2>/tmp/n.txt
 }
 gen_to() { # $1 = outfile, rest = args
   local out=$1; shift
   timeout 1800 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder "$@" >"$out" 2>/tmp/n.txt
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder "$@" >"$out" 2>/tmp/n.txt
   grep -oE "decode:.*" /tmp/n.txt
 }
 

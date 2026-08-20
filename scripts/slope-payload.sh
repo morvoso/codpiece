@@ -15,8 +15,8 @@ Explain in two sentences what binary search is, then give a complete Python impl
 run() {
   timeout 1800 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 \
-    -v $HOME/llm/tandem/codpiece:/src -v $HOME/llm/models:/models \
-    --entrypoint /src/target/release/tandem tandem-builder "$@" >/dev/null 2>/tmp/n.txt
+    -v $HOME/llm/codpiece/codpiece:/src -v $HOME/llm/models:/models \
+    --entrypoint /src/target/release/codpiece codpiece-builder "$@" >/dev/null 2>/tmp/n.txt
   # "<tokens> <seconds> <rounds>" straight from the stats line
   sed -n 's/.*decode: \([0-9]*\) tok in \([0-9.]*\)s.*, \([0-9]*\) rounds.*/\1 \2 \3/p' /tmp/n.txt | tail -1
 }

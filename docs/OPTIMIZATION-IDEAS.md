@@ -35,7 +35,7 @@ is waste to be removed.
 
 ## The cost curve that reframes everything (27B, tensor parallel, measured)
 
-`tandem stepcost` times steady-state steps as a function of tokens carried:
+`codpiece stepcost` times steady-state steps as a function of tokens carried:
 
 | tokens/step | ms/step | ms/token | vs T=1 |
 |---|---|---|---|
@@ -121,7 +121,7 @@ extra nodes on one launch rather than three launches.
 
 **Result: it works.** `--depth K` chains K drafts in one graph. Measured
 tokens/round 1.88 / 2.51 / 2.91 at depth 1/2/3, all lossless. Combined with
-idea 4 it is what put tandem level with llama.cpp at depth 2 and ahead at
+idea 4 it is what put codpiece level with llama.cpp at depth 2 and ahead at
 depth 3.
 
 The chain does not make drafts free — a chain step still costs ~5.4 ms against
@@ -163,19 +163,19 @@ diagnosis of each:
    time and evicted based on which graph was being *computed*. Those orders
    agree only while one graph is replayed forever. Containers are now keyed by
    graph uid and reclaimed least-recently-used.
-2. **tandem**: `rollback_recurrent` built its graph in a context it freed each
+2. **codpiece**: `rollback_recurrent` built its graph in a context it freed each
    round, so the heap handed the same addresses to different tensors and the
    map aliased them. Rollback graphs are now built once per rollback distance
    and kept for the session; superseded cached graphs are retired rather than
    freed.
-3. **ggml + tandem**: `ggml_new_graph_custom` leaves `cgraph->uid` at 0, which
+3. **ggml + codpiece**: `ggml_new_graph_custom` leaves `cgraph->uid` at 0, which
    the meta backend reads as "assume this graph changed" — so **every compute
    rebuilt the per-device mapping, including plain decode's supposedly cached
    graph**. A new `ggml_graph_set_new_uid()` stamps a graph whose structure is
-   frozen, and tandem stamps each cached graph after allocating it. Plain
+   frozen, and codpiece stamps each cached graph after allocating it. Plain
    decode went from 20 meta rebuilds per 20 tokens to 2.
 
-Item 3 is the one worth remembering: tandem had been paying for graph caching
+Item 3 is the one worth remembering: codpiece had been paying for graph caching
 in the control plane and getting none of it in the backend.
 
 Measured on the 27B, 160 tokens, all output identical to plain greedy:
@@ -227,7 +227,7 @@ keeping — see `notes/results-2026-08-19.md`:
 
 The draft head is tiny and the trunk is huge; on one device they could overlap
 if issued on independent streams. ggml drives one stream per backend, so this
-needs work below tandem. Idea 1 achieves most of the same benefit without it.
+needs work below codpiece. Idea 1 achieves most of the same benefit without it.
 
 ---
 
