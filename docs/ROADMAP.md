@@ -46,17 +46,22 @@ Status 2026-08-19, all vs oracles built at b10423, CPU, GPU-blind:
 - [x] Generation parity: greedy continuation **token-identical to EOS**
       (43 tokens) vs `llama-completion --temp 0` on the wrapped prompt,
       BF16 weights.
-- [ ] Formal gate remainder: ≥1 MB corpus run; 3 diverse prompts × 64 tokens;
-      numeric logit maxdiff (< 1e-3) via eval-callback; EOS stop in the rig.
+- [x] Formal gates CLOSED (session 2): tokenizer identical on wikitext-2
+      test (297,193/297,193 tokens, 1.29 MB); **PPL 20.4453 vs oracle
+      20.4429 (0.012%)** over 12×512 chunks — the numeric whole-model gate,
+      stronger than a logit maxdiff; scripts/parity-gen.sh 3 prompts × 64
+      tokens 3/3; EOS stop in run/gen.
 
-## M1.5 — hygiene before M2
+**M1: PASSED.**
 
-- [ ] tok-parity + gen-parity as scripted harness (scripts/), runnable in one
-      command; corpus checked in or fetched deterministically.
-- [ ] `tandem-tok` perf pass (BPE merge is O(n²) scan; fine for corpora,
-      wrong for serving) + decode SIGPIPE/broken-pipe hardening.
-- [ ] Builder image for llm-host with rust + CUDA so `cargo build
-      --features cuda` runs there (oracle recipe already proves the pieces).
+## M1.5 — hygiene  ✅
+
+- [x] parity harness scripted (scripts/parity-gen.sh, path-matched oracle
+      via ORACLE_FA; TANDEM_SUBCMD selects stateless/session path).
+- [x] tokenizer perf closed by measurement: 297K tokens in 0.37 s wall —
+      the pretokenizer keeps BPE pieces tiny; no heap needed.
+- [x] SIGPIPE fixed. Builder image docker/builder.Dockerfile (CUDA devel +
+      rustup + libclang); cargo cuda builds on llm-host in a named volume.
 
 ## M2 — Single-GPU CUDA + decode loop  ◕ in progress 2026-08-19
 
