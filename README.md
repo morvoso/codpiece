@@ -124,7 +124,7 @@ engines cannot bleed settings in.
 Same box, same model (Qwen3.8-27B UD-Q8_K_XL), same prompts, locked bench
 windows. llama.cpp is b10423 in its production configuration.
 
-| | codpiece | llama.cpp | vLLM (FP8) |
+| measurement | codpiece | llama.cpp | vLLM (FP8) |
 |---|---|---|---|
 | greedy decode, prose | **69.9 tok/s** | 64.5 | 76–95 |
 | greedy decode, code | **67.6** | 53.3 | — |
