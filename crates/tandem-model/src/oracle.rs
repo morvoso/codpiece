@@ -126,6 +126,7 @@ fn hash_ctx(order: usize, ctx: &[u32]) -> u64 {
 }
 
 impl ContextOracle {
+    /// `min_confidence` is the starting gate; it self-tunes from there.
     pub fn new(min_confidence: f32) -> ContextOracle {
         ContextOracle {
             table: HashMap::new(),
@@ -133,6 +134,12 @@ impl ContextOracle {
             min_confidence,
             hits: 0,
             proposals: 0,
+            // Start strict and loosen on evidence. The asymmetry is real:
+            // an extra draft slot widens the verify batch AND adds a
+            // recurrent snapshot write per layer (~300 MB of device copies
+            // per round on the 27B for two extra slots), while a correct
+            // draft only saves part of a round. So the oracle must earn its
+            // width rather than assume it.
             recent: 1.0,
             seen: 0,
             adaptive: true,

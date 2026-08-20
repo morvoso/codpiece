@@ -67,7 +67,8 @@ fn cmd_spec(args: &[String]) -> ExitCode {
     let mut n_spec = 1usize;
     let mut p_min = 0.75f32;
     let mut n_oracle = 0usize;
-    let mut oracle_conf = 0.6f32;
+    // starts strict; the gate loosens itself once drafts start landing
+    let mut oracle_conf = 0.85f32;
     let mut gpu: Option<i32> = None;
     let mut tp: Option<Vec<i32>> = None;
     let mut ignore_eos = false;
