@@ -1047,15 +1047,34 @@ impl Qwen35 {
                             }
                         }
 
-                        let k_all = ffi::ggml_view_3d(
-                            ctx, kc, hd, n_kv, hp.n_head_kv,
-                            (*kc).nb[1], hd as usize * elt_kv, 0,
-                        );
+                        // Cache reads are built as [head_dim, n_head_kv, n_kv]
+                        // — strides increase monotonically, so ggml does not
+                        // consider the view "permuted" — and then permuted
+                        // into the [head_dim, n_kv, n_head_kv] that attention
+                        // wants. Viewing tokens-before-heads directly would
+                        // invert nb[1]/nb[2], which the tensor-parallel meta
+                        // backend refuses ("view of permuted tensor not
+                        // implemented"): it cannot map a split axis through
+                        // a stride-reordered view.
+                        let k_all = {
+                            let v4 = ffi::ggml_view_4d(
+                                ctx, kc, hd, hp.n_head_kv, n_kv, 1,
+                                hd as usize * elt_kv,
+                                (*kc).nb[1],
+                                (*kc).nb[1] * s.n_ctx_max,
+                                0,
+                            );
+                            ffi::ggml_permute(ctx, v4, 0, 2, 1, 3)
+                        };
                         let v_all = if fa {
-                            ffi::ggml_view_3d(
-                                ctx, vc, hp.head_v, n_kv, hp.n_head_kv,
-                                (*vc).nb[1], hp.head_v as usize * elt_kv, 0,
-                            )
+                            let v4 = ffi::ggml_view_4d(
+                                ctx, vc, hp.head_v, hp.n_head_kv, n_kv, 1,
+                                hp.head_v as usize * elt_kv,
+                                (*vc).nb[1],
+                                (*vc).nb[1] * s.n_ctx_max,
+                                0,
+                            );
+                            ffi::ggml_permute(ctx, v4, 0, 2, 1, 3)
                         } else {
                             ffi::ggml_view_3d(
                                 ctx, vc, n_kv, hp.head_v, hp.n_head_kv,

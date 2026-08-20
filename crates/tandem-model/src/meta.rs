@@ -38,6 +38,7 @@ fn axis_to_ffi(a: Axis) -> ffi::ggml_backend_meta_split_axis {
     match a {
         Axis::Axis0 => ffi::ggml_backend_meta_split_axis_GGML_BACKEND_SPLIT_AXIS_0,
         Axis::Axis1 => ffi::ggml_backend_meta_split_axis_GGML_BACKEND_SPLIT_AXIS_1,
+        Axis::Axis2 => ffi::ggml_backend_meta_split_axis_GGML_BACKEND_SPLIT_AXIS_2,
         Axis::Mirrored => ffi::ggml_backend_meta_split_axis_GGML_BACKEND_SPLIT_AXIS_MIRRORED,
         Axis::Partial => ffi::ggml_backend_meta_split_axis_GGML_BACKEND_SPLIT_AXIS_PARTIAL,
     }
@@ -71,6 +72,7 @@ pub unsafe extern "C" fn get_split_state(
     let axis_idx = match cls.axis {
         Axis::Axis0 => 0usize,
         Axis::Axis1 => 1usize,
+        Axis::Axis2 => 2usize,
         _ => return out,
     };
     let extent = (*tensor).ne[axis_idx];
@@ -91,6 +93,23 @@ pub unsafe extern "C" fn get_split_state(
         .unwrap_or(1);
 
     let st = split::split_state(name, &ctx.hp, extent, blck, ctx.n_devices);
+    // TANDEM_TRACE_SPLIT names any tensor whose split ggml rejects: the meta
+    // backend asserts that the per-device extents sum to the tensor's own
+    // extent, and its abort does not say which tensor failed.
+    if std::env::var("TANDEM_TRACE_SPLIT").is_ok() {
+        let sum: i64 = (0..st.n_segments)
+            .map(|is| {
+                let per: i64 = (0..ctx.n_devices).map(|d| st.ne[is * ctx.n_devices + d]).sum();
+                per * st.nr[is] as i64
+            })
+            .sum();
+        eprintln!(
+            "[split] {name}: axis {:?} ne[{axis_idx}]={extent} segs={} sum={sum}{}",
+            st.axis,
+            st.n_segments,
+            if sum == extent { "" } else { "  <-- MISMATCH" }
+        );
+    }
     out.axis = axis_to_ffi(st.axis);
     out.n_segments = st.n_segments as u32;
     let n = st.ne.len().min(out.ne.len());

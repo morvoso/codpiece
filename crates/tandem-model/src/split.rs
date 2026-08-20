@@ -21,6 +21,9 @@ pub enum Axis {
     /// split along ne[1] (columns: input projections, each device owns whole
     /// output features)
     Axis1,
+    /// split along ne[2] (used by tandem's 3-D GDN state, one [S,S] matrix
+    /// per value head — the heads are what get distributed)
+    Axis2,
     /// full copy on every device (norms, embeddings, scalars)
     Mirrored,
     /// present on one device only (per-expert biases)
@@ -92,16 +95,22 @@ pub fn classify(name: &str, hp: &Hparams) -> Split {
         return match kind {
             // KV cache rows are per-head: split like attn_output's input side
             "k" | "v" => seg_ref(Axis::Axis0, vec![], "attn_output.weight"),
-            // conv state: [q|k|v] channels, same segmentation as ssm_conv1d
+            // NOTE: llama.cpp keeps its recurrent caches FLAT (one row per
+            // sequence), so its axis/segment rules do not transfer to
+            // tandem's shaped tensors. These follow tandem's own layouts:
+            //
+            // conv state is [d_conv-1, conv_dim]: the [q|k|v] channels live
+            // on ne[1] and split exactly like ssm_conv1d.weight's ne[1].
             "conv" => seg_ref(
-                Axis::Axis0,
-                vec![(key_dim * (hp.d_conv - 1), 2 + head_ratio)],
+                Axis::Axis1,
+                vec![(key_dim, 2 + head_ratio)],
                 "ssm_out.weight",
             ),
-            // GDN recurrent state: one [S,S] matrix per V head
+            // GDN state is [S, S, n_v_heads]: whole per-head matrices move
+            // with their head, so the split is over ne[2], like ssm_a.
             "gdn" => seg_ref(
-                Axis::Axis0,
-                vec![(hp.n_k_heads * head_v * head_v, head_ratio)],
+                Axis::Axis2,
+                vec![(hp.n_k_heads, head_ratio)],
                 "ssm_out.weight",
             ),
             _ => Split::mirrored(),
@@ -217,9 +226,11 @@ pub fn granularity(name: &str, hp: &Hparams, blck: i64, n_devices: usize) -> i64
             "ssm_dt.bias" | "ssm_a" | "ssm_alpha.weight" | "ssm_beta.weight" => {
                 return g_qkv / head_dim
             }
-            // cache_* suffixes arrive as the bare kind
-            "conv" => return g_qkv * (hp.d_conv - 1),
-            "gdn" => return g_qkv * head_dim,
+            // cache_* suffixes arrive as the bare kind; tandem's conv state
+            // splits its channel axis like the conv weight, and its GDN state
+            // splits whole heads
+            "conv" => return g_qkv,
+            "gdn" => return g_qkv / head_dim,
             _ => {}
         }
     } else {
@@ -270,7 +281,7 @@ pub fn split_state(
     n_devices: usize,
 ) -> SplitState {
     let split = classify(name, hp);
-    if !matches!(split.axis, Axis::Axis0 | Axis::Axis1) {
+    if !matches!(split.axis, Axis::Axis0 | Axis::Axis1 | Axis::Axis2) {
         return SplitState { axis: split.axis, ne: vec![], nr: vec![1], n_segments: 1 };
     }
 
@@ -385,11 +396,14 @@ mod tests {
         let hp = hp_27b();
         assert_eq!(classify("cache_k_l3", &hp).axis, Axis::Axis0);
         assert_eq!(classify("cache_v_l3", &hp).axis, Axis::Axis0);
+        // conv state splits its channel axis (ne[1] == conv_dim)
         let conv = classify("cache_conv_l0", &hp);
-        assert_eq!(conv.extent(), hp.conv_dim() * (hp.d_conv - 1));
+        assert_eq!(conv.axis, Axis::Axis1);
+        assert_eq!(conv.extent(), hp.conv_dim());
+        // gdn state splits whole heads (ne[2] == n_v_heads)
         let gdn = classify("cache_gdn_l0", &hp);
-        // one head_v x head_v matrix per V head
-        assert_eq!(gdn.extent(), hp.n_v_heads * hp.gdn_head_v() * hp.gdn_head_v());
+        assert_eq!(gdn.axis, Axis::Axis2);
+        assert_eq!(gdn.extent(), hp.n_v_heads);
     }
 
     #[test]
@@ -420,8 +434,10 @@ mod tests {
             // session caches
             ("cache_k_l3", 1024, 32),
             ("cache_v_l3", 1024, 32),
-            ("cache_conv_l0", 30720, 32),
-            ("cache_gdn_l0", 786432, 32),
+            // tandem layouts: conv [d_conv-1, conv_dim] splits ne[1];
+            // gdn [S, S, n_v_heads] splits ne[2]
+            ("cache_conv_l0", 10240, 32),
+            ("cache_gdn_l0", 48, 32),
         ];
         for &(name, extent, blck) in cases {
             let st = split_state(name, &hp, extent, blck, 2);
