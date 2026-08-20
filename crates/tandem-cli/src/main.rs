@@ -147,6 +147,7 @@ fn cmd_fused(args: &[String]) -> ExitCode {
     let mut n_gen = 64usize;
     let mut threads = 8i32;
     let mut n_ctx = 4096usize;
+    let mut depth = 1usize;
     let mut gpu: Option<i32> = None;
     let mut tp: Option<Vec<i32>> = None;
     let mut ignore_eos = false;
@@ -157,6 +158,7 @@ fn cmd_fused(args: &[String]) -> ExitCode {
             "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(64),
             "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
+            "--depth" => depth = it.next().and_then(|s| s.parse().ok()).unwrap_or(1),
             "--ignore-eos" => ignore_eos = true,
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
             "--tp" => {
@@ -169,7 +171,7 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: tandem fused <file.gguf> [-p prompt] [-n N] [--gpu N|--tp 0,1]");
+        eprintln!("usage: tandem fused <file.gguf> [-p prompt] [-n N] [--depth K] [--tp 0,1]");
         return ExitCode::from(2);
     };
     let dev = match (&tp, gpu) {
@@ -185,8 +187,7 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         }
     };
     let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
-    // one draft per round, so a single rollback slot beyond the live state
-    let mut session = match tandem_model::qwen35::Session::new_spec(&model, n_ctx, 1) {
+    let mut session = match tandem_model::qwen35::Session::new_spec(&model, n_ctx, depth) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("fused: {e}");
@@ -194,9 +195,22 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         }
     };
 
+    let tp_mode = model.weights.is_tensor_parallel();
+    let round = |session: &mut tandem_model::qwen35::Session, batch: &[u32]| {
+        if tp_mode {
+            model
+                .step_verify_drafting(session, batch, depth, threads)
+                .map(|(p, c)| (p, c))
+        } else {
+            model
+                .step_fused_cached(session, batch, depth, threads)
+                .map(|(p, c, _h)| (p, c))
+        }
+    };
+
     let prompt_ids = tok.encode(&prompt, true);
     let t0 = std::time::Instant::now();
-    let (preds, drafts) = match model.step_verify_drafting(&mut session, &prompt_ids, threads) {
+    let (preds, chain) = match round(&mut session, &prompt_ids) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("prefill: {e}");
@@ -206,34 +220,21 @@ fn cmd_fused(args: &[String]) -> ExitCode {
     let t_prefill = t0.elapsed().as_secs_f64();
     session.mtp_past += prompt_ids.len();
 
-    let mut committed: Vec<u32> = vec![*preds.last().unwrap()];
-    let mut draft = *drafts.last().unwrap();
+    let last_idx = prompt_ids.len() - 1;
+    let mut committed: Vec<u32> = vec![preds[last_idx]];
+    // the chain gives this round's draft sequence, read at the last position
+    let mut drafts: Vec<u32> = chain.iter().map(|c| c[last_idx]).collect();
     let (mut accepted, mut proposed, mut rounds) = (0usize, 0usize, 0usize);
 
     let t1 = std::time::Instant::now();
-    while committed.len() < n_gen {
+    'outer: while committed.len() < n_gen {
         let last = *committed.last().unwrap();
         if !ignore_eos && Some(last) == tok.eos {
             break;
         }
-        // one execution: verifies [last, draft] and drafts the next round
-        let batch = [last, draft];
-        // The fused round is cacheable — one graph, fixed shape — but the
-        // tensor-parallel meta backend rejects a REPLAYED graph containing the
-        // draft tail, while replaying a trunk-only graph is fine. The
-        // difference is that the tail indexes the embedding table with a
-        // computed node (the in-graph argmax) rather than an input tensor.
-        // So the cached path is used where it is verified (CPU, single GPU)
-        // and TP rebuilds per round, which measured the same as running the
-        // draft as its own execution.
-        let res = if model.weights.is_tensor_parallel() {
-            model
-                .step_verify_drafting(&mut session, &batch, threads)
-                .map(|(p, d)| (p, d, Vec::new()))
-        } else {
-            model.step_fused_cached(&mut session, &batch, threads)
-        };
-        let (preds, drafts, _h) = match res {
+        let mut batch = vec![last];
+        batch.extend_from_slice(&drafts);
+        let (preds, chain) = match round(&mut session, &batch) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("round: {e}");
@@ -241,30 +242,40 @@ fn cmd_fused(args: &[String]) -> ExitCode {
             }
         };
         rounds += 1;
-        proposed += 1;
+        proposed += drafts.len();
 
-        let keep = preds[0] == draft;
-        if keep {
-            accepted += 1;
-            committed.push(draft);
-            if committed.len() >= n_gen || (!ignore_eos && Some(draft) == tok.eos) {
+        // keep the drafts the model itself would have produced
+        let mut n_keep = 0usize;
+        for (i, d) in drafts.iter().enumerate() {
+            if preds[i] == *d {
+                n_keep += 1;
+            } else {
                 break;
             }
-            committed.push(preds[1]);
-            draft = drafts[1];
-            session.mtp_past += 2;
-        } else {
-            committed.push(preds[0]);
-            draft = drafts[0];
-            session.mtp_past += 1;
-            // the rejected draft advanced the recurrent layers one token too
-            // far; undo it from the snapshot slots
-            if let Err(e) = model.rollback_recurrent(&mut session, 1, threads) {
+        }
+        accepted += n_keep;
+
+        for d in drafts.iter().take(n_keep) {
+            committed.push(*d);
+            if committed.len() >= n_gen || (!ignore_eos && Some(*d) == tok.eos) {
+                break 'outer;
+            }
+        }
+        committed.push(preds[n_keep]);
+        // next round's drafts come from the chain at the accepted position
+        drafts = chain.iter().map(|c| c[n_keep]).collect();
+
+        let extra = drafts.len().saturating_sub(n_keep);
+        let over = batch.len() - (n_keep + 1);
+        session.mtp_past += n_keep + 1;
+        if over > 0 {
+            if let Err(e) = model.rollback_recurrent(&mut session, over, threads) {
                 eprintln!("rollback: {e}");
                 return ExitCode::FAILURE;
             }
-            session.n_past -= 1;
+            session.n_past -= over;
         }
+        let _ = extra;
     }
     let t_decode = t1.elapsed().as_secs_f64();
 
@@ -272,7 +283,8 @@ fn cmd_fused(args: &[String]) -> ExitCode {
     let rate = if proposed == 0 { 0.0 } else { accepted as f64 / proposed as f64 };
     eprintln!(
         "prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s) | \
-         fused: acceptance {accepted}/{proposed} = {rate:.3}, {rounds} rounds, {:.2} tok/round",
+         fused depth {depth}: acceptance {accepted}/{proposed} = {rate:.3}, {rounds} rounds, \
+         {:.2} tok/round",
         prompt_ids.len(),
         t_prefill,
         prompt_ids.len() as f64 / t_prefill,

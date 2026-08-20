@@ -200,6 +200,8 @@ pub(crate) struct MtpTail {
     pub n_ctx_max: usize,
     pub n_past: usize,
     pub n_kv: i64,
+    /// how many drafts to chain inside this one graph
+    pub depth: usize,
 }
 
 /// Kernel-path bisect switches, kept from the CUDA debugging campaign.
@@ -256,6 +258,8 @@ struct Built {
     h_out: *mut ffi::ggml_tensor,
     /// fused draft head outputs, when the MTP tail is attached
     draft_out: *mut ffi::ggml_tensor,
+    /// chained drafts beyond the first, in order
+    draft_chain: Vec<*mut ffi::ggml_tensor>,
     mtp_pos: *mut ffi::ggml_tensor,
     mtp_mask: *mut ffi::ggml_tensor,
     mtp_rows: *mut ffi::ggml_tensor,
@@ -1021,8 +1025,9 @@ impl Qwen35 {
         &self,
         session: &mut Session,
         tokens: &[u32],
+        depth: usize,
         n_threads: i32,
-    ) -> Result<(Vec<u32>, Vec<u32>, Vec<f32>), ModelError> {
+    ) -> Result<(Vec<u32>, Vec<Vec<u32>>, Vec<f32>), ModelError> {
         if session.n_past + tokens.len() > session.n_ctx_max {
             return Err(ModelError::Load("context overflow".into()));
         }
@@ -1053,6 +1058,7 @@ impl Qwen35 {
                     n_ctx_max: session.n_ctx_max,
                     n_past: 0,
                     n_kv: mtp_bucket,
+                    depth,
                 };
                 let built = self.build_inner(
                     t_len,
@@ -1111,17 +1117,17 @@ impl Qwen35 {
 
             let mut preds = vec![0i32; t];
             ffi::ggml_backend_tensor_get(b.out, preds.as_mut_ptr().cast(), 0, t * 4);
-            let mut drafts = vec![0i32; t];
-            ffi::ggml_backend_tensor_get(b.draft_out, drafts.as_mut_ptr().cast(), 0, t * 4);
+            let mut chain: Vec<Vec<u32>> = Vec::new();
+            for tnsr in std::iter::once(b.draft_out).chain(b.draft_chain.iter().copied()) {
+                let mut ids = vec![0i32; t];
+                ffi::ggml_backend_tensor_get(tnsr, ids.as_mut_ptr().cast(), 0, t * 4);
+                chain.push(ids.into_iter().map(|v| v as u32).collect());
+            }
             let mut hidden = vec![0f32; self.hp.n_embd as usize * t];
             ffi::ggml_backend_tensor_get(b.h_out, hidden.as_mut_ptr().cast(), 0, hidden.len() * 4);
 
             session.n_past += t;
-            Ok((
-                preds.into_iter().map(|v| v as u32).collect(),
-                drafts.into_iter().map(|v| v as u32).collect(),
-                hidden,
-            ))
+            Ok((preds.into_iter().map(|v| v as u32).collect(), chain, hidden))
         }
     }
 
@@ -1138,8 +1144,9 @@ impl Qwen35 {
         &self,
         session: &mut Session,
         tokens: &[u32],
+        depth: usize,
         n_threads: i32,
-    ) -> Result<(Vec<u32>, Vec<u32>), ModelError> {
+    ) -> Result<(Vec<u32>, Vec<Vec<u32>>), ModelError> {
         if session.n_past + tokens.len() > session.n_ctx_max {
             return Err(ModelError::Load("context overflow".into()));
         }
@@ -1165,6 +1172,7 @@ impl Qwen35 {
                 n_ctx_max: session.n_ctx_max,
                 n_past: session.mtp_past,
                 n_kv: mtp_n_kv,
+                depth,
             };
             let built = self.build(
                 n_out as i64,
@@ -1229,14 +1237,15 @@ impl Qwen35 {
 
             let mut preds = vec![0i32; n_out];
             ffi::ggml_backend_tensor_get(built.out, preds.as_mut_ptr().cast(), 0, n_out * 4);
-            let mut drafts = vec![0i32; n_out];
-            ffi::ggml_backend_tensor_get(
-                built.draft_out, drafts.as_mut_ptr().cast(), 0, n_out * 4,
-            );
-            (
-                preds.into_iter().map(|v| v as u32).collect::<Vec<u32>>(),
-                drafts.into_iter().map(|v| v as u32).collect::<Vec<u32>>(),
-            )
+            let mut chain: Vec<Vec<u32>> = Vec::new();
+            for tnsr in std::iter::once(built.draft_out)
+                .chain(built.draft_chain.iter().copied())
+            {
+                let mut ids = vec![0i32; n_out];
+                ffi::ggml_backend_tensor_get(tnsr, ids.as_mut_ptr().cast(), 0, n_out * 4);
+                chain.push(ids.into_iter().map(|v| v as u32).collect());
+            }
+            (preds.into_iter().map(|v| v as u32).collect::<Vec<u32>>(), chain)
         };
         session.n_past += tokens.len();
         Ok(out)
@@ -1869,6 +1878,7 @@ impl Qwen35 {
         // the condition under which its draft is the one we use, so the
         // batched drafts stay consistent with whatever prefix verification
         // ends up keeping.
+        let mut draft_chain: Vec<*mut ffi::ggml_tensor> = Vec::new();
         let (mut draft_out, mut mtp_pos, mut mtp_mask, mut mtp_rows, mut mtp_n_kv) = (
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -1897,44 +1907,60 @@ impl Qwen35 {
             ffi::ggml_set_input(mr);
             mtp_rows = mr;
 
-            // the model's own next-token prediction, embedded, without ever
-            // leaving the graph
-            let next_emb = ffi::ggml_get_rows(
-                ctx,
-                mx.embed_tokens.unwrap_or(tok_embd),
-                cur,
-            );
-            let e_norm = rms(ctx, next_emb, mx.enorm);
-            let h_norm = rms(ctx, h_sel, mx.hnorm);
-            let cat = ffi::ggml_concat(ctx, e_norm, h_norm, 0);
-            let mut d = ffi::ggml_mul_mat(ctx, mx.eh_proj, cat);
+            // Chain the drafts inside this one graph. Each step feeds on the
+            // previous step's own prediction and hidden state, so a depth-3
+            // chain is ~120 extra nodes on a launch we already pay for rather
+            // than three separate executions at ~7 ms each (see the cost
+            // curve in docs/OPTIMIZATION-IDEAS.md).
+            let mut tok_src = cur; // the trunk's own predictions
+            let mut h_src = h_sel;
+            for step in 0..tail.depth.max(1) {
+                let next_emb = ffi::ggml_get_rows(
+                    ctx,
+                    mx.embed_tokens.unwrap_or(tok_embd),
+                    tok_src,
+                );
+                let e_norm = rms(ctx, next_emb, mx.enorm);
+                let h_norm = rms(ctx, h_src, mx.hnorm);
+                let cat = ffi::ggml_concat(ctx, e_norm, h_norm, 0);
+                let mut d = ffi::ggml_mul_mat(ctx, mx.eh_proj, cat);
 
-            let d_sa = d;
-            d = rms(ctx, d, ml.attn_norm);
-            d = self.build_attn_block(
-                ctx, gf, d, &ml, mp, mm, mr,
-                Some((tail.k_cache, tail.v_cache, tail.n_ctx_max)),
-                n_out, tail.n_kv, tail.n_past, use_fa, use_fa,
-                /* use_set_rows */ use_set_rows, dbg,
-            );
-            d = ffi::ggml_add(ctx, d, d_sa);
+                let d_sa = d;
+                d = rms(ctx, d, ml.attn_norm);
+                // Later chain steps must not write the draft cache: only the
+                // first is on the path the round can actually commit.
+                d = self.build_attn_block(
+                    ctx, gf, d, &ml, mp, mm, mr,
+                    Some((tail.k_cache, tail.v_cache, tail.n_ctx_max)),
+                    n_out, tail.n_kv, tail.n_past, use_fa, use_fa,
+                    use_set_rows,
+                    DebugToggles { no_writes: step > 0, ..dbg },
+                );
+                d = ffi::ggml_add(ctx, d, d_sa);
 
-            let d_res = d;
-            let dn = rms(ctx, d, ml.post_attn_norm);
-            let du = ffi::ggml_mul_mat(ctx, ml.ffn_up, dn);
-            let dgt = ffi::ggml_mul_mat(ctx, ml.ffn_gate, dn);
-            let da = ffi::ggml_mul(ctx, ffi::ggml_silu(ctx, dgt), du);
-            d = ffi::ggml_mul_mat(ctx, ml.ffn_down, da);
-            d = ffi::ggml_add(ctx, d, d_res);
+                let d_res = d;
+                let dn = rms(ctx, d, ml.post_attn_norm);
+                let du = ffi::ggml_mul_mat(ctx, ml.ffn_up, dn);
+                let dgt = ffi::ggml_mul_mat(ctx, ml.ffn_gate, dn);
+                let da = ffi::ggml_mul(ctx, ffi::ggml_silu(ctx, dgt), du);
+                d = ffi::ggml_mul_mat(ctx, ml.ffn_down, da);
+                d = ffi::ggml_add(ctx, d, d_res);
 
-            let hn = mx.shared_head_norm.unwrap_or(output_norm);
-            d = rms(ctx, d, hn);
-            let head_w = mx.shared_head_head.unwrap_or(output_w);
-            d = ffi::ggml_mul_mat(ctx, head_w, d);
-            d = ffi::ggml_argmax(ctx, d);
-            ffi::ggml_set_output(d);
-            ffi::ggml_build_forward_expand(gf, d);
-            draft_out = d;
+                let hn = mx.shared_head_norm.unwrap_or(output_norm);
+                let h_next = rms(ctx, d, hn);
+                let head_w = mx.shared_head_head.unwrap_or(output_w);
+                let logits_d = ffi::ggml_mul_mat(ctx, head_w, h_next);
+                let ids = ffi::ggml_argmax(ctx, logits_d);
+                ffi::ggml_set_output(ids);
+                ffi::ggml_build_forward_expand(gf, ids);
+                if step == 0 {
+                    draft_out = ids;
+                } else {
+                    draft_chain.push(ids);
+                }
+                tok_src = ids;
+                h_src = h_next;
+            }
         }
 
         Ok(Built {
@@ -1950,6 +1976,7 @@ impl Qwen35 {
             out: cur,
             h_out: h_sel,
             draft_out,
+            draft_chain,
             mtp_pos,
             mtp_mask,
             mtp_rows,
