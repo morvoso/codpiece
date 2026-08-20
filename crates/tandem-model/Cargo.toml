@@ -8,3 +8,6 @@ description = "Model weight loading and (soon) qwen35 graph construction on ggml
 [dependencies]
 tandem-gguf = { path = "../tandem-gguf" }
 tandem-ggml-sys = { path = "../tandem-ggml-sys" }
+
+[features]
+cuda = ["tandem-ggml-sys/cuda"]

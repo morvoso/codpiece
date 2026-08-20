@@ -13,3 +13,6 @@ tandem-gguf = { path = "../tandem-gguf" }
 tandem-tok = { path = "../tandem-tok" }
 tandem-model = { path = "../tandem-model" }
 libc = "0.2"
+
+[features]
+cuda = ["tandem-model/cuda"]

@@ -253,7 +253,11 @@ enum StateSrc<'a> {
 
 impl Qwen35 {
     pub fn load(path: &std::path::Path) -> Result<Qwen35, ModelError> {
-        let weights = Weights::load(path, crate::Device::Cpu)?;
+        Self::load_on(path, crate::Device::Cpu)
+    }
+
+    pub fn load_on(path: &std::path::Path, device: crate::Device) -> Result<Qwen35, ModelError> {
+        let weights = Weights::load(path, device)?;
         let hp = Hparams::from_gguf(&weights.gguf)?;
         Ok(Qwen35 { weights, hp })
     }
@@ -713,7 +717,9 @@ impl Qwen35 {
                 out_positions.len() * 4,
             );
 
-            ffi::ggml_backend_cpu_set_n_threads(backend, n_threads);
+            if self.weights.is_cpu() {
+                ffi::ggml_backend_cpu_set_n_threads(backend, n_threads);
+            }
             let st = ffi::ggml_backend_graph_compute(backend, gf);
             if st != ffi::ggml_status_GGML_STATUS_SUCCESS {
                 return Err(ModelError::Load(format!("graph compute status {st}")));

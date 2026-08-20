@@ -49,9 +49,12 @@ impl From<std::io::Error> for ModelError {
     }
 }
 
-/// A backend to place weights on. CPU today; CUDA lands with M2.
+/// A backend to place weights (and compute) on.
+#[derive(Clone, Copy, Debug)]
 pub enum Device {
     Cpu,
+    /// CUDA device index; requires the `cuda` feature.
+    Cuda(i32),
 }
 
 /// Weights resident on a backend, addressable by GGUF tensor name.
@@ -62,6 +65,7 @@ pub struct Weights {
     backend: ffi::ggml_backend_t,
     tensors: HashMap<String, *mut ffi::ggml_tensor>,
     pub bytes_loaded: u64,
+    pub device: Device,
 }
 
 impl Weights {
@@ -72,6 +76,14 @@ impl Weights {
         unsafe {
             let backend = match device {
                 Device::Cpu => ffi::ggml_backend_cpu_init(),
+                #[cfg(feature = "cuda")]
+                Device::Cuda(i) => ffi::ggml_backend_cuda_init(i),
+                #[cfg(not(feature = "cuda"))]
+                Device::Cuda(_) => {
+                    return Err(ModelError::Load(
+                        "built without the cuda feature".into(),
+                    ))
+                }
             };
             if backend.is_null() {
                 return Err(ModelError::Load("backend init failed".into()));
@@ -150,7 +162,7 @@ impl Weights {
                 total += size as u64;
             }
 
-            Ok(Weights { gguf, ctx, buffer, backend, tensors, bytes_loaded: total })
+            Ok(Weights { gguf, ctx, buffer, backend, tensors, bytes_loaded: total, device })
         }
     }
 
@@ -161,6 +173,10 @@ impl Weights {
     /// The backend the weights live on (also used to compute graphs).
     pub fn backend(&self) -> ffi::ggml_backend_t {
         self.backend
+    }
+
+    pub fn is_cpu(&self) -> bool {
+        matches!(self.device, Device::Cpu)
     }
 
     pub fn n_tensors(&self) -> usize {
