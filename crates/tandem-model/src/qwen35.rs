@@ -318,6 +318,11 @@ impl Session {
                     };
                 }
             }
+            // NOTE: session KV/state tensors all live on device 0 for now.
+            // With a layer split the scheduler will copy them to the layer's
+            // device each step — correct, but it doubles bus traffic for the
+            // second half's layers. Placing them per-layer is the next step
+            // (tracked in ROADMAP M3).
             let buffer = ffi::ggml_backend_alloc_ctx_tensors(ctx, model.weights.backend());
             if buffer.is_null() {
                 ffi::ggml_free(ctx);
@@ -499,7 +504,10 @@ impl Qwen35 {
                 session.n_ctx_max
             )));
         }
-        let out = if tokens.len() == 1 && out_positions == [0] && session.fa {
+        // The cached-graph fast path assumes one backend and a frozen
+        // allocation; split models go through the scheduler every step.
+        let cacheable = self.weights.sched().is_none();
+        let out = if cacheable && tokens.len() == 1 && out_positions == [0] && session.fa {
             self.step_cached(session, tokens[0], n_threads, greedy)?
         } else {
             let view = session.view();
@@ -555,18 +563,27 @@ impl Qwen35 {
                 }
             }
             let mut guard = CtxGuard(built.ctx, std::ptr::null_mut());
-            let galloc = match galloc {
-                Some(g) => g,
-                None => {
-                    let g = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
-                        self.weights.backend(),
-                    ));
-                    guard.1 = g;
-                    g
+            if let Some(sched) = self.weights.sched() {
+                // The scheduler allocates split graphs itself; a single
+                // gallocr cannot, because the nodes span several buffers.
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, built.gf) {
+                    return Err(ModelError::Load("sched graph alloc failed".into()));
                 }
-            };
-            if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
-                return Err(ModelError::Load("graph alloc failed".into()));
+            } else {
+                let galloc = match galloc {
+                    Some(g) => g,
+                    None => {
+                        let g = ffi::ggml_gallocr_new(
+                            ffi::ggml_backend_get_default_buffer_type(self.weights.backend()),
+                        );
+                        guard.1 = g;
+                        g
+                    }
+                };
+                if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
+                    return Err(ModelError::Load("graph alloc failed".into()));
+                }
             }
             self.fill_inputs(&built, tokens, n_past, out_positions);
             self.compute(built.gf, n_threads)?;
@@ -1168,7 +1185,11 @@ impl Qwen35 {
         if self.weights.is_cpu() {
             ffi::ggml_backend_cpu_set_n_threads(backend, n_threads);
         }
-        let st = ffi::ggml_backend_graph_compute(backend, gf);
+        let st = match self.weights.sched() {
+            // multi-device: the scheduler owns placement and cross-device copies
+            Some(sched) => ffi::ggml_backend_sched_graph_compute(sched, gf),
+            None => ffi::ggml_backend_graph_compute(backend, gf),
+        };
         if st != ffi::ggml_status_GGML_STATUS_SUCCESS {
             return Err(ModelError::Load(format!("graph compute status {st}")));
         }
