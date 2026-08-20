@@ -14,7 +14,8 @@ codpiece-tok = { path = "../codpiece-tok" }
 codpiece-model = { path = "../codpiece-model" }
 codpiece-sample = { path = "../codpiece-sample" }
 codpiece-server = { path = "../codpiece-server" }
+codpiece-vision = { path = "../codpiece-vision" }
 libc = "0.2"
 
 [features]
-cuda = ["codpiece-model/cuda", "codpiece-server/cuda"]
+cuda = ["codpiece-model/cuda", "codpiece-server/cuda", "codpiece-vision/cuda"]

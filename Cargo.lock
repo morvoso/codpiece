@@ -87,6 +87,7 @@ dependencies = [
  "codpiece-sample",
  "codpiece-server",
  "codpiece-tok",
+ "codpiece-vision",
  "libc",
 ]
 
@@ -133,6 +134,15 @@ version = "0.0.1"
 dependencies = [
  "codpiece-gguf",
  "fancy-regex",
+]
+
+[[package]]
+name = "codpiece-vision"
+version = "0.1.0"
+dependencies = [
+ "codpiece-ggml-sys",
+ "codpiece-gguf",
+ "codpiece-model",
 ]
 
 [[package]]

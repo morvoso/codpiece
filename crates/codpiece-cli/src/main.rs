@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         Some("stepcost") => cmd_stepcost(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
         Some("batchtest") => cmd_batchtest(&args[1..]),
+        Some("vision") => cmd_vision(&args[1..]),
         _ => {
             eprintln!(
                 "usage: codpiece inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
@@ -41,6 +42,184 @@ fn main() -> ExitCode {
 }
 
 
+
+/// Encode a synthetic image through the vision tower and print the result in
+/// exactly the format of clip.cpp's MTMD_DEBUG_EMBEDDINGS dump, so the two
+/// can be diffed directly. The patterns are generated at the target size and
+/// normalized identically on both sides, which takes preprocessing out of the
+/// comparison: this gates the ENCODER graph alone.
+fn cmd_vision(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut size = 768usize;
+    let mut pattern = "gray".to_string();
+    let mut device = codpiece_model::Device::Cpu;
+    let mut threads: i32 = 0;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--size" if i + 1 < args.len() => {
+                size = args[i + 1].parse().unwrap_or(768);
+                i += 1;
+            }
+            "--pattern" if i + 1 < args.len() => {
+                pattern = args[i + 1].clone();
+                i += 1;
+            }
+            "--cuda" if i + 1 < args.len() => {
+                device = codpiece_model::Device::Cuda(args[i + 1].parse().unwrap_or(0));
+                i += 1;
+            }
+            "-t" if i + 1 < args.len() => {
+                threads = args[i + 1].parse().unwrap_or(0);
+                i += 1;
+            }
+            a if !a.starts_with('-') && path.is_none() => path = Some(a),
+            a => {
+                eprintln!("unknown arg {a}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = path else {
+        eprintln!("usage: codpiece vision <mmproj.gguf> [--size 768] [--pattern gray|rainbow] [--cuda N]");
+        return ExitCode::from(2);
+    };
+    let t0 = std::time::Instant::now();
+    let model = match codpiece_vision::VisionModel::load(Path::new(path), device) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("load: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "loaded {} in {:.2}s: {} layers, d={}, heads={}, ff={}, patch={}, merge={}, proj={}",
+        path,
+        t0.elapsed().as_secs_f32(),
+        model.hp.n_layer,
+        model.hp.n_embd,
+        model.hp.n_head,
+        model.hp.n_ff,
+        model.hp.patch,
+        model.hp.merge,
+        model.hp.proj_dim
+    );
+
+    let (w, h) = (size, size);
+    let n = w * h;
+    // raw pixel values in [0,1], planar [c][y][x]
+    let mut raw = vec![0f32; n * 3];
+    match pattern.as_str() {
+        "gray" => raw.fill(0.5),
+        "rainbow" => {
+            // the pattern from tools/mtmd/debug/mtmd-debug.md, verbatim
+            let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+            let max_dist = (cx * cx + cy * cy).sqrt();
+            for y in 0..h {
+                for x in 0..w {
+                    let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+                    let mut hue = dy.atan2(dx) / (2.0 * std::f32::consts::PI);
+                    if hue < 0.0 {
+                        hue += 1.0;
+                    }
+                    let sat = ((dx * dx + dy * dy).sqrt() / max_dist).min(1.0);
+                    let h6 = hue * 6.0;
+                    let i6 = h6 as i32;
+                    let f = h6 - i6 as f32;
+                    let p = 1.0 - sat;
+                    let q = 1.0 - sat * f;
+                    let t = 1.0 - sat * (1.0 - f);
+                    let rgb = match i6 % 6 {
+                        0 => (1.0, t, p),
+                        1 => (q, 1.0, p),
+                        2 => (p, 1.0, t),
+                        3 => (p, q, 1.0),
+                        4 => (t, p, 1.0),
+                        _ => (1.0, p, q),
+                    };
+                    raw[y * w + x] = rgb.0;
+                    raw[n + y * w + x] = rgb.1;
+                    raw[2 * n + y * w + x] = rgb.2;
+                }
+            }
+        }
+        p => {
+            eprintln!("unknown pattern {p}");
+            return ExitCode::from(2);
+        }
+    }
+    // NO normalization here, deliberately: llama-mtmd-debug's encode mode
+    // feeds the raw pattern straight to the encoder, and this command exists
+    // to be diffed against it. Serving normalizes in preprocessing instead.
+
+    let t1 = std::time::Instant::now();
+    let out = match model.encode_t(&raw, w, h, threads) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("encode: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let n_embd = model.hp.proj_dim as usize;
+    let n_tokens = out.len() / n_embd;
+    eprintln!("encoded {w}x{h} ({pattern}) in {:.2}s", t1.elapsed().as_secs_f32());
+
+    // clip.cpp MTMD_DEBUG_EMBEDDINGS format, byte for byte
+    println!("\n=== MTMD_DEBUG_EMBEDDINGS ===");
+    println!("Shape: [{n_embd}, {n_tokens}]");
+    print!("Token 0 (first 16 values): ");
+    for v in &out[..16.min(n_embd)] {
+        print!("{v:.6} ");
+    }
+    println!();
+    if n_embd > 16 {
+        print!("Token 0 (last 16 values):  ");
+        for v in &out[n_embd - 16..n_embd] {
+            print!("{v:.6} ");
+        }
+        println!();
+    }
+    let (mut sum, mut sum_sq) = (0f32, 0f32);
+    let (mut min_val, mut max_val) = (out[0], out[0]);
+    for &v in &out {
+        sum += v;
+        sum_sq += v * v;
+        min_val = min_val.min(v);
+        max_val = max_val.max(v);
+    }
+    let mean = sum / out.len() as f32;
+    let variance = sum_sq / out.len() as f32 - mean * mean;
+    println!(
+        "Stats: mean={mean:.6}, std={:.6}, min={min_val:.6}, max={max_val:.6}, sum={sum:.6}",
+        variance.sqrt()
+    );
+    println!("=== END MTMD_DEBUG_EMBEDDINGS ===\n");
+
+    // Also print the corner block llama.cpp's cb_eval debug callback prints
+    // for the final node (first/last 3 rows x first/last 3 cols, 4 decimals,
+    // and the tensor sum) so runs can be diffed against `llama-mtmd-debug`
+    // even when its final dump block is unavailable.
+    let cell = |r: usize, c: usize| out[r * n_embd + c];
+    let row_line = |r: usize| {
+        format!(
+            "[ {:11.4}, {:11.4}, {:11.4},    ..., {:11.4}, {:11.4}, {:11.4} ]",
+            cell(r, 0),
+            cell(r, 1),
+            cell(r, 2),
+            cell(r, n_embd - 3),
+            cell(r, n_embd - 2),
+            cell(r, n_embd - 1)
+        )
+    };
+    println!("cb-style corners:");
+    for r in [0, 1, 2, n_tokens - 3, n_tokens - 2, n_tokens - 1] {
+        println!("    {}", row_line(r));
+    }
+    // f32 accumulation, matching the callback's plain running sum
+    println!("    sum = {sum:.6}");
+    ExitCode::SUCCESS
+}
 
 /// Correctness gate for batched decoding: the same prompt, decoded greedily through
 /// the ordinary single-sequence path and as every slot of an N-way batch, must produce

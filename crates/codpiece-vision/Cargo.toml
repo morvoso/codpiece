@@ -1,0 +1,12 @@
+[package]
+name = "codpiece-vision"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+codpiece-ggml-sys = { path = "../codpiece-ggml-sys" }
+codpiece-gguf = { path = "../codpiece-gguf" }
+codpiece-model = { path = "../codpiece-model" }
+
+[features]
+cuda = ["codpiece-ggml-sys/cuda", "codpiece-model/cuda"]

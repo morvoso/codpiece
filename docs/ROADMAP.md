@@ -360,6 +360,20 @@ can A/B prod↔codpiece in one command.
 **Gate:** Shodan's real workload (screenshots + tool calls) runs a full day
 on codpiece with zero correctness incidents, then a measured week.
 
+**Progress (2026-08-20):** the encoder is ported and gated. `codpiece-vision`
+builds the qwen3vl_merger ViT (27 layers, GELU, vision M-RoPE) + 2x2 merger
+op-for-op from b10423's `models/qwen3vl.cpp`, single-device. Parity vs
+`llama-mtmd-debug` on CPU (same build, `-t 20`, `-fa off`): the ported front
+end — dual-conv patch embed, block reorder, position embedding — is
+bit-exact at the native 48x48 grid and within 2 ULP through the bilinear
+resize at 512; full-depth drift reaches only ~5e-4 by layer 26 and ~1e-3 at
+the output on both gray and rainbow patterns, attributable to op-fusion
+scheduling (the oracle's eval callback splits the graph per node; codpiece
+computes fused) — well under BF16 weight precision. `codpiece vision
+<mmproj> --pattern gray|rainbow` prints dumps diffable against the oracle.
+Remaining: preprocessing (decode/resize/normalize), trunk injection with
+vision M-RoPE positions, end-to-end gate + API surface.
+
 ## Stretch — DFlash2 under multi-GPU
 
 Block-diffusion drafter (arch `dflash`) through the pluggable drafter

@@ -6,6 +6,7 @@ members = [
     "crates/codpiece-tok",
     "crates/codpiece-sample",
     "crates/codpiece-model",
+    "crates/codpiece-vision",
     "crates/codpiece-server",
     "crates/codpiece-cli",
 ]
