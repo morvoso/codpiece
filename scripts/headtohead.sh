@@ -10,7 +10,11 @@ NPRED=${NPRED:-96}
 
 echo "== llama.cpp b10423 server, prod MTP config (-sm tensor, draft-mtp 3 / 0.75) =="
 docker rm -f tandem-ref-server >/dev/null 2>&1
+# ipc: host + a real /dev/shm are what make -sm tensor work in a container:
+# NCCL's shared-memory transport aborts in ncclGroupEnd() with Docker's
+# default 64 MiB. Prod's compose sets exactly this (docker-compose.llamacpp.yml).
 docker run -d --name tandem-ref-server --runtime nvidia \
+  --ipc=host --shm-size=8g \
   -e NVIDIA_VISIBLE_DEVICES=all -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=0 \
   -v "$HOME/llm/models:/models" -p 8031:8080 \
