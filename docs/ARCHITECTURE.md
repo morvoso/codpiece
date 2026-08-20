@@ -150,6 +150,43 @@ extent (it asserts), and it cannot map a split axis through a
 stride-reordered view — so cache reads are built with monotonically
 increasing strides and then permuted, never viewed into permuted form.
 
+## 5b. Designing for *this* box, not for a generic one
+
+Two resource facts drive everything, and they point opposite to the defaults a
+portable engine picks:
+
+- **PCIe is scarce, VRAM is not.** No NVLink bridge exists on this machine and
+  GeForce P2P is driver-disabled, so every inter-GPU byte takes a host bounce.
+  Meanwhile each card has ~9 GiB free after weights and KV.
+- **The CPU is idle.** 24 threads and 62 GiB of RAM do nothing during a decode
+  step, which is entirely GPU-bandwidth-bound.
+
+Consequences tandem acts on:
+
+**Replicate the LM head rather than split it** (`split.rs`). The memory-optimal
+choice column-splits `output.weight`, but then the vocabulary is spread across
+devices, argmax cannot run in the graph, and every scored position ships 3.9 MB
+of logits over the scarce link. Replicating costs ~0.7 GiB per card of the
+plentiful resource and reduces the readback to 4 bytes per position. This is
+the single change that makes wide speculative verification affordable.
+
+**Draft on the CPU** (`oracle.rs`). Decode is bandwidth-bound, so a verify pass
+costs one weight-read whether it checks 1 token or 12: the quantity to optimize
+is *accepted tokens per weight-read*, and draft cost is the enemy. The MTP head
+is a real transformer block (~8 ms per draft on the 27B), so its deeper drafts
+are a poor trade at falling acceptance. A bounded-order predictor over the live
+token stream runs on the idle CPU in microseconds and is strong exactly where
+transformers spend tokens — quotation, repeated identifiers, structural
+scaffolding. It declines to predict on novel text, and a self-tuning gate keeps
+it from paying for width it is not earning.
+
+**What does NOT work here, and why it is worth writing down:** tree
+speculation. Verifying a branching tree of candidates in one pass is standard
+elsewhere, but 48 of this model'"'"'s 64 layers are Gated DeltaNet recurrences
+whose state advances strictly along one sequence. A tree has no single
+sequence, so the recurrent layers cannot evaluate its branches in one pass.
+The hybrid architecture forecloses the technique regardless of hardware.
+
 ## 6. Later, surgical kernel work (only after profiles demand it)
 
 - Fused GDN in-projection (wqkv + conv + split + L2-norm are separate ops).
