@@ -47,6 +47,17 @@ fn main() -> ExitCode {
 /// would have produced anyway, so `spec` output must match `gen` exactly.
 /// Rejected drafts leave the 48 recurrent layers over-advanced, which is
 /// what `rollback_recurrent` undoes via the snapshot slots.
+/// Probability of `idx` under a numerically stable softmax of `logits`.
+fn softmax_prob(logits: &[f32], idx: u32) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
+    if sum > 0.0 {
+        (logits[idx as usize] - max).exp() / sum
+    } else {
+        0.0
+    }
+}
+
 fn cmd_spec(args: &[String]) -> ExitCode {
     let mut path: Option<&str> = None;
     let mut prompt = String::from("The capital of France is");
@@ -54,6 +65,7 @@ fn cmd_spec(args: &[String]) -> ExitCode {
     let mut threads = 8i32;
     let mut n_ctx = 4096usize;
     let mut n_spec = 1usize;
+    let mut p_min = 0.75f32;
     let mut gpu: Option<i32> = None;
     let mut tp: Option<Vec<i32>> = None;
     let mut ignore_eos = false;
@@ -65,6 +77,7 @@ fn cmd_spec(args: &[String]) -> ExitCode {
             "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
             "--spec" => n_spec = it.next().and_then(|s| s.parse().ok()).unwrap_or(1),
+            "--p-min" => p_min = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.75),
             "--ignore-eos" => ignore_eos = true,
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
             "--tp" => {
@@ -136,7 +149,20 @@ fn cmd_spec(args: &[String]) -> ExitCode {
         for _ in 0..n_spec {
             match model.mtp_draft(&mut session, &h, tok_in, pos, threads) {
                 Ok((dl, dh)) => {
+                    // Confidence gate (llama.cpp's --spec-draft-p-min): a draft
+                    // the head is unsure about is usually rejected, and a
+                    // rejected draft costs a wasted verify slot plus a
+                    // recurrent rollback. Stopping early is cheaper than
+                    // drafting badly — prod credits this with taking
+                    // acceptance from 0.60 to 0.92.
                     let d = tandem_model::qwen35::argmax(&dl);
+                    let p = softmax_prob(&dl, d);
+                    if p < p_min {
+                        // the draft head already consumed a cache slot for
+                        // this position; give it back
+                        session.mtp_past -= 1;
+                        break;
+                    }
                     drafts.push(d);
                     tok_in = d;
                     pos += 1;
@@ -207,7 +233,7 @@ fn cmd_spec(args: &[String]) -> ExitCode {
     let rate = if proposed == 0 { 0.0 } else { accepted as f64 / proposed as f64 };
     eprintln!(
         "prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s) | \
-         spec {n_spec}: acceptance {accepted}/{proposed} = {rate:.3}, {rounds} rounds, \
+         spec {n_spec}/p{p_min}: acceptance {accepted}/{proposed} = {rate:.3}, {rounds} rounds, \
          {:.2} tok/round",
         prompt_ids.len(),
         t_prefill,

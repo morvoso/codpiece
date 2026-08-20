@@ -143,9 +143,14 @@ identical to plain greedy):
 | MTP depth 2 | 52.9 | 0.713 | 2.40 |
 | **MTP depth 3** | **59.3** | 0.667 | 3.00 |
 
-**Gate: PASSED.** 59.3 tok/s clears the ≥57 bar, acceptance is 0.90 at depth
-1 (the depth where the gate's number was measured), and speculation is
-verified lossless rather than assumed to be.
+Head to head against llama.cpp's own server running production's MTP config,
+3 reps each in one window: **llama.cpp 65.0 tok/s, tandem 59.2 (91 %)**.
+
+**Gate: PASSED on its own terms** (≥57 tok/s, acceptance 0.90 at depth 1,
+losslessness verified) — but tandem is *behind* llama.cpp here, unlike the
+non-speculative case. Do not read the 59.2 as beating production: ENGINE.md's
+"~50 with MTP" was a different configuration, and the matched measurement is
+65.0.
 
 Still open here: acceptance-adaptive draft depth (prod's `p-min 0.75` drops
 low-confidence drafts instead of always drafting n), and caching the

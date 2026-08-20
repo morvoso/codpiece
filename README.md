@@ -45,14 +45,19 @@ it: output identical to llama.cpp b10423, or it does not count.
 | | tandem | llama.cpp b10423 |
 |---|---|---|
 | 27B decode, tensor parallel | 39.8 tok/s | 41.4 |
-| 27B decode, + MTP speculation | **59.3 tok/s** | (prod's documented ~50 with MTP) |
+| 27B decode, + MTP speculation | 59.2 tok/s | **65.0** (prod MTP config, measured head to head) |
 | 27B prefill, 7.5K prompt | 1,494 tok/s | — |
 | output vs llama.cpp (short, 8K, 27B) | **identical** | reference |
 | tokenizer, wikitext-2 | **297,193/297,193 identical** | reference |
 | perplexity | 20.4453 | 20.4429 |
 
-Milestones M0–M4 are done and gated; see `docs/ROADMAP.md`. Next: the
-serving layer (M5) and the host-RAM session cache (M6).
+tandem is at 96 % of llama.cpp without speculation and 91 % with it. The
+speculative gap is not mysterious: llama.cpp gates drafts on confidence
+(`p-min`) and caches its verify graph; tandem does neither yet.
+
+Milestones M0–M4 are done and gated; see `docs/ROADMAP.md`. Next: closing the
+speculative gap, then the serving layer (M5) and the host-RAM session cache
+(M6).
 
 ## Layout
 
