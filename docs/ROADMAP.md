@@ -58,13 +58,33 @@ Status 2026-08-19, all vs oracles built at b10423, CPU, GPU-blind:
 - [ ] Builder image for llm-host with rust + CUDA so `cargo build
       --features cuda` runs there (oracle recipe already proves the pieces).
 
-## M2 — Single-GPU CUDA + decode loop
+## M2 — Single-GPU CUDA + decode loop  ◕ in progress 2026-08-19
 
-Same small model on one 3090 **inside the locked bench window**. CUDA-graph
-decode loop. First speed data point vs llama.cpp same-model-same-GPU.
+Stateful engine (Session: KV cache + carried conv/GDN states) on one 3090,
+inside the locked bench window (scripts/bench-window.sh — SAFETY.md as code).
 
-**Gate:** token-parity as M1 (CUDA numerics may shift logits; parity = same
-tokens temp-0 w/ tie tolerance) + decode ≥ llama.cpp single-GPU on that model.
+Done:
+- [x] Session decode path, CPU: bitwise-identical to the gate-passed
+      stateless rig (all 5 selftest cases 0.000000 with f32 caches).
+- [x] CUDA session-path corruption found and fixed: all-F32 KV caches hit
+      undertested CUDA kernel paths (V transposed write / padded read).
+      Bisected in 3 bench windows via mechanism toggles. Fix = f16 KV,
+      which is prod's accuracy-validated config anyway.
+- [x] Parity policy learned: compare path-matched (tandem non-FA ↔ oracle
+      -fa off; tandem FA ↔ oracle -fa on). At fp16, FA and non-FA are both
+      correct but round differently.
+- [x] Flash-attention session path (untransposed f16 V cache, f16 mask,
+      prec F32): CPU 3/3 token-identical vs oracle -fa on.
+- [x] CUDA: selftest argmax-stable, ppl 16.2114 (CPU 16.2159), 64-token
+      GPU gen parity IDENTICAL (non-FA build).
+- [x] Persistent per-session graph allocator (+1.7%).
+
+Speed so far (0.8B BF16, GPU1, 256-token decode): tandem non-FA 235 tok/s
+vs oracle FA 317 tok/s. FA measurement pending this window.
+
+**Gate:** parity as above + decode ≥ oracle same-path. Remaining levers if
+FA alone doesn't close it: padded n_kv buckets → stable graph shapes →
+ggml-cuda CUDA-graph capture; single mask upload; reused graph contexts.
 
 ## M3 — Qwen3.8-27B, 2-GPU tensor split, single stream
 

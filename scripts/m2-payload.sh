@@ -53,7 +53,7 @@ done
 echo "== [4/4] 64-token generation parity on CUDA =="
 T=$(tdm gen "$MODEL_C" -p "$PROMPT" -n 64 --gpu 0 2>/dev/null | sed 's/<|im_end|>//')
 O=$(oracle -m "$MODEL_C" -p "The capital of France is" -n 64 --temp 0 -ngl 999 \
-      -fa off --no-warmup --no-display-prompt 2>/dev/null | sed -e 's/> EOF by user//' -e 's/<|im_end|>//')
+      -fa on --no-warmup --no-display-prompt 2>/dev/null | sed -e 's/> EOF by user//' -e 's/<|im_end|>//')
 norm() { printf '%s' "$1" | sed -e 's/[[:space:]]*$//' | awk 'NF{b=0} !NF{b++} {l[NR]=$0; last=NR} END{while(last>0&&l[last]=="")last--; for(i=1;i<=last;i++)print l[i]}'; }
 if [ "$(norm "$T")" == "$(norm "$O")" ]; then
   echo "GPU GEN PARITY: IDENTICAL"
