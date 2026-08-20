@@ -924,7 +924,12 @@ impl Qwen35 {
         // per-draft graph executions, and the meta backend aborts when a
         // cached graph is replayed with other graphs in between. Rebuilding
         // is the correct choice there until that is resolved.
-        if session.fa && !self.weights.is_tensor_parallel() {
+        // Every failing TP experiment so far mixed a CACHED graph with a
+        // REBUILT one. Two cached graphs alternating has not been tried, and
+        // it is the configuration that would actually pay: TANDEM_BOTH_CACHED
+        // turns it on for both the verify and the draft.
+        let both_cached = std::env::var("TANDEM_BOTH_CACHED").is_ok();
+        if session.fa && (!self.weights.is_tensor_parallel() || both_cached) {
             let (out, hidden) = self.step_cached(session, tokens, n_threads, greedy)?;
             session.n_past += tokens.len();
             let preds = match out {
@@ -1260,7 +1265,8 @@ impl Qwen35 {
         // TANDEM_MTP_CACHE=1 forces the cached path under tensor parallelism
         // so the meta-backend limitation can be probed directly.
         let cacheable = !self.weights.is_tensor_parallel()
-            || std::env::var("TANDEM_MTP_CACHE").is_ok();
+            || std::env::var("TANDEM_MTP_CACHE").is_ok()
+            || std::env::var("TANDEM_BOTH_CACHED").is_ok();
         unsafe {
             if !cacheable {
                 return self.mtp_draft_uncached(session, hidden, token, pos, n_threads);

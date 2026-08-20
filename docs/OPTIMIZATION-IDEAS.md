@@ -87,24 +87,36 @@ Under tensor parallelism it is blocked (idea 4).
 
 ## 4. Cache the verify graph per shape — BLOCKED under TP
 
-Two experiments narrowed this to a precise statement:
+Six configurations were tried on the 27B. All failures are the same assert,
+`bcj.nodes[i]` null at ggml-backend-meta.cpp:1838 — the meta backend cannot
+produce a per-device tensor for some node of a graph it is replaying.
 
-- A cached **trunk-only** graph replays fine under TP — that is what plain
-  decode does at 38 tok/s.
-- A cached verify graph *interleaved* with per-draft graphs aborts.
-- A cached graph *containing the draft tail* also aborts, even though the
-  same graph works when rebuilt each round.
+| configuration | tokens/step | cached | result |
+|---|---|---|---|
+| plain decode | 1 | yes | **works** — 38 tok/s, and gets CUDA-graph capture |
+| speculative verify | 2–4 | no | **works** — 49–55 tok/s |
+| speculative verify | 2–4 | yes | fails |
+| fused round (verify + draft tail) | 2 | no | **works** — 49.6 tok/s |
+| fused round | 2 | yes | fails |
+| draft head alone | 1 | yes | fails |
+| verify **and** draft both cached | 2–4 + 1 | yes | fails |
 
-So the rule is not "no caching under TP". The draft tail differs from
-everything else in the graph in one way: it indexes the embedding table with a
-**computed node** (the in-graph argmax) rather than an input tensor, and the
-meta backend appears not to keep that mapping valid across replays
-(`bcj.nodes[i]` null, ggml-backend-meta.cpp:1838).
+The last row is the one that kills the obvious workaround: it is not that
+cached and rebuilt graphs cannot mix. Two cached graphs alternating fail too.
 
-If that is the mechanism, the fix is to break the round into two cached
-graphs — trunk, then tail fed by an *input* token written from the host
-between them — trading one extra execution for a replayable pair. That is the
-next thing to try, and it is worth ~11 ms/round on the 27B.
+**The rule that fits every observation:** under tensor parallelism the meta
+backend supports exactly *one* repeatedly-replayed graph per session. Plain
+decode qualifies — it replays one graph forever — which is precisely why the
+only path that benefits from graph caching today is the one that does not
+speculate. A speculative round inherently needs either two recurring graphs,
+or one graph whose embedding lookup is indexed by a computed node (the
+in-graph argmax), and both are outside what the backend supports on replay.
+
+Closing this is worth ~11 ms/round (37.9 → ~26 ms), i.e. roughly 49.6 → 70
+tok/s at depth 1. It needs work inside `ggml-backend-meta.cpp` rather than in
+tandem: the per-device tensor mapping is rebuilt per graph and does not
+survive another graph claiming the buffers. `TANDEM_BOTH_CACHED=1` and
+`TANDEM_MTP_CACHE=1` reproduce the two failing shapes directly.
 
 ## 5. Overlap the draft with the trunk on a second CUDA stream — SPECULATIVE
 
