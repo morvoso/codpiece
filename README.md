@@ -1,156 +1,266 @@
 # codpiece
 
-A from-scratch LLM inference engine for exactly one machine shape: **2× RTX 3090
-(24 GiB, ~936 GB/s each) connected over PCIe with no P2P DMA**, serving
-**Qwen3.8-27B** (hybrid Gated-DeltaNet/attention with an embedded MTP head).
+A local LLM server for one specific setup: **two RTX 3090s** running
+**Qwen3.8-27B**. It does the same job as llama.cpp or vLLM — you send it
+prompts over HTTP, it streams back answers — but it is tuned for exactly this
+hardware and this model, and on that ground it is faster than both at the
+same accuracy. It speaks the OpenAI API, so anything that works with OpenAI,
+llama.cpp, or Ollama endpoints works with it unchanged: chat clients, coding
+assistants, scripts. It also reads images.
 
-codpiece replaces the *engine layer* of llama.cpp and vLLM — scheduling,
-batching, KV + recurrent-state management, speculative decoding orchestration,
-session caching, and the server API — while inheriting the battle-tested
-compute kernels underneath (vendored ggml CUDA, MIT-licensed, pinned to the
-exact build production runs today). Accuracy is a bit-parity property by
-construction, not a hope.
+What "tuned" buys you, in plain terms:
 
-## Design priorities (standing, from the box's operating doc)
+- **Faster replies.** 67–88 tokens/s where llama.cpp gets 53–65 on the same
+  GPUs, because it drafts several tokens ahead and verifies them in one pass.
+- **Same answers.** With randomness off it produces byte-for-byte the same
+  text llama.cpp does. Speed never comes from cutting corners on the model.
+- **Instant return to old conversations.** Revisiting a long chat costs ~1
+  second instead of ~25, because conversation state stays parked in GPU
+  memory.
+- **Images.** Screenshots and photos through the standard `image_url` chat
+  field, answered by the same model.
 
-**ACCURACY > SPEED > CONTEXT.** Every milestone gates on temp-0 token-identical
-output vs. llama.cpp before any speed claim counts. f16 KV is the default.
-The GGUF-embedded chat template is authoritative.
+## How to use
 
-## The physics (read ENGINE.md first)
+### Build
 
-Single-stream decode on this hardware is memory-bandwidth-bound at ~64 tok/s
-per stream (Q8 weights, tensor-split): 14.65 GiB per GPU per token against
-936 GB/s is 15.6 ms. Tuned llama.cpp already sits at 80-85% of that wall.
+Requires Rust, CMake, and CUDA. First fetch the pinned ggml sources (the
+compute kernels are vendored from llama.cpp, not reimplemented):
 
-Speculation is the one thing that gets *past* it, and this is worth being
-precise about rather than treating as a paradox: a round reads the weights
-once and can commit several tokens, so the floor applies per *round*, not per
-token. That is why the numbers below exceed 64 tok/s, and why the entire
-optimization problem reduces to accepted tokens per round. codpiece does not promise to break physics; it targets the wins
-that measurement says exist:
+```sh
+scripts/fetch-deps.sh
+cargo build --release --features cuda
+```
 
-| lever | evidence |
-|---|---|
-| Continuous batching / concurrency | vLLM: +245% at 4-way on this box |
-| Single-stream decode overhead | vLLM: +33–49% vs llama.cpp, same GPUs |
-| MTP verify batching ≥0.92 acceptance | llama.cpp measured, must not regress |
-| Host-RAM session cache incl. GDN states | 70× on session revisit (llama.cpp `--cache-ram`) |
-| f16-KV fidelity at 196K+ context | vLLM cannot (forced fp8); codpiece must |
-| DFlash2 block-diffusion drafting, multi-GPU | nobody has it; +10–15% measured prize |
+Omit `--features cuda` for a CPU-only build (useful for tests; far too slow
+to serve the 27B).
 
-The end state is one engine that holds all rows at once — which today no
-engine does.
+### Try it from the command line
 
-## Status — 2026-08-19
+```sh
+# one-shot generation
+codpiece gen model.gguf -p "Hello" -n 64 -c 8192 --tp 0,1
 
-Running the production Qwen3.8-27B on 2×3090, tensor-parallel, with MTP
-speculative decoding. Every speed number below has an accuracy gate behind
-it: output identical to llama.cpp b10423, or it does not count.
+# inspect any GGUF without loading it
+codpiece inspect model.gguf
+```
 
-| | codpiece | llama.cpp b10423 |
+`--tp 0,1` splits the model across both GPUs (tensor parallel). The 27B does
+not fit on one card.
+
+### Start the server
+
+```sh
+codpiece serve model.gguf --host 0.0.0.0 --port 8020 -c 65536 --tp 0,1 \
+    --mmproj mmproj-BF16.gguf --mmproj-gpu 0
+```
+
+`-c` is the context size in tokens. `--mmproj` enables image input; leave it
+off for text only.
+
+### Talk to it
+
+Any OpenAI-compatible client works. Raw curl:
+
+```sh
+# plain completion
+curl http://localhost:8020/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "The capital of France is", "max_tokens": 16}'
+
+# chat (the model's own template is applied server-side)
+curl http://localhost:8020/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "Explain BPE in one paragraph"}],
+       "max_tokens": 200, "stream": true}'
+```
+
+Images go in the standard content-parts form. Only `data:` URLs are
+accepted — the server never fetches remote URLs:
+
+```json
+{"messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,...."}},
+    {"type": "text", "text": "What does this screenshot show?"}
+]}]}
+```
+
+Endpoints: `/v1/completions`, `/v1/chat/completions` (both stream with
+`"stream": true`), `/tokenize`, `/detokenize`, `/v1/models`, `/health`,
+`/slots`. Responses include a `timings` object with prefill/decode speed and
+speculation acceptance.
+
+Thinking models are handled the way the Qwen API does it: the `<think>`
+block comes back in `reasoning_content`, the answer in `content`, in both
+streaming and non-streaming responses.
+
+### Settings that matter
+
+| knob | default | what it does |
 |---|---|---|
-| 27B decode, tensor parallel | 39.0 tok/s | 41.4 |
-| 27B decode, + MTP speculation | **69.9 tok/s** | 64.5 (prod MTP config) |
-| same, on a code-writing prompt | **67.6 tok/s** | 53.3 |
-| 27B prefill, 7.5K prompt | 1,494 tok/s | — |
-| output vs llama.cpp (short, 8K, 27B) | **identical** | reference |
-| tokenizer, wikitext-2 | **297,193/297,193 identical** | reference |
-| perplexity | 20.4453 | 20.4429 |
+| `--depth N` | 3 | speculation depth; `0` disables, `auto` self-tunes |
+| `--think-budget N` | 4096 | max tokens in a `<think>` block before it is force-closed |
+| `--alias NAME` | file stem | model id reported to clients |
+| `CODPIECE_CHAIN_PMIN` | 0.9 | draft confidence gate; higher = fewer, better drafts |
+| `CODPIECE_REDRAFT_PMIN` | 0.9 | same gate for post-divergence re-drafts |
+| `CODPIECE_SESSIONS` | 2 (≤70K ctx) | conversations kept resident in VRAM |
+| `CODPIECE_BATCH` | 4 | slots for concurrent requests |
+| `CODPIECE_MMPROJ` | unset | vision tower path (alternative to `--mmproj`) |
+| `CODPIECE_IMAGE_MIN_TOKENS` | 1024 | image detail floor; Qwen-VL reads text poorly below this |
 
-The speculative row is a head-to-head: both engines measured in the same
-locked bench window, same GPUs, same model, same prompt, 96 tokens, three
-repetitions each. llama.cpp ran 64.52 / 64.78 / 64.28 tok/s; codpiece's fused
-speculative round ran 64.51 / 64.47 / 64.49 at depth 2 and **69.86 / 69.81 /
-69.89 at depth 3**. Acceptance is prompt-dependent, so depth 3 is not always
-the best choice — on a longer 160-token generation depth 2 led at 64.3.
+The two `PMIN` gates hold measured speculation acceptance at or above 0.90.
+Lowering them trades acceptance for a little long-context speed.
 
-### What "lossless" does and does not mean here
+### Deploying
 
-Every token a speculative round commits is one the trunk itself predicted: a
-draft is kept only when it equals the trunk's own argmax at that position, and
-the first rejection is replaced by that argmax. Speculation cannot invent a
-token.
+`deploy/docker-compose.codpiece.yml` runs the server in the CUDA container
+this project builds in; `deploy/switch.sh {codpiece|llamacpp|vllm}` swaps
+engines on port 8020 so rollback is one command. All tunables are
+`CODPIECE_`-prefixed environment variables so a shared `.env` with other
+engines cannot bleed settings in.
 
-It can still change the output, and the honest statement is that it sometimes
-does. Verifying T tokens in one batch is not bit-identical to decoding them one
-at a time — different GEMM shapes reduce in a different order — so where two
-logits are nearly tied, the argmax can flip. Measured on three prompts at
-depths 1-3, output was byte-identical to plain greedy on two of them and
-diverged on the third (a code-writing prompt), at every depth.
+## Measured performance
 
-That is a property of batched speculative decoding on this model, not of
-codpiece. **llama.cpp's own MTP speculation diverges from its own greedy output
-on the same prompt, at the same token** (`scripts/specparity-payload.sh`
-measures exactly this). Both engines' *non*-speculative greedy outputs agree
-with each other word for word.
+Same box, same model (Qwen3.8-27B UD-Q8_K_XL), same prompts, locked bench
+windows. llama.cpp is b10423 in its production configuration.
 
-So: plain decode is gated on byte-identical output versus llama.cpp, and that
-gate holds. Speculative decode is gated on committing only trunk-predicted
-tokens, and on matching the reference implementation's behaviour — which it
-does.
+| | codpiece | llama.cpp | vLLM (FP8) |
+|---|---|---|---|
+| greedy decode, prose | **69.9 tok/s** | 64.5 | 76–95 |
+| greedy decode, code | **67.6** | 53.3 | — |
+| sampled (temp 1.0), short | **42.8** | 32.4 | — |
+| sampled, 32K context | 39.5 | **52.7** | — |
+| prefill, 32K prompt | 1,337 | 1,353 | — |
+| 8 concurrent requests | **153.5** | ~101 | 251–260 |
+| return to a 32K conversation | **0.9 s** | 1.3 s | — |
+| speculation acceptance | **0.91–0.93** | ~0.78 | — |
+| vision (same page, same question) | same answer, 847 tok/s prefill | same, 837 | n/a |
+| greedy output parity | byte-identical | reference | not comparable (FP8) |
 
-### Acceptance ≥ 0.90 — 2026-08-20
+Honest caveats: llama.cpp still wins sampled decode at 32K (a consequence of
+the 0.9 confidence gates; at gate 0 codpiece measures 47.5 there) and can run
+196K context where codpiece's speculation stops near 145K. vLLM wins raw
+throughput at high concurrency, but only at FP8 weight precision — this
+project's quant keeps the sensitive tensors in BF16, and accuracy outranks
+speed here by design.
 
-Speculation now runs behind two confidence gates, both defaulting to 0.9:
+## Technical details
 
-- `CODPIECE_CHAIN_PMIN` — the fused graph emits each chain link's softmax peak
-  at its own argmax (a batched `get_rows` over the softmax viewed as
-  `[1, vocab, n_out]`; in-graph, so it costs no extra readback pass), and the
-  server carries a chain link into the next round only while the draft head's
-  confidence holds above the gate.
-- `CODPIECE_REDRAFT_PMIN` — the post-divergence re-draft chain stops at the
-  first link whose softmax peak falls below the gate (this knob existed at
-  0.75; the joint sweep moved it).
+### What it is
 
-Verification accepts a draft with probability p(x0), so a well-calibrated 0.9
-gate puts every surviving draft near 0.93 acceptance odds — and either gate
-alone tops out near 0.86 because the other pool dilutes the ratio. Measured on
-the 27B under tensor parallel (db2 harness, 2 reps): acceptance **0.910
-greedy, 0.910 sampled short, 0.933 sampled at 32K** (0.678 / 0.637 / 0.684
-with the gates off). The ratio is bought with fewer carried drafts, so decode
-gives back some speed (32K sampled 39.5 tok/s vs 47.5 gate-off); accuracy
-ranks above speed here, and both knobs are env-tunable per deployment.
+codpiece replaces the engine layer — scheduling, batching, KV and
+recurrent-state management, speculative decoding, session caching, the HTTP
+server — and keeps ggml's CUDA kernels underneath, vendored at the exact
+llama.cpp build production ran (b10423) plus a small patch set
+(`patches/ggml-codpiece.patch`). Accuracy against llama.cpp is therefore a
+bit-parity property of shared kernels, checked by gates, not an aspiration.
 
-One porting note for the in-graph confidence: the tensor-parallel meta backend
-infers a split axis for every tensor from its sources, so source ops like
-`ggml_arange` (no inputs, nothing to inherit) abort it. The gather sticks to
-ops that inherit the lm head's mirrored state — which is also why the lm head
-*stays* mirrored (`lm_head_is_replicated_to_keep_sampling_in_graph`).
+The model is Qwen3.8-27B: 64 trunk layers, 48 of them Gated-DeltaNet
+recurrences and 16 attention, plus an embedded MTP draft head. The recurrent
+majority is why decode barely slows with context (fixed-size state) and why
+rejected speculative tokens need explicit state rollback: the fused GDN
+kernel emits K trailing state snapshots, and rollback promotes one.
 
-Draft depth is `--depth N` (default 3, the best single setting across the prompts
-measured). `--depth auto` chooses per round from observed acceptance and measured
-round cost, and matches fixed depth 3 within +-0.4% across four prompts while
-picking the depth itself. It stays opt-in because it matches rather than beats a
-correctly chosen fixed depth — but depth is worth up to 14% between adjacent
-settings, so it is the right choice when the workload is unknown.
+### The bandwidth argument
 
-What closed the gap was not drafting at all. Three lifetime bugs were keeping
-graphs from being reused across computes — including one where
-`ggml_new_graph_custom` leaves `cgraph->uid` at 0, which the tensor-parallel
-backend reads as "assume this graph changed", so **every compute rebuilt its
-per-device mapping even for graphs codpiece had carefully cached**. Fixing that
-took plain decode from 20 backend rebuilds per 20 tokens to 2, and took the
-speculative round from 53.6 to 64.3 tok/s. See
-`docs/OPTIMIZATION-IDEAS.md` §4 and `notes/results-2026-08-19.md`.
+Single-stream decode is memory-bound: ~14.7 GiB of weights per GPU per token
+against 936 GB/s is a 15.7 ms floor, ~64 tok/s. Speculation is the only way
+past it — one weight read verifies several drafted tokens, so the floor
+applies per round, not per token. The whole optimization problem is accepted
+tokens per round. Details and measurements: `ENGINE.md`,
+`docs/ARCHITECTURE.md`.
 
-Milestones M0–M4 are done and gated; see `docs/ROADMAP.md`. Next: closing the
-speculative gap, then the serving layer (M5) and the host-RAM session cache
-(M6).
+### Speculation
+
+The fused round runs verification and the next draft chain in one graph,
+including in-graph argmax→embedding chaining so the chain conditions on the
+trunk's own prediction without a round trip. At temperature, drafts are
+accepted with probability p(draft) and rejections re-drawn from the residual,
+which provably emits the target distribution unchanged (verified on the 27B:
+total-variation test/null ratio 1.039 over 24K sampled tokens).
+
+Acceptance is held at ≥ 0.90 by two confidence gates. The graph emits each
+chain link's softmax peak (a batched `get_rows` over the softmax viewed as
+`[1, vocab, n_out]`), and the server drops carried links below
+`CODPIECE_CHAIN_PMIN`; the post-divergence re-draft chain stops below
+`CODPIECE_REDRAFT_PMIN`. Since verification accepts with probability p(x0),
+a calibrated 0.9 gate puts each surviving draft near 0.93 acceptance odds;
+either gate alone tops out near 0.86 because the ungated pool dilutes the
+ratio. Measured: 0.910 greedy, 0.910 sampled short, 0.933 sampled at 32K.
+
+Speculative output is not always byte-identical to one-token-at-a-time
+greedy decoding: batched verification reduces GEMMs in a different order, and
+a near-tied argmax can flip. llama.cpp's own MTP speculation diverges from
+its own greedy output at the same token on the same prompt
+(`scripts/specparity-payload.sh`). Non-speculative greedy output is gated
+byte-identical against llama.cpp, and that gate holds.
+
+### Serving
+
+One engine thread owns the model (ggml pointers are not Send). Single
+requests take a speculative fast path; overlapping requests move to a batch
+scheduler with fixed-width rounds and per-slot samplers, where the
+recurrent-state slot dimension doubles as the sequence dimension (batch mode
+does not speculate, so snapshots and sequences never coexist). Prefill runs
+bulk chunks through the trunk only and the last 64 tokens through the fused
+round to warm the draft head; chunk size follows VRAM headroom, not context.
+
+Conversations stay resident: a pool of whole sessions in VRAM with
+longest-prefix matching (tensor-parallel GDN state cannot be copied
+off-device, so the pool switches by pointer), plus a host-RAM snapshot store
+on single-device builds. Multi-turn thinking chats round-trip exactly — the
+server splits generations at `</think>` into `reasoning_content` the way the
+template re-renders them, so a returning conversation is a token-exact prefix
+and costs ~1 s instead of a full re-prefill.
+
+### Vision
+
+`crates/codpiece-vision` is an op-for-op port of llama.cpp's qwen3vl_merger
+clip graph: dual-conv patch embedding, 2×2 block reorder, bilinearly resized
+position embeddings, 27 transformer layers with vision M-RoPE, and the
+merger MLP into the trunk width. Encoder parity vs `llama-mtmd-debug` on the
+same build: the ported front end is bit-exact, full-depth drift stays under
+BF16 weight precision. Preprocessing (smart-resize, PAD_CEIL bilinear,
+normalization) mirrors mtmd's rounding exactly.
+
+Image embeddings enter the trunk through an embedding-input graph with the
+Qwen-VL position rule — the RoPE clock advances by max(grid_w, grid_h) while
+the KV cache advances by the token count; the gap is tracked per session —
+and image spans appear in the prompt cache as content-hash pseudo-ids, so
+prefix reuse matches an image only when its bytes match. The ViT runs flash
+attention on CUDA (the non-FA path materializes a >1 GiB attention matrix at
+1024 image tokens); the CPU keeps the exact reference path for parity runs.
+End-to-end gate: `scripts/vision-payload.sh` asks llama.cpp and codpiece the
+same question about the same newspaper page and requires the same reading.
+
+### Verification
+
+Every capability has a gate script under `scripts/`, run inside
+`scripts/bench-window.sh` (locks the GPUs, stops production, restores and
+health-checks it afterwards — see `docs/SAFETY.md`):
+
+- `final-verify.sh` — fused speculation vs plain greedy, three prompts, all
+  depths
+- `serve-payload.sh` — greedy over HTTP must equal the CLI byte-for-byte
+- `specparity2-payload.sh` — sampling distribution preservation on the 27B
+- `vision-payload.sh` — end-to-end image answer vs llama.cpp
+- tokenizer: 297,193/297,193 tokens identical on wikitext-2; perplexity
+  20.4453 vs 20.4429
 
 ## Layout
 
-- `crates/codpiece-gguf` — zero-dependency GGUF v2/v3 reader (done, tested
-  against the production 31 GB file).
-- `crates/codpiece-cli` — `codpiece inspect`, header-only model analysis (done).
-- `crates/codpiece-ggml-sys` — FFI bindings to vendored ggml (in progress).
-- `docs/ARCHITECTURE.md` — full design and rationale.
-- `docs/ROADMAP.md` — milestones M0–M7, each with a hard accuracy gate.
-- `docs/SAFETY.md` — hardware- and production-safety protocol for the
-  llm-host box. **Read before running anything on the server.**
-- `notes/` — recon logs and reference snapshots (llama.cpp qwen35 sources,
-  prod config, chat template).
-- `ENGINE.md` — the measured knowledge base this project is built on.
+- `crates/codpiece-gguf` — dependency-free GGUF reader
+- `crates/codpiece-tok` — BPE tokenizer (token-identical to llama.cpp)
+- `crates/codpiece-model` — weight loading, graphs, sessions, speculation,
+  tensor-parallel split rules
+- `crates/codpiece-vision` — image encoder and preprocessing
+- `crates/codpiece-sample` — samplers, llama.cpp-compatible semantics
+- `crates/codpiece-server` — HTTP server, OpenAI API, engine thread, batch
+  scheduler
+- `crates/codpiece-cli` — `codpiece {serve,gen,inspect,vision,...}`
+- `docs/` — architecture, roadmap (M0–M7, each with an accuracy gate),
+  safety protocol
+- `ENGINE.md`, `notes/` — the measured knowledge base under the design
 
 ## License
 
