@@ -10,6 +10,41 @@
 //! bilinear, floor of the composite offset) mirrors the C++ so the same
 //! image bytes produce the same floats the reference feeds its encoder.
 
+/// A decoded, smart-resized, normalized image ready for the encoder, plus a
+/// content hash for prompt-cache identity. `planar` is [c][y][x] f32.
+#[derive(Debug, Clone)]
+pub struct PreparedImage {
+    pub planar: Vec<f32>,
+    pub w: u32,
+    pub h: u32,
+    /// FNV-1a of the original encoded bytes: two prompts share cached prefix
+    /// rows for an image span only when the underlying image bytes matched.
+    pub hash: u64,
+}
+
+impl PreparedImage {
+    /// Merged-grid dimensions: one trunk embedding per 2x2 patch block.
+    pub fn grid(&self, align: u32) -> (usize, usize) {
+        ((self.w / align) as usize, (self.h / align) as usize)
+    }
+
+    /// Rows this image occupies in the trunk (= embeddings the encoder emits).
+    pub fn n_tokens(&self, align: u32) -> usize {
+        let (nx, ny) = self.grid(align);
+        nx * ny
+    }
+}
+
+/// FNV-1a, for image identity in the prompt cache.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// Pixel-budget policy, mirroring clip.cpp's `set_limit_image_tokens`.
 /// One output token covers `patch*merge` square pixels (32x32 = 1024 px).
 #[derive(Debug, Clone)]
@@ -59,6 +94,13 @@ impl Preprocessor {
             w_bar = ceil_by(w as f32 * beta);
         }
         (w_bar as u32, h_bar as u32)
+    }
+
+    /// Decode + resize + normalize one encoded (JPEG/PNG) image.
+    pub fn prepare(&self, bytes: &[u8]) -> Result<PreparedImage, String> {
+        let (rgb, w, h) = decode(bytes)?;
+        let (planar, tw, th) = self.run(&rgb, w, h)?;
+        Ok(PreparedImage { planar, w: tw, h: th, hash: fnv1a(bytes) })
     }
 
     /// Full pipeline: interleaved RGB bytes -> planar normalized f32 at the

@@ -14,6 +14,83 @@ use crate::chat::{ChatMessage, ChatTemplate};
 use crate::engine::{Engine, Event, GenRequest};
 use crate::http::{begin_sse, sse_data, sse_done, write_error, write_json, Request};
 use codpiece_sample::SamplerParams;
+use codpiece_vision::preprocess::{PreparedImage, Preprocessor};
+
+/// Standard base64 (RFC 4648, `+/`, optional padding). Hand-rolled like the
+/// HTTP layer: one alphabet, no streaming, fail loudly.
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0u8;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\n' | b'\r' => continue,
+            _ => return Err(format!("invalid base64 byte {c:#x}")),
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Pull the encoded bytes out of one image content part. Accepted shapes:
+/// `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`,
+/// `image_url` as a plain string, and the Qwen `image` shorthand. Only data:
+/// URLs (or bare base64) are accepted — the server does not fetch.
+fn image_part_bytes(item: &serde_json::Value) -> Option<Result<Vec<u8>, String>> {
+    let url = item
+        .get("image_url")
+        .map(|u| u.get("url").and_then(|v| v.as_str()).or(u.as_str()))
+        .unwrap_or_else(|| item.get("image").and_then(|v| v.as_str()));
+    let is_image = url.is_some() || item.get("type").and_then(|t| t.as_str()) == Some("image");
+    if !is_image {
+        return None;
+    }
+    let Some(url) = url else {
+        return Some(Err("image part without image data".into()));
+    };
+    let payload = if let Some(rest) = url.strip_prefix("data:") {
+        match rest.split_once(";base64,") {
+            Some((_mime, b64)) => b64,
+            None => return Some(Err("data: URL without base64 payload".into())),
+        }
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(Err(
+            "remote image URLs are not fetched; inline the image as a data: URL".into(),
+        ));
+    } else {
+        url // bare base64
+    };
+    Some(base64_decode(payload))
+}
+
+/// Decode + preprocess every image in the conversation, in document order —
+/// the same order the chat template emits `<|image_pad|>` markers.
+fn extract_images(
+    messages: &[ChatMessage],
+    prep: &Preprocessor,
+) -> Result<Vec<PreparedImage>, String> {
+    let mut out = Vec::new();
+    for m in messages {
+        if let Some(parts) = m.content.as_array() {
+            for item in parts {
+                if let Some(bytes) = image_part_bytes(item) {
+                    out.push(prep.prepare(&bytes?)?);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// The knobs both endpoints share. Defaults match "no sampling", so a request that
 /// specifies nothing decodes greedily and keeps the in-graph argmax.
@@ -207,6 +284,7 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
             };
             let gen = GenRequest {
                 prompt: body.prompt,
+                images: Vec::new(),
                 params: body.sampling.params(),
                 max_tokens: body.sampling.max_tokens(ctx.default_max_tokens),
                 stop: body.sampling.stop(),
@@ -237,6 +315,29 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                         .and_then(|v| v.as_bool())
                 })
                 .unwrap_or(true);
+            let images = match ctx.engine.vision_prep.as_ref() {
+                Some(prep) => match extract_images(&body.messages, prep) {
+                    Ok(v) => v,
+                    Err(e) => return write_error(w, 400, &format!("image: {e}")),
+                },
+                None => {
+                    // fail loudly if the request carries images we cannot see
+                    let has = body.messages.iter().any(|m| {
+                        m.content
+                            .as_array()
+                            .map(|a| a.iter().any(|i| image_part_bytes(i).is_some()))
+                            .unwrap_or(false)
+                    });
+                    if has {
+                        return write_error(
+                            w,
+                            400,
+                            "this server was started without --mmproj; images are not supported",
+                        );
+                    }
+                    Vec::new()
+                }
+            };
             let prompt = match tmpl.render(
                 &body.messages,
                 true,
@@ -249,6 +350,7 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
             };
             let gen = GenRequest {
                 prompt,
+                images,
                 params: body.sampling.params(),
                 max_tokens: body.sampling.max_tokens(ctx.default_max_tokens),
                 stop: body.sampling.stop(),

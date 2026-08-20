@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use codpiece_model::qwen35::{Qwen35, Session};
 use codpiece_sample::{Sampler, SamplerParams};
+use codpiece_vision::preprocess::{PreparedImage, Preprocessor};
+use codpiece_vision::VisionModel;
 
 
 /// How many prompt tokens to prefill per graph.
@@ -116,6 +118,9 @@ impl SessionStore {
 
 pub struct GenRequest {
     pub prompt: String,
+    /// Preprocessed images, in the order their markers appear in the prompt.
+    /// Each `<|image_pad|>` token in the prompt consumes the next entry.
+    pub images: Vec<PreparedImage>,
     pub params: SamplerParams,
     pub max_tokens: usize,
     pub stop: Vec<String>,
@@ -165,6 +170,9 @@ pub struct Engine {
     pub stats: Arc<Stats>,
     pub model_name: String,
     pub n_ctx: usize,
+    /// Set when a vision tower is loaded: the API layer preprocesses images
+    /// with it (CPU work, off the engine thread) before submitting.
+    pub vision_prep: Option<Preprocessor>,
 }
 
 #[derive(Default)]
@@ -177,6 +185,12 @@ pub struct Stats {
 
 pub struct EngineConfig {
     pub model_path: String,
+    /// Vision tower (mmproj GGUF); None serves text only.
+    pub mmproj: Option<String>,
+    /// Device for the vision tower: a CUDA ordinal, or None for the CPU.
+    /// The tower is ~0.9 GiB of weights plus a few hundred MB of compute
+    /// buffer at encode time — VRAM that must fit beside the trunk.
+    pub mmproj_gpu: Option<i32>,
     pub n_ctx: usize,
     pub threads: i32,
     pub tp: Option<Vec<i32>>,
@@ -195,11 +209,89 @@ pub struct EngineConfig {
     pub draft_gate: f32,
 }
 
+/// The vision tower plus everything the engine needs to splice images into
+/// a token stream.
+struct VisionCtx {
+    model: VisionModel,
+    /// patch * spatial_merge: one trunk row covers align x align pixels
+    align: u32,
+    pad_id: u32,
+}
+
+/// Image spans in the expanded stream carry PSEUDO ids derived from the image
+/// content hash — far above any real vocab id (vocab is 248320; these are all
+/// >= 2^31). They never reach the model (image rows go through step_embd);
+/// they exist so prefix reuse over `history` treats an image span as matched
+/// only when the image bytes matched.
+fn img_pseudo_id(hash: u64, j: usize) -> u32 {
+    let mix = (hash ^ (hash >> 32)) as u32;
+    0x8000_0000 | (mix.wrapping_mul(0x9E37_79B9).wrapping_add(j as u32) & 0x7FFF_FFFF)
+}
+
+/// One stretch of the expanded prompt: text token indices, or one image.
+enum Seg {
+    /// range of indices into the expanded id stream holding REAL token ids
+    Text(std::ops::Range<usize>),
+    /// image index into `GenRequest::images`; its span in the stream is
+    /// `start..start + n_tokens`
+    Image { idx: usize, start: usize },
+}
+
+/// Replace each `<|image_pad|>` in the tokenized prompt with the image's
+/// pseudo-id span and record the segment layout for prefill.
+fn expand_prompt(
+    raw: &[u32],
+    pad_id: u32,
+    align: u32,
+    images: &[PreparedImage],
+) -> Result<(Vec<u32>, Vec<Seg>), String> {
+    let mut ids = Vec::with_capacity(raw.len());
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut text_start = 0usize;
+    let mut next_img = 0usize;
+    for &t in raw {
+        if t == pad_id {
+            let img = images.get(next_img).ok_or_else(|| {
+                format!("prompt has more image markers than images ({})", images.len())
+            })?;
+            if ids.len() > text_start {
+                segs.push(Seg::Text(text_start..ids.len()));
+            }
+            let n = img.n_tokens(align);
+            if n == 0 {
+                return Err("image resolved to zero tokens".into());
+            }
+            let start = ids.len();
+            for j in 0..n {
+                ids.push(img_pseudo_id(img.hash, j));
+            }
+            segs.push(Seg::Image { idx: next_img, start });
+            next_img += 1;
+            text_start = ids.len();
+        } else {
+            ids.push(t);
+        }
+    }
+    if next_img != images.len() {
+        return Err(format!(
+            "{} images supplied but {} markers in the prompt",
+            images.len(),
+            next_img
+        ));
+    }
+    if ids.len() > text_start {
+        segs.push(Seg::Text(text_start..ids.len()));
+    }
+    Ok((ids, segs))
+}
+
 impl Engine {
     /// Load the model on a worker thread and return once it is ready to serve.
     pub fn start(cfg: EngineConfig) -> Result<(Self, String), String> {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        #[allow(clippy::type_complexity)]
+        let (ready_tx, ready_rx) =
+            std::sync::mpsc::channel::<Result<(String, Option<Preprocessor>), String>>();
         let stats = Arc::new(Stats::default());
         let stats_worker = stats.clone();
         let name = std::path::Path::new(&cfg.model_path)
@@ -211,10 +303,10 @@ impl Engine {
             .name("codpiece-engine".into())
             .spawn(move || worker(cfg, rx, ready_tx, stats_worker))
             .map_err(|e| format!("engine thread: {e}"))?;
-        let template = ready_rx
+        let (template, vision_prep) = ready_rx
             .recv()
             .map_err(|_| "engine thread died during load".to_string())??;
-        Ok((Self { tx, stats, model_name: name, n_ctx }, template))
+        Ok((Self { tx, stats, model_name: name, n_ctx, vision_prep }, template))
     }
 
     /// Queue a request. Events stream back on the returned receiver.
@@ -234,7 +326,7 @@ impl Engine {
 fn worker(
     cfg: EngineConfig,
     rx: Receiver<Job>,
-    ready: Sender<Result<String, String>>,
+    ready: Sender<Result<(String, Option<Preprocessor>), String>>,
     stats: Arc<Stats>,
 ) {
     let device = match (&cfg.tp, cfg.gpu) {
@@ -263,6 +355,54 @@ fn worker(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // The vision tower loads before ready so a broken mmproj fails startup
+    // loudly instead of 500ing the first image request.
+    let vision: Option<VisionCtx> = match &cfg.mmproj {
+        Some(path) => {
+            let dev = match cfg.mmproj_gpu {
+                Some(i) => codpiece_model::Device::Cuda(i),
+                None => codpiece_model::Device::Cpu,
+            };
+            let vm = match VisionModel::load(std::path::Path::new(path), dev) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = ready.send(Err(format!("mmproj: {e:?}")));
+                    return;
+                }
+            };
+            let pad = tok.encode("<|image_pad|>", true);
+            if pad.len() != 1 {
+                let _ = ready.send(Err(
+                    "tokenizer has no <|image_pad|> token; cannot serve vision".into(),
+                ));
+                return;
+            }
+            let align = (vm.hp.patch * vm.hp.merge) as u32;
+            eprintln!(
+                "serve: vision tower up ({} layers, d={}, align {}px/token, {})",
+                vm.hp.n_layer,
+                vm.hp.n_embd,
+                align,
+                match cfg.mmproj_gpu {
+                    Some(i) => format!("cuda:{i}"),
+                    None => "cpu".into(),
+                }
+            );
+            Some(VisionCtx { model: vm, align, pad_id: pad[0] })
+        }
+        None => None,
+    };
+    let vision_prep = vision.as_ref().map(|v| {
+        let min_t = std::env::var("CODPIECE_IMAGE_MIN_TOKENS")
+            .ok()
+            .and_then(|x| x.parse().ok());
+        let max_t = std::env::var("CODPIECE_IMAGE_MAX_TOKENS")
+            .ok()
+            .and_then(|x| x.parse().ok());
+        // prod llama.cpp runs --image-min-tokens 1024 (Qwen-VL grounding
+        // degrades below that), so that is the default here too
+        Preprocessor::new(&v.model.hp, Some(min_t.unwrap_or(1024)), max_t)
+    });
     // One session for the life of the process, reset between requests. Building it per
     // request meant allocating and freeing the KV cache each time — 4+ GiB at a long
     // context — and `cudaFree` synchronises, so the teardown outlived the response and
@@ -288,7 +428,7 @@ fn worker(
             return;
         }
     };
-    if ready.send(Ok(template)).is_err() {
+    if ready.send(Ok((template, vision_prep))).is_err() {
         return;
     }
 
@@ -333,7 +473,7 @@ fn worker(
         while let Ok(next) = rx.try_recv() {
             pending.push_back(next);
         }
-        if !pending.is_empty() && batch_slots > 1 {
+        if !pending.is_empty() && batch_slots > 1 && job.req.images.is_empty() {
             if bsession.is_none() {
                 match Session::new_spec(&model, batch_slots * batch_seq_ctx, batch_slots - 1) {
                     Ok(s) => bsession = Some(s),
@@ -355,7 +495,18 @@ fn worker(
         let out = job.out.clone();
         // Longest full-prefix match wins the slot; with no match, evict the least
         // recently used conversation.
-        let prompt_ids = tok.encode(&job.req.prompt, true);
+        let prompt_ids = {
+            let raw = tok.encode(&job.req.prompt, true);
+            match (&vision, job.req.images.is_empty()) {
+                (Some(v), false) => {
+                    expand_prompt(&raw, v.pad_id, v.align, &job.req.images)
+                        .map(|(ids, _)| ids)
+                        // run_job reports the error properly; match on nothing here
+                        .unwrap_or_default()
+                }
+                _ => raw,
+            }
+        };
         clock += 1;
         let slot = pool
             .iter()
@@ -395,7 +546,8 @@ fn worker(
         let (session, history, used) = &mut pool[slot];
         *used = clock;
         let outcome = run_job(
-            &model, &tok, &cfg, session, history, &mut store, can_speculate, job, &stats,
+            &model, &tok, &cfg, vision.as_ref(), session, history, &mut store, can_speculate,
+            job, &stats,
         );
         // Drop the busy flag *before* the client is told the request finished. A client
         // that polls /slots the instant it has its answer — which is exactly what the
@@ -519,7 +671,11 @@ fn run_batch(
         }
         for slot in 0..n_slots {
             if slots[slot].is_none() {
-                if let Some(j) = pending.pop_front() {
+                // Image requests only run on the single path (the batch graph
+                // has no embd input and no vision M-RoPE); leave them queued
+                // for the serve loop to pick up after this batch drains.
+                if let Some(at) = pending.iter().position(|j| j.req.images.is_empty()) {
+                    let j = pending.remove(at).unwrap();
                     admit(slot, j, &mut slots, bsession, stats);
                 }
             }
@@ -664,6 +820,7 @@ fn run_job(
     model: &Qwen35,
     tok: &codpiece_tok::Tokenizer,
     cfg: &EngineConfig,
+    vision: Option<&VisionCtx>,
     session: &mut Session,
     history: &mut Vec<u32>,
     store: &mut SessionStore,
@@ -673,7 +830,26 @@ fn run_job(
 ) -> Result<Option<Finish>, String> {
     let Job { req, out } = job;
 
-    let prompt_ids = tok.encode(&req.prompt, true);
+    let raw_ids = tok.encode(&req.prompt, true);
+    let (prompt_ids, segs) = match vision {
+        Some(v) if !req.images.is_empty() => {
+            expand_prompt(&raw_ids, v.pad_id, v.align, &req.images)
+                .map_err(|e| format!("vision: {e}"))?
+        }
+        _ => {
+            if !req.images.is_empty() {
+                return Err("images supplied but no vision tower is loaded (--mmproj)".into());
+            }
+            let n = raw_ids.len();
+            (raw_ids, vec![Seg::Text(0..n)])
+        }
+    };
+    // Prompts must end with text: the token after the last prompt position is
+    // predicted from a text step, and chat prompts always close with the
+    // assistant header. (Images produce no logits.)
+    if !matches!(segs.last(), Some(Seg::Text(_))) {
+        return Err("prompt must contain text after the last image".into());
+    }
     if prompt_ids.len() + req.max_tokens > cfg.n_ctx {
         return Err(format!(
             "prompt of {} tokens plus {} to generate exceeds the {} token context",
@@ -713,7 +889,10 @@ fn run_job(
     // sampled rounds need the distribution to verify drafts against.
     let greedy = req.params.is_greedy();
     let mut sampler = Sampler::new(req.params.clone());
-    sampler.accept_all(&prompt_ids);
+    // pseudo-ids of image spans stay out of the penalty history: llama.cpp's
+    // sampler likewise sees only the text chunks
+    let text_ids: Vec<u32> = prompt_ids.iter().copied().filter(|&t| t < 0x8000_0000).collect();
+    sampler.accept_all(&text_ids);
 
     let mut text = String::new();
     let mut emitted = 0usize; // bytes of `text` already sent
@@ -751,28 +930,65 @@ fn run_job(
     // was the entire gap against llama.cpp.
     const PREFILL_TAIL: usize = 64;
     let bulk_chunk = prefill_chunk_for(cfg.n_ctx);
+    // The fused tail draws from the FINAL text segment only — images never
+    // pass through the draft head, and the segment check above guarantees the
+    // prompt ends with text.
+    let last_text = match segs.last() {
+        Some(Seg::Text(r)) => r.clone(),
+        _ => unreachable!("checked above"),
+    };
     let split = if can_speculate {
-        prompt_ids.len().saturating_sub(PREFILL_TAIL).max(cached_n)
+        last_text
+            .end
+            .saturating_sub(PREFILL_TAIL)
+            .max(last_text.start)
+            .max(cached_n)
     } else {
         prompt_ids.len()
     };
     let mut drafts: Vec<u32> = Vec::new();
     let mut next = 0u32;
 
-    for chunk in prompt_ids[cached_n..split].chunks(bulk_chunk) {
-        let r = if greedy {
-            model.step_greedy(session, chunk, cfg.threads)
-        } else {
-            model
-                .step(session, chunk, &[(chunk.len() - 1) as i32], cfg.threads)
-                .map(|l| sampler.sample(&l))
-        };
-        match r {
-            // without a draft head this is the only source of the first token; with one
-            // it is overwritten by the speculative tail below
-            Ok(t) => next = t,
-            Err(e) => {
-                return Err(format!("prefill: {e}"));
+    for seg in &segs {
+        match seg {
+            Seg::Image { idx, start } => {
+                let v = vision.expect("image segs exist only with a vision ctx");
+                let img = &req.images[*idx];
+                if start + img.n_tokens(v.align) <= cached_n {
+                    continue; // fully inside the reused prefix
+                }
+                let (nx, ny) = img.grid(v.align);
+                let emb = v
+                    .model
+                    .encode(&img.planar, img.w as usize, img.h as usize)
+                    .map_err(|e| format!("vision encode: {e}"))?;
+                model
+                    .step_embd(session, &emb, nx, ny, cfg.threads)
+                    .map_err(|e| format!("vision inject: {e}"))?;
+            }
+            Seg::Text(r) => {
+                let lo = r.start.max(cached_n);
+                let hi = r.end.min(split);
+                if lo >= hi {
+                    continue;
+                }
+                for chunk in prompt_ids[lo..hi].chunks(bulk_chunk) {
+                    let r = if greedy {
+                        model.step_greedy(session, chunk, cfg.threads)
+                    } else {
+                        model
+                            .step(session, chunk, &[(chunk.len() - 1) as i32], cfg.threads)
+                            .map(|l| sampler.sample(&l))
+                    };
+                    match r {
+                        // without a draft head this is the only source of the first
+                        // token; with one it is overwritten by the speculative tail
+                        Ok(t) => next = t,
+                        Err(e) => {
+                            return Err(format!("prefill: {e}"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1087,7 +1303,7 @@ fn run_job(
             let base = n_keep * n_embd;
             let mut h = hidden[base..base + n_embd].to_vec();
             let mut tok_in = next;
-            let mut pos = session.n_past;
+            let mut pos = session.rope_base();
             for _ in 0..redraft_depth {
                 match model.mtp_draft(session, &h, tok_in, pos, cfg.threads) {
                     Ok((lg, hn)) => {

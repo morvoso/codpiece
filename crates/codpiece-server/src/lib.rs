@@ -22,6 +22,10 @@ pub struct ServeConfig {
     /// 0 selects adaptive depth.
     pub max_depth: usize,
     pub draft_gate: f32,
+    /// Vision tower (mmproj GGUF path); None serves text only.
+    pub mmproj: Option<String>,
+    /// CUDA ordinal for the vision tower; None runs it on the CPU.
+    pub mmproj_gpu: Option<i32>,
     pub default_max_tokens: usize,
     /// Served model id in `/v1/models` (the alias clients send as `model`).
     pub served_name: Option<String>,
@@ -39,6 +43,8 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
         depth: cfg.depth,
         max_depth: cfg.max_depth,
         draft_gate: cfg.draft_gate,
+        mmproj: cfg.mmproj.clone(),
+        mmproj_gpu: cfg.mmproj_gpu,
     })?;
 
     // A template that fails to parse is worth saying out loud rather than silently

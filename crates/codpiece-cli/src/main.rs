@@ -371,6 +371,8 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let mut serve_max_depth = 3usize;
     let mut gpu: Option<i32> = None;
     let mut tp: Option<Vec<i32>> = None;
+    let mut mmproj: Option<String> = None;
+    let mut mmproj_gpu: Option<i32> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -393,6 +395,10 @@ fn cmd_serve(args: &[String]) -> ExitCode {
                 default_max_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(512)
             }
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--mmproj" => mmproj = it.next().cloned(),
+            "--mmproj-gpu" => {
+                mmproj_gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0))
+            }
             "--tp" => {
                 tp = it.next().map(|v| {
                     v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
@@ -413,8 +419,15 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
+    // compose files cannot conditionally append flags, so the tower can also
+    // be enabled by env; empty means disabled
+    let mmproj = mmproj.or_else(|| std::env::var("CODPIECE_MMPROJ").ok().filter(|s| !s.is_empty()));
+    let mmproj_gpu = mmproj_gpu
+        .or_else(|| std::env::var("CODPIECE_MMPROJ_GPU").ok().and_then(|s| s.parse().ok()));
     match codpiece_server::run(codpiece_server::ServeConfig {
         model_path: path.to_string(),
+        mmproj,
+        mmproj_gpu,
         host,
         port,
         n_ctx,

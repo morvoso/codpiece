@@ -146,6 +146,7 @@ dependencies = [
  "codpiece-model",
  "codpiece-sample",
  "codpiece-tok",
+ "codpiece-vision",
  "minijinja",
  "minijinja-contrib",
  "serde",

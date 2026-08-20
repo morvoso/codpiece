@@ -275,6 +275,9 @@ struct Built {
     ctx: *mut ffi::ggml_context,
     gf: *mut ffi::ggml_cgraph,
     inp_tokens: *mut ffi::ggml_tensor,
+    /// raw [n_embd, t_len] input in place of the token lookup: image chunks
+    /// feed the vision tower's output here (null on token graphs)
+    inp_embd: *mut ffi::ggml_tensor,
     inp_pos: *mut ffi::ggml_tensor,
     kq_mask: *mut ffi::ggml_tensor,
     /// set_rows write positions (cached decode graphs only)
@@ -380,6 +383,13 @@ pub(crate) unsafe fn trace_mem(what: &str, galloc: ffi::ggml_gallocr_t, n_kv: i6
 pub struct Session {
     pub n_ctx_max: usize,
     pub n_past: usize,
+    /// RoPE position minus physical row position. Zero for text-only
+    /// conversations. An image chunk of nx x ny merged patches occupies
+    /// nx*ny physical rows but advances the RoPE clock by only max(nx, ny)
+    /// (the Qwen-VL rule), so every image makes this more negative by
+    /// nx*ny - max(nx, ny). All TEXT position fills add this offset; the
+    /// physical n_past keeps indexing KV rows and masks.
+    pub rope_off: i64,
     /// Recurrent-state snapshot slots: K = n_spec + 1. Slot 0 is live; slot s
     /// holds the state as of s tokens earlier. Speculative decoding advances
     /// the recurrent layers over draft tokens that may be rejected, and those
@@ -548,6 +558,7 @@ impl Session {
             Ok(Session {
                 n_ctx_max,
                 n_past: 0,
+                rope_off: 0,
                 k_slots,
                 fa,
                 tp: model.weights.is_tensor_parallel(),
@@ -628,7 +639,13 @@ impl Session {
             self.graveyard.push(c.built.ctx);
         }
         self.n_past = 0;
+        self.rope_off = 0;
         self.mtp_past = 0;
+    }
+
+    /// The RoPE position of the NEXT row: n_past shifted by the image debt.
+    pub fn rope_base(&self) -> usize {
+        (self.n_past as i64 + self.rope_off) as usize
     }
 }
 
@@ -688,6 +705,7 @@ const FUSED_CACHE: usize = 6;
 /// contiguous, which is what makes the copy a single `tensor_get` per tensor.
 pub struct SessionSnapshot {
     n_past: usize,
+    rope_off: i64,
     mtp_past: usize,
     k: Vec<Vec<u8>>,
     v: Vec<Vec<u8>>,
@@ -757,6 +775,7 @@ impl Session {
         unsafe {
             Some(SessionSnapshot {
                 n_past: self.n_past,
+                rope_off: self.rope_off,
                 mtp_past: self.mtp_past,
                 k: self
                     .k_cache
@@ -816,6 +835,7 @@ impl Session {
             }
         }
         self.n_past = snap.n_past;
+        self.rope_off = snap.rope_off;
         self.mtp_past = snap.mtp_past;
     }
 }
@@ -930,6 +950,7 @@ impl Qwen35 {
             StateSrc::Stateless,
             None,
             0,
+            0,
             out_positions,
             n_threads,
             false,
@@ -1006,6 +1027,7 @@ impl Qwen35 {
                 StateSrc::Session(view),
                 Some(galloc),
                 session.n_past,
+                session.rope_base(),
                 out_positions,
                 n_threads,
                 greedy,
@@ -1013,6 +1035,113 @@ impl Qwen35 {
         };
         session.n_past += tokens.len();
         Ok(out)
+    }
+
+    /// Inject an image chunk: `nx * ny` precomputed trunk embeddings advance
+    /// the session exactly like that many prefill tokens, but with Qwen-VL
+    /// vision M-RoPE positions — t = pos0 for the whole image, y/x walk the
+    /// merged grid — and an intra-image block-visible mask. llama.cpp keeps
+    /// causal masking on for these tokens, but it masks by comparing
+    /// POSITIONS and every image token shares t = pos0, so the image block is
+    /// mutually visible there; this row-indexed mask replicates that
+    /// explicitly. The RoPE clock advances by max(nx, ny) while n_past
+    /// advances by nx*ny — the growing gap lives in Session::rope_off and
+    /// every text-position fill adds it.
+    pub fn step_embd(
+        &self,
+        session: &mut Session,
+        embd: &[f32],
+        nx: usize,
+        ny: usize,
+        n_threads: i32,
+    ) -> Result<(), ModelError> {
+        let t = nx * ny;
+        let n_embd = self.hp.n_embd as usize;
+        if t == 0 || embd.len() != t * n_embd {
+            return Err(ModelError::Load(format!(
+                "embd chunk: {} floats for a {nx}x{ny} grid",
+                embd.len()
+            )));
+        }
+        if session.n_past + t > session.n_ctx_max {
+            return Err(ModelError::Load("context overflow".into()));
+        }
+        let pos0 = session.rope_base();
+        unsafe {
+            let n_kv_exact = session.n_past as i64 + t as i64;
+            let kvb = kv_bucket();
+            let n_kv = (((n_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
+            let built = self.build_inner(
+                t as i64,
+                n_kv,
+                &StateSrc::Session(session.view()),
+                1,
+                /* use_set_rows */ false,
+                session.n_past,
+                /* greedy */ false,
+                None,
+                SeqMode::Single,
+                /* embd_input */ true,
+            )?;
+            // odd-shaped step: the frozen decode allocation no longer holds
+            session.cached = None;
+            let galloc = session.galloc;
+            struct G(*mut ffi::ggml_context);
+            impl Drop for G {
+                fn drop(&mut self) {
+                    unsafe { ffi::ggml_free(self.0) }
+                }
+            }
+            let _guard = G(built.ctx);
+            if let Some(sched) = self.weights.sched() {
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, built.gf) {
+                    return Err(ModelError::Load("embd sched alloc".into()));
+                }
+            } else if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
+                return Err(ModelError::Load("embd graph alloc".into()));
+            }
+
+            ffi::ggml_backend_tensor_set(
+                built.inp_embd,
+                embd.as_ptr().cast(),
+                0,
+                embd.len() * 4,
+            );
+            let mut pos = vec![0i32; t * 4];
+            for i in 0..t {
+                pos[i] = pos0 as i32;
+                pos[t + i] = (pos0 + i / nx) as i32;
+                pos[2 * t + i] = (pos0 + i % nx) as i32;
+            }
+            ffi::ggml_backend_tensor_set(built.inp_pos, pos.as_ptr().cast(), 0, pos.len() * 4);
+
+            let nkv = built.n_kv as usize;
+            let vis = (session.n_past + t).min(nkv);
+            if built.fa_mask {
+                let mut mask = vec![0xFC00u16; nkv * t];
+                for q in 0..t {
+                    for kv in 0..vis {
+                        mask[q * nkv + kv] = 0;
+                    }
+                }
+                ffi::ggml_backend_tensor_set(built.kq_mask, mask.as_ptr().cast(), 0, mask.len() * 2);
+            } else {
+                let mut mask = vec![f32::NEG_INFINITY; nkv * t];
+                for q in 0..t {
+                    for kv in 0..vis {
+                        mask[q * nkv + kv] = 0.0;
+                    }
+                }
+                ffi::ggml_backend_tensor_set(built.kq_mask, mask.as_ptr().cast(), 0, mask.len() * 4);
+            }
+            let out_ids = [(t - 1) as i32];
+            ffi::ggml_backend_tensor_set(built.out_ids, out_ids.as_ptr().cast(), 0, 4);
+            self.compute(built.gf, n_threads)?;
+        }
+        session.n_past += t;
+        session.rope_off += nx.max(ny) as i64 - t as i64;
+        Ok(())
     }
 
     /// One-shot path: build graph, allocate (scratch or throwaway), fill,
@@ -1023,6 +1152,7 @@ impl Qwen35 {
         state: StateSrc,
         galloc: Option<ffi::ggml_gallocr_t>,
         n_past: usize,
+        rope_base: usize,
         out_positions: &[i32],
         n_threads: i32,
         greedy: bool,
@@ -1073,7 +1203,7 @@ impl Qwen35 {
                     return Err(ModelError::Load("graph alloc failed".into()));
                 }
             }
-            self.fill_inputs(&built, tokens, n_past, out_positions);
+            self.fill_inputs(&built, tokens, n_past, rope_base, out_positions);
             self.compute(built.gf, n_threads)?;
             Ok(self.read_out(&built, out_positions.len()))
         }
@@ -1252,7 +1382,7 @@ impl Qwen35 {
             } else if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
                 return Err(ModelError::Load("graph alloc".into()));
             }
-            self.fill_inputs(&built, tokens, session.n_past, out_positions);
+            self.fill_inputs(&built, tokens, session.n_past, session.rope_base(), out_positions);
             self.compute(built.gf, n_threads)?;
             let n_out = out_positions.len();
             let mut logits = vec![0f32; self.hp.n_vocab as usize * n_out];
@@ -1348,7 +1478,7 @@ impl Qwen35 {
             } else if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
                 return Err(ModelError::Load("graph alloc".into()));
             }
-            self.fill_inputs(&built, tokens, session.n_past, &out_positions);
+            self.fill_inputs(&built, tokens, session.n_past, session.rope_base(), &out_positions);
             self.compute(built.gf, n_threads)?;
 
             let n_out = out_positions.len();
@@ -1478,6 +1608,7 @@ impl Qwen35 {
                         /* greedy */ true,
                         Some(tail),
                         SeqMode::Single,
+                        false,
                     )?;
                     let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                         self.weights.backend(),
@@ -1517,13 +1648,13 @@ impl Qwen35 {
             let first_out = t - no;
 
             let out_positions: Vec<i32> = (first_out..t).map(|i| i as i32).collect();
-            self.fill_inputs(b, tokens, session.n_past, &out_positions);
+            self.fill_inputs(b, tokens, session.n_past, session.rope_base(), &out_positions);
             let rows: Vec<i64> = (0..t).map(|i| (session.n_past + i) as i64).collect();
             ffi::ggml_backend_tensor_set(b.row_ids, rows.as_ptr().cast(), 0, t * 8);
 
             let mut mpos = vec![0i32; no * 4];
             for i in 0..no {
-                let p = (session.n_past + first_out + i + 1) as i32;
+                let p = (session.rope_base() + first_out + i + 1) as i32;
                 mpos[i] = p;
                 mpos[no + i] = p;
                 mpos[2 * no + i] = p;
@@ -1675,12 +1806,12 @@ impl Qwen35 {
             } else if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
                 return Err(ModelError::Load("graph alloc".into()));
             }
-            self.fill_inputs(&built, tokens, session.n_past, &out_positions);
+            self.fill_inputs(&built, tokens, session.n_past, session.rope_base(), &out_positions);
 
             // the draft head's own positions and causal window
             let mut mpos = vec![0i32; n_out * 4];
             for i in 0..n_out {
-                let p = (session.n_past + i + 1) as i32;
+                let p = (session.rope_base() + i + 1) as i32;
                 mpos[i] = p;
                 mpos[n_out + i] = p;
                 mpos[2 * n_out + i] = p;
@@ -1946,6 +2077,7 @@ impl Qwen35 {
                     greedy,
                     None,
                     SeqMode::Single,
+                    false,
                 )?;
                 let galloc = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                     self.weights.backend(),
@@ -1974,6 +2106,7 @@ impl Qwen35 {
             }
         }
         let n_past = session.n_past;
+        let rope_off = session.rope_off;
         let cached = session.cached.as_mut().unwrap();
         unsafe {
             let backend = self.weights.backend();
@@ -1993,7 +2126,7 @@ impl Qwen35 {
             );
 
             for i in 0..t {
-                let p = (n_past + i) as i32;
+                let p = (n_past as i64 + i as i64 + rope_off) as i32;
                 h.pos[i] = p;
                 h.pos[t + i] = p;
                 h.pos[2 * t + i] = p;
@@ -2072,6 +2205,7 @@ impl Qwen35 {
         };
         self.build_inner(
             t_len, n_kv, state, n_out, use_set_rows, n_past, greedy, mtp_tail, SeqMode::Single,
+            false,
         )
     }
 
@@ -2089,6 +2223,7 @@ impl Qwen35 {
         greedy: bool,
         mtp_tail: Option<MtpTail>,
         seq: SeqMode,
+        embd_input: bool,
     ) -> Result<Built, ModelError> {
         let hp = &self.hp;
 
@@ -2118,8 +2253,18 @@ impl Qwen35 {
         let f32t = ffi::ggml_type_GGML_TYPE_F32;
 
         // ---- inputs ----
-        let inp_tokens = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I32, t_len);
-        ffi::ggml_set_input(inp_tokens);
+        // Exactly one of inp_tokens / inp_embd exists: a tensor created but
+        // absent from the graph would never be allocated, and writing to it
+        // would fault, so the unused one stays null.
+        let (inp_tokens, inp_embd) = if embd_input {
+            let e = ffi::ggml_new_tensor_2d(ctx, f32t, hp.n_embd, t_len);
+            ffi::ggml_set_input(e);
+            (std::ptr::null_mut::<ffi::ggml_tensor>(), e)
+        } else {
+            let tk = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I32, t_len);
+            ffi::ggml_set_input(tk);
+            (tk, std::ptr::null_mut::<ffi::ggml_tensor>())
+        };
         let inp_pos = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I32, t_len * 4);
         ffi::ggml_set_input(inp_pos);
         let use_fa = matches!(state, StateSrc::Session(s) if s.fa) && !dbg_attn_batch;
@@ -2163,7 +2308,11 @@ impl Qwen35 {
         // ---- trunk ----
         let tok_embd = self.t("token_embd.weight")?;
         let mut cur;
-        let mut inp_l = ffi::ggml_get_rows(ctx, tok_embd, inp_tokens);
+        let mut inp_l = if embd_input {
+            inp_embd
+        } else {
+            ffi::ggml_get_rows(ctx, tok_embd, inp_tokens)
+        };
 
         let elt = ffi::ggml_type_size(f32t);
         let row = |n: i64| ffi::ggml_row_size(f32t, n);
@@ -2566,6 +2715,7 @@ impl Qwen35 {
             ctx,
             gf,
             inp_tokens,
+            inp_embd,
             inp_pos,
             kq_mask,
             row_ids,
@@ -2901,6 +3051,7 @@ pub(crate) unsafe fn build_attn_block(
                 /* greedy */ !want_logits,
                 None,
                 SeqMode::Slot(slot as i64),
+                false,
             )?;
             struct G(*mut ffi::ggml_context);
             impl Drop for G {
@@ -2982,6 +3133,7 @@ pub(crate) unsafe fn build_attn_block(
                     /* greedy */ !want_logits,
                     None,
                     SeqMode::Batched,
+                    false,
                 )?;
                 let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                     self.weights.backend(),
@@ -3083,13 +3235,23 @@ pub(crate) unsafe fn build_attn_block(
         );
     }
 
-    unsafe fn fill_inputs(&self, b: &Built, tokens: &[u32], n_past: usize, out_positions: &[i32]) {
+    /// `n_past` indexes physical KV rows (mask visibility); `rope_base` is
+    /// the RoPE position of the first token — they differ once an image has
+    /// been injected (see Session::rope_off).
+    unsafe fn fill_inputs(
+        &self,
+        b: &Built,
+        tokens: &[u32],
+        n_past: usize,
+        rope_base: usize,
+        out_positions: &[i32],
+    ) {
         let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         ffi::ggml_backend_tensor_set(b.inp_tokens, toks_i32.as_ptr().cast(), 0, tokens.len() * 4);
 
         let mut pos = vec![0i32; tokens.len() * 4];
         for i in 0..tokens.len() {
-            let p = (n_past + i) as i32;
+            let p = (rope_base + i) as i32;
             pos[i] = p;
             pos[tokens.len() + i] = p;
             pos[2 * tokens.len() + i] = p;
