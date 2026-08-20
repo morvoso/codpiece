@@ -24,10 +24,18 @@ docker run -d --name tandem-ref-server --runtime nvidia \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75 --jinja \
   >/dev/null 2>&1
 
+# Give up early if the container died: waiting out the full timeout for a
+# crashed server holds the bench window (and therefore production) down for
+# no reason.
 ready=0
-for _ in $(seq 1 150); do
+for _ in $(seq 1 100); do
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:8031/health || true)
     if [ "$code" = "200" ]; then ready=1; break; fi
+    if ! docker ps --format '{{.Names}}' | grep -qx tandem-ref-server; then
+        echo "  reference server exited during startup:"
+        docker logs tandem-ref-server 2>&1 | grep -iE "error|abort|assert" | head -4
+        break
+    fi
     sleep 3
 done
 if [ "$ready" != "1" ]; then
