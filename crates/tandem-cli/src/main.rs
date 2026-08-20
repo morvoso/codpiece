@@ -23,6 +23,7 @@ fn main() -> ExitCode {
         Some("ppl") => cmd_ppl(&args[1..]),
         Some("selftest") => cmd_selftest(&args[1..]),
         Some("mtp-probe") => cmd_mtp_probe(&args[1..]),
+        Some("spec") => cmd_spec(&args[1..]),
         _ => {
             eprintln!(
                 "usage: tandem inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
@@ -32,6 +33,191 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Speculative greedy generation with the MTP draft head.
+///
+/// Each round: draft `n_spec` tokens from the MTP head (cheap — one block,
+/// not 64 layers), then verify all of them in ONE trunk pass. Verification
+/// costs about what a single decode step costs, because decode is
+/// memory-bandwidth-bound: the weights are read once regardless of how many
+/// tokens ride along. Accepted drafts are therefore nearly free.
+///
+/// This is lossless: a draft is kept only when it equals what the trunk
+/// would have produced anyway, so `spec` output must match `gen` exactly.
+/// Rejected drafts leave the 48 recurrent layers over-advanced, which is
+/// what `rollback_recurrent` undoes via the snapshot slots.
+fn cmd_spec(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut prompt = String::from("The capital of France is");
+    let mut n_gen = 64usize;
+    let mut threads = 8i32;
+    let mut n_ctx = 4096usize;
+    let mut n_spec = 1usize;
+    let mut gpu: Option<i32> = None;
+    let mut tp: Option<Vec<i32>> = None;
+    let mut ignore_eos = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-p" => prompt = it.next().cloned().unwrap_or_default(),
+            "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(64),
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
+            "--spec" => n_spec = it.next().and_then(|s| s.parse().ok()).unwrap_or(1),
+            "--ignore-eos" => ignore_eos = true,
+            "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            _ => {}
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: tandem spec <file.gguf> [-p prompt] [-n N] [--spec K] [--gpu N|--tp 0,1]");
+        return ExitCode::from(2);
+    };
+    let dev = match (&tp, gpu) {
+        (Some(ids), _) => tandem_model::Device::CudaTensorParallel(ids.clone()),
+        (None, Some(i)) => tandem_model::Device::Cuda(i),
+        (None, None) => tandem_model::Device::Cpu,
+    };
+    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), dev) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("spec: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
+    let mut session =
+        match tandem_model::qwen35::Session::new_spec(&model, n_ctx, n_spec) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("spec: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let prompt_ids = tok.encode(&prompt, true);
+    let t0 = std::time::Instant::now();
+    let (mut logits, mut hidden) = match model.step_with_hidden(
+        &mut session,
+        &prompt_ids,
+        &[(prompt_ids.len() - 1) as i32],
+        threads,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("prefill: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let t_prefill = t0.elapsed().as_secs_f64();
+    let n_vocab = model.hp.n_vocab as usize;
+
+    let mut committed: Vec<u32> = vec![tandem_model::qwen35::argmax(&logits)];
+    let (mut accepted, mut proposed, mut rounds) = (0usize, 0usize, 0usize);
+    let t1 = std::time::Instant::now();
+
+    'outer: while committed.len() < n_gen {
+        let last = *committed.last().unwrap();
+        if !ignore_eos && Some(last) == tok.eos {
+            break;
+        }
+        // ---- draft ----
+        let mut drafts: Vec<u32> = Vec::with_capacity(n_spec);
+        let mut h = hidden.clone();
+        let mut tok_in = last;
+        let mut pos = session.n_past;
+        for _ in 0..n_spec {
+            match model.mtp_draft(&mut session, &h, tok_in, pos, threads) {
+                Ok((dl, dh)) => {
+                    let d = tandem_model::qwen35::argmax(&dl);
+                    drafts.push(d);
+                    tok_in = d;
+                    pos += 1;
+                    h = dh; // chain from the draft head's own hidden
+                }
+                Err(e) => {
+                    eprintln!("draft: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+
+        // ---- verify: last token + all drafts in one trunk pass ----
+        let mut batch = vec![last];
+        batch.extend_from_slice(&drafts);
+        let outs: Vec<i32> = (0..batch.len() as i32).collect();
+        let (vl, vh) = match model.step_with_hidden(&mut session, &batch, &outs, threads) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("verify: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        rounds += 1;
+        proposed += drafts.len();
+
+        // position i predicts token i+1; keep drafts while they match
+        let mut n_keep = 0usize;
+        for (i, d) in drafts.iter().enumerate() {
+            let truth = tandem_model::qwen35::argmax(&vl[i * n_vocab..(i + 1) * n_vocab]);
+            if truth == *d {
+                n_keep += 1;
+            } else {
+                break;
+            }
+        }
+        accepted += n_keep;
+
+        // commit accepted drafts plus the token the trunk itself produced.
+        // An accepted draft can be EOS, and nothing may follow it.
+        for d in drafts.iter().take(n_keep) {
+            committed.push(*d);
+            if committed.len() >= n_gen || (!ignore_eos && Some(*d) == tok.eos) {
+                break 'outer;
+            }
+        }
+        let next = tandem_model::qwen35::argmax(&vl[n_keep * n_vocab..(n_keep + 1) * n_vocab]);
+        committed.push(next);
+        hidden = vh[n_keep * model.hp.n_embd as usize..(n_keep + 1) * model.hp.n_embd as usize]
+            .to_vec();
+
+        // undo the over-advance from rejected drafts
+        let extra = drafts.len() - n_keep;
+        if extra > 0 {
+            if let Err(e) = model.rollback_recurrent(&mut session, extra, threads) {
+                eprintln!("rollback: {e}");
+                return ExitCode::FAILURE;
+            }
+            session.n_past -= extra;
+            session.mtp_past -= extra;
+        }
+        let _ = logits;
+        logits = vl;
+    }
+    let t_decode = t1.elapsed().as_secs_f64();
+
+    println!("{}", tok.decode(&committed, true));
+    let rate = if proposed == 0 { 0.0 } else { accepted as f64 / proposed as f64 };
+    eprintln!(
+        "prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s) | \
+         spec {n_spec}: acceptance {accepted}/{proposed} = {rate:.3}, {rounds} rounds, \
+         {:.2} tok/round",
+        prompt_ids.len(),
+        t_prefill,
+        prompt_ids.len() as f64 / t_prefill,
+        committed.len(),
+        t_decode,
+        committed.len() as f64 / t_decode,
+        committed.len() as f64 / rounds.max(1) as f64,
+    );
+    ExitCode::SUCCESS
 }
 
 /// MTP acceptance probe: run a normal greedy decode, and at each step ask
@@ -117,7 +303,7 @@ fn cmd_mtp_probe(args: &[String]) -> ExitCode {
         // draft the token after `next`, from this position's hidden state
         let pos = session.n_past; // position `next` will occupy
         match model.mtp_draft(&mut session, &hidden, next, pos, threads) {
-            Ok(dl) => drafted = Some(tandem_model::qwen35::argmax(&dl)),
+            Ok((dl, _)) => drafted = Some(tandem_model::qwen35::argmax(&dl)),
             Err(e) => {
                 eprintln!("mtp draft step {i}: {e}");
                 return ExitCode::FAILURE;

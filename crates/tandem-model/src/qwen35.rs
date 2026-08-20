@@ -183,6 +183,7 @@ pub(crate) struct Layer {
 /// building never holds a Rust borrow of the Session itself.
 #[derive(Clone)]
 struct SessView {
+    k_slots: i64,
     k_cache: Vec<*mut ffi::ggml_tensor>,
     v_cache: Vec<*mut ffi::ggml_tensor>,
     conv_state: Vec<*mut ffi::ggml_tensor>,
@@ -286,6 +287,11 @@ impl Drop for CachedStep {
 pub struct Session {
     pub n_ctx_max: usize,
     pub n_past: usize,
+    /// Recurrent-state snapshot slots: K = n_spec + 1. Slot 0 is live; slot s
+    /// holds the state as of s tokens earlier. Speculative decoding advances
+    /// the recurrent layers over draft tokens that may be rejected, and those
+    /// layers cannot be run backwards — the snapshots ARE the undo.
+    pub k_slots: i64,
     /// flash-attention path (untransposed V cache); TANDEM_NO_FA=1 disables
     pub fa: bool,
     ctx: *mut ffi::ggml_context,
@@ -306,8 +312,18 @@ pub struct Session {
 
 impl Session {
     pub fn new(model: &Qwen35, n_ctx_max: usize) -> Result<Session, ModelError> {
+        Self::new_spec(model, n_ctx_max, 0)
+    }
+
+    /// `n_spec` = how many draft tokens a verify step may need to undo.
+    pub fn new_spec(
+        model: &Qwen35,
+        n_ctx_max: usize,
+        n_spec: usize,
+    ) -> Result<Session, ModelError> {
         let hp = &model.hp;
         let fa = std::env::var("TANDEM_NO_FA").is_err();
+        let k_slots = (n_spec + 1) as i64;
         unsafe {
             let params = ffi::ggml_init_params {
                 mem_size: (hp.n_layer * 4 + 8) * ffi::ggml_tensor_overhead(),
@@ -334,10 +350,11 @@ impl Session {
             };
             for il in 0..hp.n_layer {
                 if hp.is_recurrent(il) {
-                    conv_state[il] =
-                        ffi::ggml_new_tensor_2d(ctx, f32t, hp.d_conv - 1, hp.conv_dim());
-                    gdn_state[il] = ffi::ggml_new_tensor_3d(
-                        ctx, f32t, hp.gdn_head_v(), hp.gdn_head_v(), hp.n_v_heads,
+                    conv_state[il] = ffi::ggml_new_tensor_3d(
+                        ctx, f32t, hp.d_conv - 1, hp.conv_dim(), k_slots,
+                    );
+                    gdn_state[il] = ffi::ggml_new_tensor_4d(
+                        ctx, f32t, hp.gdn_head_v(), hp.gdn_head_v(), hp.n_v_heads, k_slots,
                     );
                     name_it(conv_state[il], format!("cache_conv_l{il}"));
                     name_it(gdn_state[il], format!("cache_gdn_l{il}"));
@@ -394,6 +411,7 @@ impl Session {
             Ok(Session {
                 n_ctx_max,
                 n_past: 0,
+                k_slots,
                 fa,
                 ctx,
                 buffer,
@@ -412,6 +430,7 @@ impl Session {
 
     fn view(&self) -> SessView {
         SessView {
+            k_slots: self.k_slots,
             k_cache: self.k_cache.clone(),
             v_cache: self.v_cache.clone(),
             conv_state: self.conv_state.clone(),
@@ -674,6 +693,69 @@ impl Qwen35 {
         }
     }
 
+    /// Undo `n` tokens of recurrent-state advance by promoting snapshot slot
+    /// `n` to slot 0. KV/attention needs no undo — rewinding `n_past` is
+    /// enough, since stale entries are simply overwritten.
+    pub fn rollback_recurrent(
+        &self,
+        session: &mut Session,
+        n: usize,
+        n_threads: i32,
+    ) -> Result<(), ModelError> {
+        if n == 0 {
+            return Ok(());
+        }
+        if n as i64 >= session.k_slots {
+            return Err(ModelError::Load(format!(
+                "rollback of {n} exceeds {} snapshot slots",
+                session.k_slots
+            )));
+        }
+        let hp = &self.hp;
+        unsafe {
+            let params = ffi::ggml_init_params {
+                mem_size: (hp.n_layer * 6 + 16) * ffi::ggml_tensor_overhead()
+                    + ffi::ggml_graph_overhead(),
+                mem_buffer: std::ptr::null_mut(),
+                no_alloc: true,
+            };
+            let ctx = ffi::ggml_init(params);
+            if ctx.is_null() {
+                return Err(ModelError::Load("rollback ctx".into()));
+            }
+            struct G(*mut ffi::ggml_context);
+            impl Drop for G {
+                fn drop(&mut self) {
+                    unsafe { ffi::ggml_free(self.0) }
+                }
+            }
+            let _g = G(ctx);
+            let gf = ffi::ggml_new_graph_custom(ctx, (hp.n_layer * 4 + 16) as usize, false);
+            for il in 0..hp.n_layer {
+                if !hp.is_recurrent(il) {
+                    continue;
+                }
+                for t in [session.conv_state[il], session.gdn_state[il]] {
+                    let slot_nb = if (*t).ne[3] > 1 { (*t).nb[3] } else { (*t).nb[2] };
+                    let elems = ffi::ggml_nelements(t) / session.k_slots;
+                    let src = ffi::ggml_view_1d(ctx, t, elems, n * slot_nb);
+                    let dst = ffi::ggml_view_1d(ctx, t, elems, 0);
+                    ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, src, dst));
+                }
+            }
+            if let Some(sched) = self.weights.sched() {
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, gf) {
+                    return Err(ModelError::Load("rollback sched alloc".into()));
+                }
+            } else if !ffi::ggml_gallocr_alloc_graph(session.galloc, gf) {
+                return Err(ModelError::Load("rollback alloc".into()));
+            }
+            self.compute(gf, n_threads)?;
+        }
+        Ok(())
+    }
+
     /// Trunk step that also returns the pre-LM-head hidden state, which the
     /// MTP draft head consumes. Same graph as `step` — the hidden was always
     /// computed, it just was not readable before.
@@ -741,7 +823,7 @@ impl Qwen35 {
         token: u32,
         pos: usize,
         n_threads: i32,
-    ) -> Result<Vec<f32>, ModelError> {
+    ) -> Result<(Vec<f32>, Vec<f32>), ModelError> {
         let n_kv_exact = (session.mtp_past + 1) as i64;
         let kvb = kv_bucket();
         let n_kv = (((n_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
@@ -795,8 +877,13 @@ impl Qwen35 {
             self.compute(g.gf, n_threads)?;
             let mut logits = vec![0f32; self.hp.n_vocab as usize];
             ffi::ggml_backend_tensor_get(g.out, logits.as_mut_ptr().cast(), 0, logits.len() * 4);
+            // the draft head's own hidden: chained drafts must consume this,
+            // not the trunk's, or every draft past the first is predicted
+            // from a stale state (measured: acceptance 0.40 vs 0.72 at depth 3)
+            let mut h = vec![0f32; self.hp.n_embd as usize];
+            ffi::ggml_backend_tensor_get(g.h_out, h.as_mut_ptr().cast(), 0, h.len() * 4);
             session.mtp_past += 1;
-            Ok(logits)
+            Ok((logits, h))
         }
     }
 
@@ -1044,11 +1131,15 @@ impl Qwen35 {
                     StateSrc::Stateless => (conv_zero, state_zero),
                     StateSrc::Session(_) if dbg_gdn_zero => (conv_zero, state_zero),
                     StateSrc::Session(s) => {
-                        let c3 = ffi::ggml_reshape_3d(
+                        // slot 0 is the live state
+                        let c3 = ffi::ggml_view_3d(
                             ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), 1,
+                            (*s.conv_state[il]).nb[1], (*s.conv_state[il]).nb[2], 0,
                         );
-                        let s4 = ffi::ggml_reshape_4d(
+                        let s4 = ffi::ggml_view_4d(
                             ctx, s.gdn_state[il], head_v, head_v, hp.n_v_heads, 1,
+                            (*s.gdn_state[il]).nb[1], (*s.gdn_state[il]).nb[2],
+                            (*s.gdn_state[il]).nb[3], 0,
                         );
                         (c3, s4)
                     }
@@ -1058,16 +1149,26 @@ impl Qwen35 {
                 let conv_input = ffi::ggml_concat(ctx, conv_in_state, qkv_t, 0);
 
                 if let (StateSrc::Session(s), false) = (state, dbg_no_writes || dbg_gdn_zero) {
-                    let tail = ffi::ggml_view_3d(
-                        ctx, conv_input,
-                        hp.d_conv - 1, hp.conv_dim(), 1,
-                        (*conv_input).nb[1], (*conv_input).nb[2],
-                        row(t_len),
-                    );
-                    let dst = ffi::ggml_reshape_3d(
-                        ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), 1,
-                    );
-                    ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, tail, dst));
+                    // Snapshot slot s = the conv window ending s tokens back.
+                    let n_written = s.k_slots.min(t_len);
+                    for slot in 0..n_written {
+                        let idx = (*conv_input).ne[0] - (hp.d_conv - 1) - slot;
+                        if idx < 0 {
+                            break;
+                        }
+                        let tail = ffi::ggml_view_3d(
+                            ctx, conv_input,
+                            hp.d_conv - 1, hp.conv_dim(), 1,
+                            (*conv_input).nb[1], (*conv_input).nb[2],
+                            row(idx),
+                        );
+                        let dst = ffi::ggml_view_3d(
+                            ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), 1,
+                            (*s.conv_state[il]).nb[1], (*s.conv_state[il]).nb[2],
+                            slot as usize * (*s.conv_state[il]).nb[2],
+                        );
+                        ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, tail, dst));
+                    }
                 }
 
                 let conv_out = ffi::ggml_ssm_conv(ctx, conv_input, as_f32(ctx, l.conv1d));
@@ -1096,7 +1197,12 @@ impl Qwen35 {
                 let k = ffi::ggml_l2_norm(ctx, k, hp.rms_eps);
                 let v = ffi::ggml_cont(ctx, v);
 
-                let gdn = ffi::ggml_gated_delta_net(ctx, q, k, v, g, beta, gdn_in_state, 1);
+                let k_snap = match state {
+                    StateSrc::Session(s) => s.k_slots,
+                    StateSrc::Stateless => 1,
+                };
+                let gdn =
+                    ffi::ggml_gated_delta_net(ctx, q, k, v, g, beta, gdn_in_state, k_snap);
 
                 let out = ffi::ggml_view_4d(
                     ctx, gdn,
@@ -1106,17 +1212,21 @@ impl Qwen35 {
                 );
 
                 if let (StateSrc::Session(s), false) = (state, dbg_no_writes || dbg_gdn_zero) {
-                    let new_state = ffi::ggml_view_4d(
-                        ctx, gdn,
-                        head_v, head_v, hp.n_v_heads, 1,
-                        row(head_v), row(head_v * head_v),
-                        row(head_v * head_v * hp.n_v_heads),
+                    // The op packs K state snapshots after the attention rows,
+                    // most recent first; copy the written ones into the
+                    // session's matching slots.
+                    let d = head_v * head_v * hp.n_v_heads;
+                    let n_written = s.k_slots.min(t_len);
+                    let src = ffi::ggml_view_3d(
+                        ctx, gdn, d, 1, n_written,
+                        row(d), row(d),
                         row(head_v * hp.n_v_heads * t_len),
                     );
-                    let dst = ffi::ggml_reshape_4d(
-                        ctx, s.gdn_state[il], head_v, head_v, hp.n_v_heads, 1,
+                    let dst = ffi::ggml_view_3d(
+                        ctx, s.gdn_state[il], d, 1, n_written,
+                        row(d), row(d), 0,
                     );
-                    ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, new_state, dst));
+                    ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, src, dst));
                 }
 
                 let z4 = ffi::ggml_reshape_4d(ctx, z, head_v, hp.n_v_heads, t_len, 1);

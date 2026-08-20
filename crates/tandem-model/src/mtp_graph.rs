@@ -33,6 +33,8 @@ pub struct MtpGraph {
     pub kq_mask: *mut ffi::ggml_tensor,
     pub out_ids: *mut ffi::ggml_tensor,
     pub out: *mut ffi::ggml_tensor,
+    /// the draft head's own pre-LM-head hidden, which chained drafts consume
+    pub h_out: *mut ffi::ggml_tensor,
     pub n_kv: i64,
     pub t_len: i64,
     pub fa_mask: bool,
@@ -170,7 +172,10 @@ impl Qwen35 {
             .shared_head_norm
             .unwrap_or(self.t_pub("output_norm.weight")?);
         cur = rms(cur, head_norm);
-        cur = ffi::ggml_get_rows(ctx, cur, out_ids);
+        let h_out = ffi::ggml_get_rows(ctx, cur, out_ids);
+        ffi::ggml_set_output(h_out);
+        ffi::ggml_build_forward_expand(gf, h_out);
+        cur = h_out;
         let head_w = match x.shared_head_head {
             Some(w) => w,
             None => self
@@ -191,6 +196,7 @@ impl Qwen35 {
             kq_mask,
             out_ids,
             out: cur,
+            h_out,
             n_kv,
             t_len,
             fa_mask: fa,
