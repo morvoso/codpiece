@@ -115,10 +115,13 @@ Staged deliberately:
 - [ ] M3d — placement fixes: session KV/state tensors on their layer's
       device (today they all sit on device 0, doubling bus traffic for the
       second half of the stack), cached decode graph under the scheduler
-- [ ] M3e — tensor parallel (`split.rs` classification + meta device), which
-      is what prod's `-sm tensor` uses and what makes single-stream decode
-      competitive. All-reduce must assume PCIe host-bounce forever: the user
-      confirmed there is no NVLink bridge on this machine.
+- [x] **M3e — tensor parallel DONE**: `Device::CudaTensorParallel` over
+      ggml's meta device, tandem supplying the split classification.
+      **27B decode 39.9 tok/s vs llama.cpp's prod config 40.4 (98.8 %),
+      output identical.** 2.1× the layer-split path.
+- [ ] M3d — remaining placement work: session KV/state per device under the
+      layer-split path (TP handles this itself), cached decode graph reuse
+      measurements under TP.
 
 **Gate:** temp-0 parity vs prod build on 3 prompts (short, 8K, 27K) AND
 decode within 10% of llama.cpp-no-MTP baseline (~39 tok/s np1) at d0.
