@@ -28,7 +28,8 @@ tandem_gen() { # $1 = raw prompt
 $1<|im_end|>
 <|im_start|>assistant
 "
-  nice -n 19 "$TANDEM" run "$MODEL" -p "$wrapped" -n "$N" -t 8 2>/dev/null \
+  # TANDEM_SUBCMD=run (stateless reference) or gen (session/engine path)
+  nice -n 19 "$TANDEM" "${TANDEM_SUBCMD:-run}" "$MODEL" -p "$wrapped" -n "$N" -t 8 2>/dev/null \
   | sed -e 's/<|im_end|>//'
 }
 

@@ -19,7 +19,9 @@ fn main() -> ExitCode {
         Some("tokenize") => cmd_tokenize(&args[1..]),
         Some("load") => cmd_load(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
+        Some("gen") => cmd_gen(&args[1..]),
         Some("ppl") => cmd_ppl(&args[1..]),
+        Some("selftest") => cmd_selftest(&args[1..]),
         _ => {
             eprintln!(
                 "usage: tandem inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
@@ -29,6 +31,179 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Numeric self-test: stateless forward vs session path on the same tokens.
+/// Case A: whole prompt as one session prefill. Case B: prompt split so the
+/// last token goes through the single-token decode path. Reports max |Δlogit|
+/// and per-path argmax — localizes cache/state bugs without an oracle.
+fn cmd_selftest(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut prompt = String::from("The quick brown fox jumps over the lazy dog. The capital of France is");
+    let mut threads = 8i32;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-p" => prompt = it.next().cloned().unwrap_or_default(),
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            _ => {}
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: tandem selftest <file.gguf> [-p prompt]");
+        return ExitCode::from(2);
+    };
+    let model = tandem_model::qwen35::Qwen35::load(Path::new(path)).expect("load");
+    let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
+    let ids = tok.encode(&prompt, true);
+    eprintln!("{} prompt tokens", ids.len());
+
+    let report = |name: &str, a: &[f32], b: &[f32]| {
+        let maxd = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        let (aa, ab) = (
+            tandem_model::qwen35::argmax(a),
+            tandem_model::qwen35::argmax(b),
+        );
+        println!(
+            "{name}: max|Δ| = {maxd:.6}, argmax {} vs {} ({})",
+            aa,
+            ab,
+            if aa == ab { "MATCH" } else { "MISMATCH" }
+        );
+    };
+
+    let reference = model.forward_logits(&ids, threads).expect("stateless");
+
+    // Case A: full-prompt prefill through the session path
+    let mut s = tandem_model::qwen35::Session::new(&model, 4096).expect("session");
+    let a = model
+        .step(&mut s, &ids, &[(ids.len() - 1) as i32], threads)
+        .expect("prefill");
+    report("A prefill(all)      vs stateless", &a, &reference);
+
+    // Case B: prefill(n-1) then decode(1)
+    let mut s2 = tandem_model::qwen35::Session::new(&model, 4096).expect("session");
+    let (head, tail) = ids.split_at(ids.len() - 1);
+    model
+        .step(&mut s2, head, &[(head.len() - 1) as i32], threads)
+        .expect("prefill head");
+    let b = model.step(&mut s2, tail, &[0], threads).expect("decode 1");
+    report("B prefill+decode(1) vs stateless", &b, &reference);
+
+    // Case C: token-by-token decode of the whole prompt
+    let mut s3 = tandem_model::qwen35::Session::new(&model, 4096).expect("session");
+    let mut c = Vec::new();
+    for t in &ids {
+        c = model.step(&mut s3, &[*t], &[0], threads).expect("decode all");
+    }
+    report("C decode-only       vs stateless", &c, &reference);
+    ExitCode::SUCCESS
+}
+
+/// Stateful greedy generation: prefill once, then O(1)-per-token decode via
+/// Session (KV cache + carried recurrent states). The engine path.
+fn cmd_gen(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut prompt = String::from("The capital of France is");
+    let mut n_gen = 16usize;
+    let mut threads = 8i32;
+    let mut n_ctx = 4096usize;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-p" => prompt = it.next().cloned().unwrap_or_default(),
+            "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(16),
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            s => {
+                eprintln!("unknown arg: {s}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: tandem gen <file.gguf> [-p prompt] [-n tokens] [-t threads] [-c n_ctx]");
+        return ExitCode::from(2);
+    };
+
+    let model = match tandem_model::qwen35::Qwen35::load(Path::new(path)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("tandem gen: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = match tandem_tok::Tokenizer::from_gguf(&model.weights.gguf) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tandem gen: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut session = match tandem_model::qwen35::Session::new(&model, n_ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("tandem gen: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let prompt_ids = tok.encode(&prompt, true);
+    eprintln!("prompt: {} tokens", prompt_ids.len());
+
+    // prefill (single ubatch; chunk if longer than 512)
+    let t0 = std::time::Instant::now();
+    let mut last_logits: Vec<f32> = Vec::new();
+    for chunk in prompt_ids.chunks(512) {
+        let out_pos = [(chunk.len() - 1) as i32];
+        last_logits = match model.step(&mut session, chunk, &out_pos, threads) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("prefill: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    }
+    let t_prefill = t0.elapsed().as_secs_f64();
+
+    // decode
+    let t1 = std::time::Instant::now();
+    let mut gen_ids: Vec<u32> = Vec::with_capacity(n_gen);
+    let mut next = tandem_model::qwen35::argmax(&last_logits);
+    gen_ids.push(next);
+    for _ in 1..n_gen {
+        if Some(next) == tok.eos {
+            break;
+        }
+        let logits = match model.step(&mut session, &[next], &[0], threads) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("decode: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        next = tandem_model::qwen35::argmax(&logits);
+        gen_ids.push(next);
+    }
+    let t_decode = t1.elapsed().as_secs_f64();
+
+    println!("{}", tok.decode(&gen_ids, true));
+    eprintln!(
+        "prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s)",
+        prompt_ids.len(),
+        t_prefill,
+        prompt_ids.len() as f64 / t_prefill,
+        gen_ids.len(),
+        t_decode,
+        gen_ids.len() as f64 / t_decode,
+    );
+    ExitCode::SUCCESS
 }
 
 /// Perplexity over a text file, mirroring llama-perplexity's methodology
