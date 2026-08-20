@@ -200,11 +200,15 @@ impl Session {
                         ctx, f32t, hp.gdn_head_v(), hp.gdn_head_v(), hp.n_v_heads,
                     );
                 } else {
+                    // f16 KV, like production llama.cpp: the f32 cache variant
+                    // hit undertested CUDA kernel paths (V read/write) and is
+                    // not what any accuracy claim was validated on anyway.
+                    let f16t = ffi::ggml_type_GGML_TYPE_F16;
                     k_cache[il] = ffi::ggml_new_tensor_2d(
-                        ctx, f32t, hp.head_k * hp.n_head_kv, n_ctx_max as i64,
+                        ctx, f16t, hp.head_k * hp.n_head_kv, n_ctx_max as i64,
                     );
                     v_cache[il] = ffi::ggml_new_tensor_2d(
-                        ctx, f32t, n_ctx_max as i64, hp.head_v * hp.n_head_kv,
+                        ctx, f16t, n_ctx_max as i64, hp.head_v * hp.n_head_kv,
                     );
                 }
             }
@@ -214,6 +218,20 @@ impl Session {
                 return Err(ModelError::Load("session buffer alloc".into()));
             }
             ffi::ggml_backend_buffer_clear(buffer, 0);
+            // Belt and braces: explicitly zero the recurrent states via
+            // tensor_set — buffer_clear semantics proved trustworthy on CPU,
+            // but the session path diverged on CUDA and garbage initial
+            // states are the prime suspect (caches are fully overwritten
+            // before being read, states are not).
+            for il in 0..hp.n_layer {
+                if hp.is_recurrent(il) {
+                    for &t in [&conv_state[il], &gdn_state[il]] {
+                        let n = ffi::ggml_nbytes(t);
+                        let zeros = vec![0u8; n];
+                        ffi::ggml_backend_tensor_set(t, zeros.as_ptr().cast(), 0, n);
+                    }
+                }
+            }
             Ok(Session {
                 n_ctx_max,
                 n_past: 0,
@@ -353,6 +371,18 @@ impl Qwen35 {
         };
         let n_kv = (n_past + tokens.len()) as i64;
 
+        // --- temporary CUDA-bisect toggles (see selftest; remove when fixed) ---
+        // ATTN_BATCH: attention reads in-batch k/v (stateless style) even in
+        //             session mode (cache writes still happen unless NO_WRITES)
+        // GDN_ZERO:   GDN uses zero init states even in session mode
+        // NO_WRITES:  skip every cache/state write-back cpy
+        let dbg_attn_batch = std::env::var("TANDEM_DBG_ATTN_BATCH").is_ok();
+        let dbg_gdn_zero = std::env::var("TANDEM_DBG_GDN_ZERO").is_ok();
+        let dbg_no_writes = std::env::var("TANDEM_DBG_NO_WRITES").is_ok();
+        // finer bisect: read only K (or only V) through the cache
+        let dbg_k_batch = std::env::var("TANDEM_DBG_K_BATCH").is_ok();
+        let dbg_v_batch = std::env::var("TANDEM_DBG_V_BATCH").is_ok();
+
         unsafe {
             let params = ffi::ggml_init_params {
                 mem_size: 64 << 20, // graph metadata only (no_alloc)
@@ -386,8 +416,9 @@ impl Qwen35 {
             ffi::ggml_set_input(inp_pos);
             let kq_mask = ffi::ggml_new_tensor_2d(ctx, f32t, n_kv, t_len);
             ffi::ggml_set_input(kq_mask);
-            let (conv_zero, state_zero) = match &state {
-                StateSrc::Stateless => {
+            let need_zeros = matches!(&state, StateSrc::Stateless) || dbg_gdn_zero;
+            let (conv_zero, state_zero) = match (&state, need_zeros) {
+                (_, true) | (StateSrc::Stateless, _) => {
                     let c = ffi::ggml_new_tensor_3d(ctx, f32t, hp.d_conv - 1, hp.conv_dim(), 1);
                     ffi::ggml_set_input(c);
                     let s = ffi::ggml_new_tensor_4d(
@@ -396,7 +427,7 @@ impl Qwen35 {
                     ffi::ggml_set_input(s);
                     (c, s)
                 }
-                StateSrc::Session(_) => (std::ptr::null_mut(), std::ptr::null_mut()),
+                _ => (std::ptr::null_mut(), std::ptr::null_mut()),
             };
             let out_ids = ffi::ggml_new_tensor_1d(
                 ctx,
@@ -458,6 +489,7 @@ impl Qwen35 {
                     // conv over [q|k|v] with carried (or zero) state
                     let (conv_in_state, gdn_in_state) = match &state {
                         StateSrc::Stateless => (conv_zero, state_zero),
+                        StateSrc::Session(_) if dbg_gdn_zero => (conv_zero, state_zero),
                         StateSrc::Session(s) => {
                             let c3 = ffi::ggml_reshape_3d(
                                 ctx, s.conv_state[il], hp.d_conv - 1, hp.conv_dim(), 1,
@@ -473,7 +505,7 @@ impl Qwen35 {
                     let conv_input = ffi::ggml_concat(ctx, conv_in_state, qkv_t, 0);
 
                     // write updated conv state (last d_conv-1 columns) back
-                    if let StateSrc::Session(s) = &state {
+                    if let (StateSrc::Session(s), false) = (&state, dbg_no_writes || dbg_gdn_zero) {
                         let tail = ffi::ggml_view_3d(
                             ctx, conv_input,
                             hp.d_conv - 1, hp.conv_dim(), 1,
@@ -523,7 +555,7 @@ impl Qwen35 {
                     );
 
                     // write final GDN state back (snapshot slot 0)
-                    if let StateSrc::Session(s) = &state {
+                    if let (StateSrc::Session(s), false) = (&state, dbg_no_writes || dbg_gdn_zero) {
                         let new_state = ffi::ggml_view_4d(
                             ctx, gdn,
                             head_v, head_v, hp.n_v_heads, 1,
@@ -582,6 +614,13 @@ impl Qwen35 {
                         hp.n_ctx_train, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0,
                     );
 
+                    let batch_kv = |ctx: *mut ffi::ggml_context| {
+                        let k = ffi::ggml_permute(ctx, kcur, 0, 2, 1, 3);
+                        let v3 = ffi::ggml_reshape_3d(ctx, vcur, hp.head_v, hp.n_head_kv, t_len);
+                        let v = ffi::ggml_permute(ctx, v3, 0, 2, 1, 3);
+                        let v_t = ffi::ggml_cont(ctx, ffi::ggml_transpose(ctx, v));
+                        (k, v_t)
+                    };
                     let (k_all, v_t_all) = match &state {
                         StateSrc::Stateless => {
                             let k = ffi::ggml_permute(ctx, kcur, 0, 2, 1, 3); // [hd, T, nhkv]
@@ -594,8 +633,10 @@ impl Qwen35 {
                         StateSrc::Session(s) => {
                             let kc = s.k_cache[il];
                             let vc = s.v_cache[il];
+                            let elt_kv = ffi::ggml_type_size((*kc).type_);
 
                             // write new K columns (post-rope, post-norm) at n_past
+                            if dbg_no_writes { let _ = (kc, vc); }
                             let k2 = ffi::ggml_reshape_2d(
                                 ctx,
                                 ffi::ggml_cont(ctx, kcur),
@@ -606,28 +647,44 @@ impl Qwen35 {
                                 ctx, kc, hd * hp.n_head_kv, t_len,
                                 (*kc).nb[1], n_past * (*kc).nb[1],
                             );
-                            ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, k2, k_dst));
+                            if !dbg_no_writes {
+                                ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, k2, k_dst));
+                            }
 
                             // write new V rows transposed at column offset n_past
                             let v_t_new = ffi::ggml_transpose(ctx, vcur); // [T, hv*nhkv]
                             let v_dst = ffi::ggml_view_2d(
                                 ctx, vc, t_len, hp.head_v * hp.n_head_kv,
-                                (*vc).nb[1], n_past * elt,
+                                (*vc).nb[1], n_past * elt_kv,
                             );
-                            ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, v_t_new, v_dst));
+                            if !dbg_no_writes {
+                                ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, v_t_new, v_dst));
+                            }
 
                             // read views over [0, n_kv)
                             let k_all = ffi::ggml_view_3d(
                                 ctx, kc, hd, n_kv, hp.n_head_kv,
-                                (*kc).nb[1], hd as usize * elt, 0,
+                                (*kc).nb[1], hd as usize * elt_kv, 0,
                             );
                             let v_t_all = ffi::ggml_view_3d(
                                 ctx, vc, n_kv, hp.head_v, hp.n_head_kv,
                                 (*vc).nb[1],
-                                s.n_ctx_max * hp.head_v as usize * elt,
+                                s.n_ctx_max * hp.head_v as usize * elt_kv,
                                 0,
                             );
-                            (k_all, v_t_all)
+                            if dbg_attn_batch {
+                                batch_kv(ctx)
+                            } else {
+                                let (kb, vb) = if dbg_k_batch || dbg_v_batch {
+                                    batch_kv(ctx)
+                                } else {
+                                    (k_all, v_t_all)
+                                };
+                                (
+                                    if dbg_k_batch { kb } else { k_all },
+                                    if dbg_v_batch { vb } else { v_t_all },
+                                )
+                            }
                         }
                     };
 

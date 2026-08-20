@@ -19,7 +19,7 @@ oracle_gen() { # $1 = raw prompt
     --entrypoint /work/llama.cpp-b10423/build/bin/llama-completion \
     nvidia/cuda:13.0.0-devel-ubuntu24.04 \
     -m "$MODEL_IN_CONTAINER" -p "$1" -n "$N" --temp 0 -t 8 -ngl 0 \
-    --no-warmup --no-display-prompt 2>/dev/null \
+    -fa "${ORACLE_FA:-off}" --no-warmup --no-display-prompt 2>/dev/null \
   | sed -e 's/> EOF by user//' -e 's/<|im_end|>//'
 }
 

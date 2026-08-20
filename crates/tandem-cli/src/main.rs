@@ -104,6 +104,26 @@ fn cmd_selftest(args: &[String]) -> ExitCode {
         c = model.step(&mut s3, &[*t], &[0], threads).expect("decode all");
     }
     report("C decode-only       vs stateless", &c, &reference);
+
+    // Case D: single-token session vs single-token stateless (isolates the
+    // cache-write path with T=1 from multi-token specifics)
+    let one = &ids[..1];
+    let d_ref = model.forward_logits(one, threads).expect("stateless 1");
+    let mut s4 = tandem_model::qwen35::Session::new(&model, 4096).expect("session");
+    let d = model.step(&mut s4, one, &[0], threads).expect("session 1");
+    report("D single-token      vs stateless", &d, &d_ref);
+
+    // Case E: session-vs-session determinism (fresh sessions, same input);
+    // any difference here means uninitialized memory, not a layout bug
+    let mut s5 = tandem_model::qwen35::Session::new(&model, 4096).expect("session");
+    let e1 = model
+        .step(&mut s5, &ids, &[(ids.len() - 1) as i32], threads)
+        .expect("e1");
+    let mut s6 = tandem_model::qwen35::Session::new(&model, 4096).expect("session");
+    let e2 = model
+        .step(&mut s6, &ids, &[(ids.len() - 1) as i32], threads)
+        .expect("e2");
+    report("E session repeat    vs session ", &e1, &e2);
     ExitCode::SUCCESS
 }
 

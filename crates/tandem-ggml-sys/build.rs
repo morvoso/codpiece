@@ -93,6 +93,8 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cublas");
         println!("cargo:rustc-link-lib=dylib=cublasLt");
         println!("cargo:rustc-link-lib=dylib=cuda");
+        // ggml-cuda @ b10423 uses NCCL for its multi-GPU comm layer
+        println!("cargo:rustc-link-lib=dylib=nccl");
     }
     println!("cargo:rustc-link-lib=static=ggml-base");
     println!("cargo:rustc-link-lib=dylib=stdc++");
