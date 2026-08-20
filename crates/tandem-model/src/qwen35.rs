@@ -945,7 +945,10 @@ impl Qwen35 {
         // trunk's cached decode graph uses the same mechanism and is fine, so
         // this is specific to the MTP head and unresolved — under TP the
         // draft graph is rebuilt per round, as before.
-        let cacheable = !self.weights.is_tensor_parallel();
+        // TANDEM_MTP_CACHE=1 forces the cached path under tensor parallelism
+        // so the meta-backend limitation can be probed directly.
+        let cacheable = !self.weights.is_tensor_parallel()
+            || std::env::var("TANDEM_MTP_CACHE").is_ok();
         unsafe {
             if !cacheable {
                 return self.mtp_draft_uncached(session, hidden, token, pos, n_threads);
