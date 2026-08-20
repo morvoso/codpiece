@@ -63,33 +63,37 @@ Status 2026-08-19, all vs oracles built at b10423, CPU, GPU-blind:
 - [x] SIGPIPE fixed. Builder image docker/builder.Dockerfile (CUDA devel +
       rustup + libclang); cargo cuda builds on llm-host in a named volume.
 
-## M2 — Single-GPU CUDA + decode loop  ◕ in progress 2026-08-19
+## M2 — Single-GPU CUDA + decode loop  ✅ correctness / ◕ speed 2026-08-19
 
 Stateful engine (Session: KV cache + carried conv/GDN states) on one 3090,
 inside the locked bench window (scripts/bench-window.sh — SAFETY.md as code).
 
-Done:
-- [x] Session decode path, CPU: bitwise-identical to the gate-passed
-      stateless rig (all 5 selftest cases 0.000000 with f32 caches).
-- [x] CUDA session-path corruption found and fixed: all-F32 KV caches hit
-      undertested CUDA kernel paths (V transposed write / padded read).
-      Bisected in 3 bench windows via mechanism toggles. Fix = f16 KV,
-      which is prod's accuracy-validated config anyway.
-- [x] Parity policy learned: compare path-matched (tandem non-FA ↔ oracle
-      -fa off; tandem FA ↔ oracle -fa on). At fp16, FA and non-FA are both
-      correct but round differently.
-- [x] Flash-attention session path (untransposed f16 V cache, f16 mask,
-      prec F32): CPU 3/3 token-identical vs oracle -fa on.
-- [x] CUDA: selftest argmax-stable, ppl 16.2114 (CPU 16.2159), 64-token
-      GPU gen parity IDENTICAL (non-FA build).
-- [x] Persistent per-session graph allocator (+1.7%).
+Correctness (all PASSED, path-matched vs llama-completion @ b10423):
+- [x] selftest 5/5 on CUDA (prefill-all, prefill+decode, decode-only,
+      single-token, session-repeat determinism)
+- [x] PPL on GPU 16.2114 vs CPU 16.2159 (same 4 chunks)
+- [x] 64-token GPU generation parity IDENTICAL
+- [x] **2334-token long-context parity IDENTICAL** (chunked prefill,
+      positions at depth, KV across chunk boundaries, bucket rollovers)
 
-Speed so far (0.8B BF16, GPU1, 256-token decode): tandem non-FA 235 tok/s
-vs oracle FA 317 tok/s. FA measurement pending this window.
+Speed (0.8B BF16, GPU1, 256-token decode, ≥2 reps):
 
-**Gate:** parity as above + decode ≥ oracle same-path. Remaining levers if
-FA alone doesn't close it: padded n_kv buckets → stable graph shapes →
-ggml-cuda CUDA-graph capture; single mask upload; reused graph contexts.
+| step | tok/s | note |
+|---|---|---|
+| session decode, f32 KV, per-step graph | 235 | correctness baseline |
+| + persistent gallocr | 239 | +1.7% |
+| + flash attention | 247 | +3% |
+| + in-graph argmax (4-byte readback) | 265 | +7%; unlocked the next one |
+| + CUDA graphs (GGML_CUDA_GRAPHS=ON) | **295** | +11%; capture was compiled out AND masked by the logits copy |
+| llama.cpp b10423, same GPU/model/path | 317 | tandem = **93%** |
+
+Three levers that did NOT pay: async input uploads (0%), KV bucket 64/128
+(worse than 256 — rebuild cost), f32→f32 weight casts (already F32 in file).
+Remaining 7% is unexplained; it is not launch overhead, not padding waste,
+and not cast nodes. Deferred deliberately: the 27B has ~30× the compute per
+step, so fixed overheads matter far less there — profile at real scale.
+
+**Gate:** correctness ✅; speed ≥ oracle NOT met (93%).
 
 ## M3 — Qwen3.8-27B, 2-GPU tensor split, single stream
 
