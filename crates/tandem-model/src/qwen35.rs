@@ -920,7 +920,11 @@ impl Qwen35 {
         // matters more than it sounds: measured on the 27B, a round that
         // rebuilds the 64-layer trunk graph costs ~38 ms against ~26 ms for
         // a replayed one — the rebuild, not the drafting, was the overhead.
-        if session.fa && self.weights.sched().is_none() {
+        // Not under tensor parallelism: `spec` interleaves this verify with
+        // per-draft graph executions, and the meta backend aborts when a
+        // cached graph is replayed with other graphs in between. Rebuilding
+        // is the correct choice there until that is resolved.
+        if session.fa && !self.weights.is_tensor_parallel() {
             let (out, hidden) = self.step_cached(session, tokens, n_threads, greedy)?;
             session.n_past += tokens.len();
             let preds = match out {
