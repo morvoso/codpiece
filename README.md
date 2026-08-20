@@ -51,9 +51,13 @@ it: output identical to llama.cpp b10423, or it does not count.
 | tokenizer, wikitext-2 | **297,193/297,193 identical** | reference |
 | perplexity | 20.4453 | 20.4429 |
 
-tandem is at 96 % of llama.cpp without speculation and 91 % with it. The
-speculative gap is not mysterious: llama.cpp gates drafts on confidence
-(`p-min`) and caches its verify graph; tandem does neither yet.
+tandem is at 96 % of llama.cpp without speculation and ~91 % with it. Two
+hypotheses for closing the speculative gap were implemented and measured this
+session, and **both were refuted** (see `notes/results-2026-08-19.md`):
+confidence-gated drafting moves acceptance but not throughput, and free
+CPU-side drafts cost more than they return on the 27B. What measurement
+*does* point at is per-draft graph construction: a draft from a one-layer
+head costs ~8 ms against ~1.4 ms of actual bandwidth.
 
 Milestones M0–M4 are done and gated; see `docs/ROADMAP.md`. Next: closing the
 speculative gap, then the serving layer (M5) and the host-RAM session cache
