@@ -14,6 +14,7 @@ use tandem_ggml_sys as ffi;
 use tandem_gguf::GgufFile;
 
 pub mod meta;
+pub mod mtp_graph;
 pub mod qwen35;
 pub mod split;
 

@@ -22,6 +22,7 @@ fn main() -> ExitCode {
         Some("gen") => cmd_gen(&args[1..]),
         Some("ppl") => cmd_ppl(&args[1..]),
         Some("selftest") => cmd_selftest(&args[1..]),
+        Some("mtp-probe") => cmd_mtp_probe(&args[1..]),
         _ => {
             eprintln!(
                 "usage: tandem inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
@@ -31,6 +32,119 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// MTP acceptance probe: run a normal greedy decode, and at each step ask
+/// the draft head what it thinks the NEXT-next token is. Comparing that
+/// against what the trunk actually produces measures draft acceptance — the
+/// number speculative decoding's speedup is entirely made of — without
+/// needing the batched-verify or recurrent-rollback machinery yet.
+///
+/// Prod (llama.cpp, same model) measures 0.78-0.92 at draft depth 3.
+fn cmd_mtp_probe(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut prompt = String::from("The capital of France is");
+    let mut n_gen = 64usize;
+    let mut threads = 8i32;
+    let mut n_ctx = 4096usize;
+    let mut gpu: Option<i32> = None;
+    let mut tp: Option<Vec<i32>> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-p" => prompt = it.next().cloned().unwrap_or_default(),
+            "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(64),
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
+            "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            _ => {}
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: tandem mtp-probe <file.gguf> [-p prompt] [-n tokens] [--gpu N|--tp 0,1]");
+        return ExitCode::from(2);
+    };
+    let dev = match (&tp, gpu) {
+        (Some(ids), _) => tandem_model::Device::CudaTensorParallel(ids.clone()),
+        (None, Some(i)) => tandem_model::Device::Cuda(i),
+        (None, None) => tandem_model::Device::Cpu,
+    };
+    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), dev) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("mtp-probe: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
+    let mut session = match tandem_model::qwen35::Session::new(&model, n_ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("mtp-probe: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let ids = tok.encode(&prompt, true);
+    // prefill; keep the hidden state of the last position
+    let (mut logits, mut hidden) =
+        match model.step_with_hidden(&mut session, &ids, &[(ids.len() - 1) as i32], threads) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("prefill: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let mut next = tandem_model::qwen35::argmax(&logits);
+
+    let mut drafted: Option<u32> = None;
+    let (mut hits, mut total) = (0usize, 0usize);
+    let mut out_ids: Vec<u32> = vec![next];
+    for i in 0..n_gen {
+        // what the draft head predicted last round for THIS position
+        if let Some(d) = drafted.take() {
+            total += 1;
+            if d == next {
+                hits += 1;
+            }
+        }
+        // draft the token after `next`, from this position's hidden state
+        let pos = session.n_past; // position `next` will occupy
+        match model.mtp_draft(&mut session, &hidden, next, pos, threads) {
+            Ok(dl) => drafted = Some(tandem_model::qwen35::argmax(&dl)),
+            Err(e) => {
+                eprintln!("mtp draft step {i}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if Some(next) == tok.eos {
+            break;
+        }
+        // advance the trunk one token
+        match model.step_with_hidden(&mut session, &[next], &[0], threads) {
+            Ok((l, h)) => {
+                logits = l;
+                hidden = h;
+            }
+            Err(e) => {
+                eprintln!("trunk step {i}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        next = tandem_model::qwen35::argmax(&logits);
+        out_ids.push(next);
+    }
+
+    println!("{}", tok.decode(&out_ids, true));
+    let rate = if total == 0 { 0.0 } else { hits as f64 / total as f64 };
+    eprintln!("MTP draft acceptance: {hits}/{total} = {rate:.3}");
+    ExitCode::SUCCESS
 }
 
 /// Numeric self-test: stateless forward vs session path on the same tokens.

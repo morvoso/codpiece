@@ -76,7 +76,6 @@ pub fn classify(name: &str, hp: &Hparams) -> Split {
     // (Qwen3-Next uses the contiguous pattern; do not copy its rules.)
     let head_ratio = (hp.n_v_heads / hp.n_k_heads) as u32;
     let key_dim = hp.key_dim();
-    let head_v = hp.gdn_head_v();
 
     let seg = |axis: Axis, segments: Vec<(i64, u32)>| Split {
         axis,

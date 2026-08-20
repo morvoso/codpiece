@@ -153,30 +153,30 @@ pub struct Qwen35 {
 }
 
 /// Layer tensor handles, resolved per graph build.
-struct Layer {
-    attn_norm: *mut ffi::ggml_tensor,
-    post_attn_norm: *mut ffi::ggml_tensor,
+pub(crate) struct Layer {
+    pub(crate) attn_norm: *mut ffi::ggml_tensor,
+    pub(crate) post_attn_norm: *mut ffi::ggml_tensor,
     // full attention
-    wq: *mut ffi::ggml_tensor,
-    wk: *mut ffi::ggml_tensor,
-    wv: *mut ffi::ggml_tensor,
-    wo: *mut ffi::ggml_tensor,
-    q_norm: *mut ffi::ggml_tensor,
-    k_norm: *mut ffi::ggml_tensor,
+    pub(crate) wq: *mut ffi::ggml_tensor,
+    pub(crate) wk: *mut ffi::ggml_tensor,
+    pub(crate) wv: *mut ffi::ggml_tensor,
+    pub(crate) wo: *mut ffi::ggml_tensor,
+    pub(crate) q_norm: *mut ffi::ggml_tensor,
+    pub(crate) k_norm: *mut ffi::ggml_tensor,
     // gdn
-    wqkv: *mut ffi::ggml_tensor,
-    wqkv_gate: *mut ffi::ggml_tensor,
-    conv1d: *mut ffi::ggml_tensor,
-    dt_bias: *mut ffi::ggml_tensor,
-    ssm_a: *mut ffi::ggml_tensor,
-    ssm_beta: *mut ffi::ggml_tensor,
-    ssm_alpha: *mut ffi::ggml_tensor,
-    ssm_norm: *mut ffi::ggml_tensor,
-    ssm_out: *mut ffi::ggml_tensor,
+    pub(crate) wqkv: *mut ffi::ggml_tensor,
+    pub(crate) wqkv_gate: *mut ffi::ggml_tensor,
+    pub(crate) conv1d: *mut ffi::ggml_tensor,
+    pub(crate) dt_bias: *mut ffi::ggml_tensor,
+    pub(crate) ssm_a: *mut ffi::ggml_tensor,
+    pub(crate) ssm_beta: *mut ffi::ggml_tensor,
+    pub(crate) ssm_alpha: *mut ffi::ggml_tensor,
+    pub(crate) ssm_norm: *mut ffi::ggml_tensor,
+    pub(crate) ssm_out: *mut ffi::ggml_tensor,
     // ffn
-    ffn_gate: *mut ffi::ggml_tensor,
-    ffn_up: *mut ffi::ggml_tensor,
-    ffn_down: *mut ffi::ggml_tensor,
+    pub(crate) ffn_gate: *mut ffi::ggml_tensor,
+    pub(crate) ffn_up: *mut ffi::ggml_tensor,
+    pub(crate) ffn_down: *mut ffi::ggml_tensor,
 }
 
 /// Raw pointers into a Session's persistent tensors — plain data, so graph
@@ -189,6 +189,29 @@ struct SessView {
     gdn_state: Vec<*mut ffi::ggml_tensor>,
     n_ctx_max: usize,
     fa: bool,
+}
+
+/// Kernel-path bisect switches, kept from the CUDA debugging campaign.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DebugToggles {
+    attn_batch: bool,
+    gdn_zero: bool,
+    no_writes: bool,
+    k_batch: bool,
+    v_batch: bool,
+}
+
+impl DebugToggles {
+    fn from_env() -> DebugToggles {
+        let on = |k: &str| std::env::var(k).is_ok();
+        DebugToggles {
+            attn_batch: on("TANDEM_DBG_ATTN_BATCH"),
+            gdn_zero: on("TANDEM_DBG_GDN_ZERO"),
+            no_writes: on("TANDEM_DBG_NO_WRITES"),
+            k_batch: on("TANDEM_DBG_K_BATCH"),
+            v_batch: on("TANDEM_DBG_V_BATCH"),
+        }
+    }
 }
 
 /// Either raw logits or an in-graph-sampled token id.
@@ -216,6 +239,8 @@ struct Built {
     state_zero: *mut ffi::ggml_tensor,
     out_ids: *mut ffi::ggml_tensor,
     out: *mut ffi::ggml_tensor,
+    /// pre-LM-head hidden states at the requested positions (MTP input)
+    h_out: *mut ffi::ggml_tensor,
     n_kv: i64,
     fa_mask: bool,
     /// out is an I32 token id (in-graph argmax) rather than f32 logits
@@ -271,6 +296,11 @@ pub struct Session {
     v_cache: Vec<*mut ffi::ggml_tensor>,
     conv_state: Vec<*mut ffi::ggml_tensor>,
     gdn_state: Vec<*mut ffi::ggml_tensor>,
+    /// KV cache for the single MTP draft block (blk.n_layer)
+    mtp_k: *mut ffi::ggml_tensor,
+    mtp_v: *mut ffi::ggml_tensor,
+    /// how many tokens the MTP block has consumed
+    pub mtp_past: usize,
     cached: Option<CachedStep>,
 }
 
@@ -335,6 +365,18 @@ impl Session {
             // device each step — correct, but it doubles bus traffic for the
             // second half's layers. Placing them per-layer is the next step
             // (tracked in ROADMAP M3).
+            // MTP draft block: one attention layer with its own cache
+            let mtp_k = ffi::ggml_new_tensor_2d(
+                ctx, f16t, hp.head_k * hp.n_head_kv, n_ctx_max as i64,
+            );
+            let mtp_v = if fa {
+                ffi::ggml_new_tensor_2d(ctx, f16t, hp.head_v * hp.n_head_kv, n_ctx_max as i64)
+            } else {
+                ffi::ggml_new_tensor_2d(ctx, f16t, n_ctx_max as i64, hp.head_v * hp.n_head_kv)
+            };
+            name_it(mtp_k, format!("cache_k_l{}", hp.n_layer));
+            name_it(mtp_v, format!("cache_v_l{}", hp.n_layer));
+
             let buffer = ffi::ggml_backend_alloc_ctx_tensors(ctx, model.weights.backend());
             if buffer.is_null() {
                 ffi::ggml_free(ctx);
@@ -360,6 +402,9 @@ impl Session {
                 v_cache,
                 conv_state,
                 gdn_state,
+                mtp_k,
+                mtp_v,
+                mtp_past: 0,
                 cached: None,
             })
         }
@@ -382,6 +427,7 @@ impl Session {
         }
         self.cached = None;
         self.n_past = 0;
+        self.mtp_past = 0;
     }
 }
 
@@ -413,10 +459,20 @@ impl Qwen35 {
             .ok_or_else(|| ModelError::Load(format!("missing tensor {name}")))
     }
 
+    pub(crate) fn t_pub(&self, name: &str) -> Result<*mut ffi::ggml_tensor, ModelError> {
+        self.t(name)
+    }
+
+    pub(crate) fn layer_pub(&self, il: usize) -> Result<Layer, ModelError> {
+        self.layer(il)
+    }
+
     fn layer(&self, il: usize) -> Result<Layer, ModelError> {
         let n = |suffix: &str| format!("blk.{il}.{suffix}");
         let opt = |name: &str| self.weights.tensor(name).unwrap_or(std::ptr::null_mut());
-        let recurrent = self.hp.is_recurrent(il);
+        // The MTP block (il == n_layer) is a dense attention block regardless
+        // of where it lands in the recurrent/attention cadence.
+        let recurrent = il < self.hp.n_layer && self.hp.is_recurrent(il);
         Ok(Layer {
             attn_norm: self.t(&n("attn_norm.weight"))?,
             post_attn_norm: self.t(&n("post_attention_norm.weight"))?,
@@ -618,6 +674,132 @@ impl Qwen35 {
         }
     }
 
+    /// Trunk step that also returns the pre-LM-head hidden state, which the
+    /// MTP draft head consumes. Same graph as `step` — the hidden was always
+    /// computed, it just was not readable before.
+    pub fn step_with_hidden(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        out_positions: &[i32],
+        n_threads: i32,
+    ) -> Result<(Vec<f32>, Vec<f32>), ModelError> {
+        if session.n_past + tokens.len() > session.n_ctx_max {
+            return Err(ModelError::Load("context overflow".into()));
+        }
+        let view = session.view();
+        let galloc = session.galloc;
+        session.cached = None;
+        let out = unsafe {
+            let built = self.build(
+                tokens.len() as i64,
+                session.n_past,
+                &StateSrc::Session(view),
+                out_positions.len() as i64,
+                false,
+                false,
+            )?;
+            struct G(*mut ffi::ggml_context);
+            impl Drop for G {
+                fn drop(&mut self) {
+                    unsafe { ffi::ggml_free(self.0) }
+                }
+            }
+            let _g = G(built.ctx);
+            if let Some(sched) = self.weights.sched() {
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, built.gf) {
+                    return Err(ModelError::Load("sched alloc".into()));
+                }
+            } else if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
+                return Err(ModelError::Load("graph alloc".into()));
+            }
+            self.fill_inputs(&built, tokens, session.n_past, out_positions);
+            self.compute(built.gf, n_threads)?;
+            let n_out = out_positions.len();
+            let mut logits = vec![0f32; self.hp.n_vocab as usize * n_out];
+            ffi::ggml_backend_tensor_get(built.out, logits.as_mut_ptr().cast(), 0, logits.len() * 4);
+            let mut hidden = vec![0f32; self.hp.n_embd as usize * n_out];
+            ffi::ggml_backend_tensor_get(
+                built.h_out,
+                hidden.as_mut_ptr().cast(),
+                0,
+                hidden.len() * 4,
+            );
+            (logits, hidden)
+        };
+        session.n_past += tokens.len();
+        Ok(out)
+    }
+
+    /// One MTP draft: given the trunk hidden for position p and the token at
+    /// p+1, predict the token at p+2. Advances the MTP block's own cache.
+    pub fn mtp_draft(
+        &self,
+        session: &mut Session,
+        hidden: &[f32],
+        token: u32,
+        pos: usize,
+        n_threads: i32,
+    ) -> Result<Vec<f32>, ModelError> {
+        let n_kv_exact = (session.mtp_past + 1) as i64;
+        let kvb = kv_bucket();
+        let n_kv = (((n_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
+        unsafe {
+            let g = self.build_mtp(
+                1,
+                n_kv,
+                session.mtp_past,
+                session.mtp_k,
+                session.mtp_v,
+                session.n_ctx_max,
+                session.fa,
+            )?;
+            if let Some(sched) = self.weights.sched() {
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, g.gf) {
+                    return Err(ModelError::Load("mtp sched alloc".into()));
+                }
+            } else if !ffi::ggml_gallocr_alloc_graph(session.galloc, g.gf) {
+                return Err(ModelError::Load("mtp graph alloc".into()));
+            }
+
+            let tok = [token as i32];
+            ffi::ggml_backend_tensor_set(g.inp_tokens, tok.as_ptr().cast(), 0, 4);
+            ffi::ggml_backend_tensor_set(
+                g.inp_h,
+                hidden.as_ptr().cast(),
+                0,
+                self.hp.n_embd as usize * 4,
+            );
+            let p = pos as i32;
+            let posv = [p, p, p, 0];
+            ffi::ggml_backend_tensor_set(g.inp_pos, posv.as_ptr().cast(), 0, 16);
+            let nkv = n_kv as usize;
+            if g.fa_mask {
+                let mut mask = vec![0xFC00u16; nkv];
+                for c in mask.iter_mut().take((session.mtp_past + 1).min(nkv)) {
+                    *c = 0;
+                }
+                ffi::ggml_backend_tensor_set(g.kq_mask, mask.as_ptr().cast(), 0, nkv * 2);
+            } else {
+                let mut mask = vec![f32::NEG_INFINITY; nkv];
+                for c in mask.iter_mut().take((session.mtp_past + 1).min(nkv)) {
+                    *c = 0.0;
+                }
+                ffi::ggml_backend_tensor_set(g.kq_mask, mask.as_ptr().cast(), 0, nkv * 4);
+            }
+            let zero = [0i32];
+            ffi::ggml_backend_tensor_set(g.out_ids, zero.as_ptr().cast(), 0, 4);
+
+            self.compute(g.gf, n_threads)?;
+            let mut logits = vec![0f32; self.hp.n_vocab as usize];
+            ffi::ggml_backend_tensor_get(g.out, logits.as_mut_ptr().cast(), 0, logits.len() * 4);
+            session.mtp_past += 1;
+            Ok(logits)
+        }
+    }
+
     /// Cached T=1 decode: reuse the per-bucket graph + frozen allocation.
     fn step_cached(
         &self,
@@ -761,11 +943,10 @@ impl Qwen35 {
         let hp = &self.hp;
 
         // --- CUDA-bisect toggles (kept for kernel-path debugging) ---
-        let dbg_attn_batch = std::env::var("TANDEM_DBG_ATTN_BATCH").is_ok();
-        let dbg_gdn_zero = std::env::var("TANDEM_DBG_GDN_ZERO").is_ok();
-        let dbg_no_writes = std::env::var("TANDEM_DBG_NO_WRITES").is_ok();
-        let dbg_k_batch = std::env::var("TANDEM_DBG_K_BATCH").is_ok();
-        let dbg_v_batch = std::env::var("TANDEM_DBG_V_BATCH").is_ok();
+        let dbg = DebugToggles::from_env();
+        let dbg_attn_batch = dbg.attn_batch;
+        let dbg_gdn_zero = dbg.gdn_zero;
+        let dbg_no_writes = dbg.no_writes;
 
         let params = ffi::ggml_init_params {
             mem_size: 64 << 20,
@@ -946,180 +1127,19 @@ impl Qwen35 {
                 cur = ffi::ggml_mul_mat(ctx, l.ssm_out, flat);
                 cur = ffi::ggml_reshape_2d(ctx, cur, hp.n_embd, t_len);
             } else {
-                // ---- full attention (packed Q+gate, IMROPE, GQA) ----
-                let hd = hp.head_k;
-                let q_full = ffi::ggml_mul_mat(ctx, l.wq, cur);
-
-                let qcur = ffi::ggml_view_3d(
-                    ctx, q_full, hd, hp.n_head, t_len,
-                    elt * (hd * 2) as usize,
-                    elt * (hd * 2 * hp.n_head) as usize,
-                    0,
-                );
-                let qcur = rms(ctx, qcur, l.q_norm);
-
-                let gate = ffi::ggml_view_3d(
-                    ctx, q_full, hd, hp.n_head, t_len,
-                    elt * (hd * 2) as usize,
-                    elt * (hd * 2 * hp.n_head) as usize,
-                    elt * hd as usize,
-                );
-                let gate = ffi::ggml_cont_2d(ctx, gate, hd * hp.n_head, t_len);
-
-                let kcur = ffi::ggml_mul_mat(ctx, l.wk, cur);
-                let kcur = ffi::ggml_reshape_3d(ctx, kcur, hd, hp.n_head_kv, t_len);
-                let kcur = rms(ctx, kcur, l.k_norm);
-
-                let vcur = ffi::ggml_mul_mat(ctx, l.wv, cur);
-
-                let qcur = ffi::ggml_rope_multi(
-                    ctx, qcur, inp_pos, std::ptr::null_mut(),
-                    hp.n_rot, sections.as_mut_ptr(), ffi::GGML_ROPE_TYPE_IMROPE as i32,
-                    hp.n_ctx_train, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0,
-                );
-                let kcur = ffi::ggml_rope_multi(
-                    ctx, kcur, inp_pos, std::ptr::null_mut(),
-                    hp.n_rot, sections.as_mut_ptr(), ffi::GGML_ROPE_TYPE_IMROPE as i32,
-                    hp.n_ctx_train, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0,
-                );
-
-                let batch_kv = |ctx: *mut ffi::ggml_context| {
-                    let k = ffi::ggml_permute(ctx, kcur, 0, 2, 1, 3);
-                    let v3 = ffi::ggml_reshape_3d(ctx, vcur, hp.head_v, hp.n_head_kv, t_len);
-                    let v = ffi::ggml_permute(ctx, v3, 0, 2, 1, 3);
-                    let v_t = ffi::ggml_cont(ctx, ffi::ggml_transpose(ctx, v));
-                    (k, v_t)
-                };
-                let (k_all, v_all) = match state {
-                    StateSrc::Stateless => batch_kv(ctx),
-                    StateSrc::Session(s) => {
-                        let kc = s.k_cache[il];
-                        let vc = s.v_cache[il];
-                        let elt_kv = ffi::ggml_type_size((*kc).type_);
-                        let fa = s.fa;
-
-                        let k2 = ffi::ggml_reshape_2d(
-                            ctx,
-                            ffi::ggml_cont(ctx, kcur),
-                            hd * hp.n_head_kv,
-                            t_len,
-                        );
-                        if use_set_rows {
-                            debug_assert!(fa, "set_rows path requires FA V layout");
-                            if !dbg_no_writes {
-                                ffi::ggml_build_forward_expand(
-                                    gf,
-                                    ffi::ggml_set_rows(ctx, kc, k2, row_ids),
-                                );
-                                ffi::ggml_build_forward_expand(
-                                    gf,
-                                    ffi::ggml_set_rows(ctx, vc, vcur, row_ids),
-                                );
-                            }
-                        } else {
-                            let k_dst = ffi::ggml_view_2d(
-                                ctx, kc, hd * hp.n_head_kv, t_len,
-                                (*kc).nb[1], n_past_views * (*kc).nb[1],
-                            );
-                            if !dbg_no_writes {
-                                ffi::ggml_build_forward_expand(
-                                    gf, ffi::ggml_cpy(ctx, k2, k_dst),
-                                );
-                            }
-                            if fa {
-                                let v_dst = ffi::ggml_view_2d(
-                                    ctx, vc, hp.head_v * hp.n_head_kv, t_len,
-                                    (*vc).nb[1], n_past_views * (*vc).nb[1],
-                                );
-                                if !dbg_no_writes {
-                                    ffi::ggml_build_forward_expand(
-                                        gf, ffi::ggml_cpy(ctx, vcur, v_dst),
-                                    );
-                                }
-                            } else {
-                                let v_t_new = ffi::ggml_transpose(ctx, vcur);
-                                let v_dst = ffi::ggml_view_2d(
-                                    ctx, vc, t_len, hp.head_v * hp.n_head_kv,
-                                    (*vc).nb[1], n_past_views * elt_kv,
-                                );
-                                if !dbg_no_writes {
-                                    ffi::ggml_build_forward_expand(
-                                        gf, ffi::ggml_cpy(ctx, v_t_new, v_dst),
-                                    );
-                                }
-                            }
+                // full attention: shared with the MTP draft head
+                cur = self.build_attn_block(
+                    ctx, gf, cur, &l, inp_pos, kq_mask, row_ids,
+                    match state {
+                        StateSrc::Stateless => None,
+                        StateSrc::Session(s) => {
+                            Some((s.k_cache[il], s.v_cache[il], s.n_ctx_max))
                         }
-
-                        // Cache reads are built as [head_dim, n_head_kv, n_kv]
-                        // — strides increase monotonically, so ggml does not
-                        // consider the view "permuted" — and then permuted
-                        // into the [head_dim, n_kv, n_head_kv] that attention
-                        // wants. Viewing tokens-before-heads directly would
-                        // invert nb[1]/nb[2], which the tensor-parallel meta
-                        // backend refuses ("view of permuted tensor not
-                        // implemented"): it cannot map a split axis through
-                        // a stride-reordered view.
-                        let k_all = {
-                            let v4 = ffi::ggml_view_4d(
-                                ctx, kc, hd, hp.n_head_kv, n_kv, 1,
-                                hd as usize * elt_kv,
-                                (*kc).nb[1],
-                                (*kc).nb[1] * s.n_ctx_max,
-                                0,
-                            );
-                            ffi::ggml_permute(ctx, v4, 0, 2, 1, 3)
-                        };
-                        let v_all = if fa {
-                            let v4 = ffi::ggml_view_4d(
-                                ctx, vc, hp.head_v, hp.n_head_kv, n_kv, 1,
-                                hp.head_v as usize * elt_kv,
-                                (*vc).nb[1],
-                                (*vc).nb[1] * s.n_ctx_max,
-                                0,
-                            );
-                            ffi::ggml_permute(ctx, v4, 0, 2, 1, 3)
-                        } else {
-                            ffi::ggml_view_3d(
-                                ctx, vc, n_kv, hp.head_v, hp.n_head_kv,
-                                (*vc).nb[1],
-                                s.n_ctx_max * hp.head_v as usize * elt_kv,
-                                0,
-                            )
-                        };
-                        if dbg_attn_batch {
-                            batch_kv(ctx)
-                        } else {
-                            let (kb, vb) = if dbg_k_batch || dbg_v_batch {
-                                batch_kv(ctx)
-                            } else {
-                                (k_all, v_all)
-                            };
-                            (
-                                if dbg_k_batch { kb } else { k_all },
-                                if dbg_v_batch { vb } else { v_all },
-                            )
-                        }
-                    }
-                };
-
-                let q = ffi::ggml_permute(ctx, qcur, 0, 2, 1, 3);
-                let kq_scale = 1.0f32 / (hd as f32).sqrt();
-                let merged = if use_fa {
-                    let fa_out = ffi::ggml_flash_attn_ext(
-                        ctx, q, k_all, v_all, kq_mask, kq_scale, 0.0, 0.0,
-                    );
-                    ffi::ggml_flash_attn_ext_set_prec(fa_out, ffi::ggml_prec_GGML_PREC_F32);
-                    ffi::ggml_reshape_2d(ctx, fa_out, hp.head_v * hp.n_head, t_len)
-                } else {
-                    let kq = ffi::ggml_mul_mat(ctx, k_all, q);
-                    let p = ffi::ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, 0.0);
-                    let kqv = ffi::ggml_mul_mat(ctx, v_all, p);
-                    let m = ffi::ggml_permute(ctx, kqv, 0, 2, 1, 3);
-                    ffi::ggml_cont_2d(ctx, m, hp.head_v * hp.n_head, t_len)
-                };
-
-                let gated = ffi::ggml_mul(ctx, merged, ffi::ggml_sigmoid(ctx, gate));
-                cur = ffi::ggml_mul_mat(ctx, l.wo, gated);
+                    },
+                    t_len, n_kv, n_past_views,
+                    matches!(state, StateSrc::Session(s) if s.fa),
+                    use_fa, use_set_rows, dbg,
+                );
             }
 
             cur = ffi::ggml_add(ctx, cur, inp_sa);
@@ -1137,8 +1157,13 @@ impl Qwen35 {
         let output_norm = self.t("output_norm.weight")?;
         let output_w = self.weights.tensor("output.weight").unwrap_or(tok_embd);
         cur = rms(ctx, inp_l, output_norm);
-        cur = ffi::ggml_get_rows(ctx, cur, out_ids);
-        cur = ffi::ggml_mul_mat(ctx, output_w, cur);
+        // h_nextn: the normed trunk hidden BEFORE the LM head. The MTP draft
+        // head consumes exactly this (llama.cpp's res->t_h_nextn), so it must
+        // be readable, not just an intermediate.
+        let h_sel = ffi::ggml_get_rows(ctx, cur, out_ids);
+        ffi::ggml_set_output(h_sel);
+        ffi::ggml_build_forward_expand(gf, h_sel);
+        cur = ffi::ggml_mul_mat(ctx, output_w, h_sel);
         if greedy {
             // Sample in the graph: the readback becomes 4 bytes instead of
             // n_vocab floats (993 KB for this model), removing a full
@@ -1160,11 +1185,218 @@ impl Qwen35 {
             state_zero,
             out_ids,
             out: cur,
+            h_out: h_sel,
             n_kv,
             fa_mask: use_fa,
             greedy,
         })
     }
+
+
+/// One full-attention block: packed Q+gate projection, per-head q/k RMS
+/// norms, IMROPE, GQA attention against `cache` (or in-batch K/V when
+/// stateless), output gating, and the wo projection. Shared by the trunk's
+/// attention layers and the MTP draft head so the two cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_attn_block(
+    &self,
+    ctx: *mut ffi::ggml_context,
+    gf: *mut ffi::ggml_cgraph,
+    cur: *mut ffi::ggml_tensor,
+    l: &Layer,
+    inp_pos: *mut ffi::ggml_tensor,
+    kq_mask: *mut ffi::ggml_tensor,
+    row_ids: *mut ffi::ggml_tensor,
+    // cache: (k, v, n_ctx_max); None runs stateless over the batch
+    cache: Option<(*mut ffi::ggml_tensor, *mut ffi::ggml_tensor, usize)>,
+    t_len: i64,
+    n_kv: i64,
+    n_past_views: usize,
+    fa: bool,
+    use_fa: bool,
+    use_set_rows: bool,
+    dbg: DebugToggles,
+) -> *mut ffi::ggml_tensor {
+        // Q and a per-head output gate are packed in wq (2 x head_dim per
+        // head); q/k are RMS-normed per head; IMROPE covers n_rot of head_dim.
+        let hp = &self.hp;
+        let hd = hp.head_k;
+        let elt = ffi::ggml_type_size(ffi::ggml_type_GGML_TYPE_F32);
+        let mut sections = hp.rope_sections;
+        let rms = |ctx: *mut ffi::ggml_context, x: *mut ffi::ggml_tensor, w: *mut ffi::ggml_tensor| {
+            let n = ffi::ggml_rms_norm(ctx, x, hp.rms_eps);
+            ffi::ggml_mul(ctx, n, if (*w).type_ == ffi::ggml_type_GGML_TYPE_F32 { w } else { ffi::ggml_cast(ctx, w, ffi::ggml_type_GGML_TYPE_F32) })
+        };
+        let q_full = ffi::ggml_mul_mat(ctx, l.wq, cur);
+
+        let qcur = ffi::ggml_view_3d(
+            ctx, q_full, hd, hp.n_head, t_len,
+            elt * (hd * 2) as usize,
+            elt * (hd * 2 * hp.n_head) as usize,
+            0,
+        );
+        let qcur = rms(ctx, qcur, l.q_norm);
+
+        let gate = ffi::ggml_view_3d(
+            ctx, q_full, hd, hp.n_head, t_len,
+            elt * (hd * 2) as usize,
+            elt * (hd * 2 * hp.n_head) as usize,
+            elt * hd as usize,
+        );
+        let gate = ffi::ggml_cont_2d(ctx, gate, hd * hp.n_head, t_len);
+
+        let kcur = ffi::ggml_mul_mat(ctx, l.wk, cur);
+        let kcur = ffi::ggml_reshape_3d(ctx, kcur, hd, hp.n_head_kv, t_len);
+        let kcur = rms(ctx, kcur, l.k_norm);
+
+        let vcur = ffi::ggml_mul_mat(ctx, l.wv, cur);
+
+        let qcur = ffi::ggml_rope_multi(
+            ctx, qcur, inp_pos, std::ptr::null_mut(),
+            hp.n_rot, sections.as_mut_ptr(), ffi::GGML_ROPE_TYPE_IMROPE as i32,
+            hp.n_ctx_train, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0,
+        );
+        let kcur = ffi::ggml_rope_multi(
+            ctx, kcur, inp_pos, std::ptr::null_mut(),
+            hp.n_rot, sections.as_mut_ptr(), ffi::GGML_ROPE_TYPE_IMROPE as i32,
+            hp.n_ctx_train, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0,
+        );
+
+        let batch_kv = |ctx: *mut ffi::ggml_context| {
+            let k = ffi::ggml_permute(ctx, kcur, 0, 2, 1, 3);
+            let v3 = ffi::ggml_reshape_3d(ctx, vcur, hp.head_v, hp.n_head_kv, t_len);
+            let v = ffi::ggml_permute(ctx, v3, 0, 2, 1, 3);
+            let v_t = ffi::ggml_cont(ctx, ffi::ggml_transpose(ctx, v));
+            (k, v_t)
+        };
+        let (k_all, v_all) = match cache {
+            None => batch_kv(ctx),
+            Some((kc, vc, n_ctx_max)) => {
+                let elt_kv = ffi::ggml_type_size((*kc).type_);
+
+                let k2 = ffi::ggml_reshape_2d(
+                    ctx,
+                    ffi::ggml_cont(ctx, kcur),
+                    hd * hp.n_head_kv,
+                    t_len,
+                );
+                if use_set_rows {
+                    debug_assert!(fa, "set_rows path requires FA V layout");
+                    if !dbg.no_writes {
+                        ffi::ggml_build_forward_expand(
+                            gf,
+                            ffi::ggml_set_rows(ctx, kc, k2, row_ids),
+                        );
+                        ffi::ggml_build_forward_expand(
+                            gf,
+                            ffi::ggml_set_rows(ctx, vc, vcur, row_ids),
+                        );
+                    }
+                } else {
+                    let k_dst = ffi::ggml_view_2d(
+                        ctx, kc, hd * hp.n_head_kv, t_len,
+                        (*kc).nb[1], n_past_views * (*kc).nb[1],
+                    );
+                    if !dbg.no_writes {
+                        ffi::ggml_build_forward_expand(
+                            gf, ffi::ggml_cpy(ctx, k2, k_dst),
+                        );
+                    }
+                    if fa {
+                        let v_dst = ffi::ggml_view_2d(
+                            ctx, vc, hp.head_v * hp.n_head_kv, t_len,
+                            (*vc).nb[1], n_past_views * (*vc).nb[1],
+                        );
+                        if !dbg.no_writes {
+                            ffi::ggml_build_forward_expand(
+                                gf, ffi::ggml_cpy(ctx, vcur, v_dst),
+                            );
+                        }
+                    } else {
+                        let v_t_new = ffi::ggml_transpose(ctx, vcur);
+                        let v_dst = ffi::ggml_view_2d(
+                            ctx, vc, t_len, hp.head_v * hp.n_head_kv,
+                            (*vc).nb[1], n_past_views * elt_kv,
+                        );
+                        if !dbg.no_writes {
+                            ffi::ggml_build_forward_expand(
+                                gf, ffi::ggml_cpy(ctx, v_t_new, v_dst),
+                            );
+                        }
+                    }
+                }
+
+                // Cache reads are built as [head_dim, n_head_kv, n_kv]
+                // — strides increase monotonically, so ggml does not
+                // consider the view "permuted" — and then permuted
+                // into the [head_dim, n_kv, n_head_kv] that attention
+                // wants. Viewing tokens-before-heads directly would
+                // invert nb[1]/nb[2], which the tensor-parallel meta
+                // backend refuses ("view of permuted tensor not
+                // implemented"): it cannot map a split axis through
+                // a stride-reordered view.
+                let k_all = {
+                    let v4 = ffi::ggml_view_4d(
+                        ctx, kc, hd, hp.n_head_kv, n_kv, 1,
+                        hd as usize * elt_kv,
+                        (*kc).nb[1],
+                        (*kc).nb[1] * n_ctx_max,
+                        0,
+                    );
+                    ffi::ggml_permute(ctx, v4, 0, 2, 1, 3)
+                };
+                let v_all = if fa {
+                    let v4 = ffi::ggml_view_4d(
+                        ctx, vc, hp.head_v, hp.n_head_kv, n_kv, 1,
+                        hp.head_v as usize * elt_kv,
+                        (*vc).nb[1],
+                        (*vc).nb[1] * n_ctx_max,
+                        0,
+                    );
+                    ffi::ggml_permute(ctx, v4, 0, 2, 1, 3)
+                } else {
+                    ffi::ggml_view_3d(
+                        ctx, vc, n_kv, hp.head_v, hp.n_head_kv,
+                        (*vc).nb[1],
+                        n_ctx_max * hp.head_v as usize * elt_kv,
+                        0,
+                    )
+                };
+                if dbg.attn_batch {
+                    batch_kv(ctx)
+                } else {
+                    let (kb, vb) = if dbg.k_batch || dbg.v_batch {
+                        batch_kv(ctx)
+                    } else {
+                        (k_all, v_all)
+                    };
+                    (
+                        if dbg.k_batch { kb } else { k_all },
+                        if dbg.v_batch { vb } else { v_all },
+                    )
+                }
+            }
+        };
+
+        let q = ffi::ggml_permute(ctx, qcur, 0, 2, 1, 3);
+        let kq_scale = 1.0f32 / (hd as f32).sqrt();
+        let merged = if use_fa {
+            let fa_out = ffi::ggml_flash_attn_ext(
+                ctx, q, k_all, v_all, kq_mask, kq_scale, 0.0, 0.0,
+            );
+            ffi::ggml_flash_attn_ext_set_prec(fa_out, ffi::ggml_prec_GGML_PREC_F32);
+            ffi::ggml_reshape_2d(ctx, fa_out, hp.head_v * hp.n_head, t_len)
+        } else {
+            let kq = ffi::ggml_mul_mat(ctx, k_all, q);
+            let p = ffi::ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, 0.0);
+            let kqv = ffi::ggml_mul_mat(ctx, v_all, p);
+            let m = ffi::ggml_permute(ctx, kqv, 0, 2, 1, 3);
+            ffi::ggml_cont_2d(ctx, m, hp.head_v * hp.n_head, t_len)
+        };
+
+        let gated = ffi::ggml_mul(ctx, merged, ffi::ggml_sigmoid(ctx, gate));
+        ffi::ggml_mul_mat(ctx, l.wo, gated)
+}
 
     unsafe fn fill_inputs(&self, b: &Built, tokens: &[u32], n_past: usize, out_positions: &[i32]) {
         let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
