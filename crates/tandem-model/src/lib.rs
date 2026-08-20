@@ -306,6 +306,16 @@ impl Weights {
         matches!(self.device, Device::Cpu)
     }
 
+    /// True when weights are sliced across devices by the meta backend.
+    /// Under tensor parallelism the LM head is column-split, so each device
+    /// holds only a slice of the vocabulary: sampling cannot happen inside
+    /// the graph (a per-row argmax over a row-split tensor is meaningless,
+    /// and ggml asserts on it). llama.cpp reaches the same conclusion and
+    /// disables backend sampling for SPLIT_MODE_TENSOR.
+    pub fn is_tensor_parallel(&self) -> bool {
+        matches!(self.device, Device::CudaTensorParallel(_))
+    }
+
     pub fn n_tensors(&self) -> usize {
         self.tensors.len()
     }

@@ -494,9 +494,12 @@ impl Qwen35 {
         n_threads: i32,
     ) -> Result<u32, ModelError> {
         let last = [(tokens.len() - 1) as i32];
-        match self.step_impl(session, tokens, &last, n_threads, true)? {
+        // Tensor parallelism splits the vocabulary across devices, so the
+        // argmax has to happen after the logits are gathered host-side.
+        let in_graph = !self.weights.is_tensor_parallel();
+        match self.step_impl(session, tokens, &last, n_threads, in_graph)? {
             StepOut::Token(t) => Ok(t),
-            StepOut::Logits(_) => unreachable!("token requested"),
+            StepOut::Logits(l) => Ok(argmax(&l)),
         }
     }
 
