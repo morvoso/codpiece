@@ -107,8 +107,11 @@ Staged deliberately:
       Costs speed (113 vs 295 tok/s on the 0.8B — sched re-plans every step,
       no cached graph, session state all on device 0) but it is the path
       that makes the real model runnable at all.
-- [ ] M3b — 27B loaded and generating across both cards
-- [ ] M3c — parity vs prod llama.cpp (temp-0, short / 8K / 27K prompts)
+- [x] **M3b — the production 27B runs on tandem**: 29.3 GiB placed as
+      16.57 + 12.72 GiB across the two 3090s, coherent generation,
+      prefill 105 tok/s, decode 19.0 tok/s
+- [x] **M3c(partial) — 27B output IDENTICAL to llama.cpp** (`-sm layer
+      -fa on`, greedy 40, matching sha256). Still to do: 8K and 27K prompts.
 - [ ] M3d — placement fixes: session KV/state tensors on their layer's
       device (today they all sit on device 0, doubling bus traffic for the
       second half of the stack), cached decode graph under the scheduler

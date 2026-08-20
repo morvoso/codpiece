@@ -39,7 +39,7 @@ O=$(docker run --rm --runtime nvidia \
       --no-warmup --no-display-prompt --no-escape 2>/dev/null \
     | sed -e 's/> EOF by user//')
 
-norm() { sed -e 's/[[:space:]]*$//' | awk 'NF{b=0} !NF{b++} {l[NR]=$0; last=NR} END{while(last>0&&l[last]=="")last--; for(i=1;i<=last;i++)print l[i]}'; }
+norm() { sed -e 's/<|im_end|>//' -e 's/[[:space:]]*$//' | awk 'NF{b=0} !NF{b++} {l[NR]=$0; last=NR} END{while(last>0&&l[last]=="")last--; for(i=1;i<=last;i++)print l[i]}'; }
 TN=$(printf '%s' "$T" | norm)
 ON=$(printf '%s' "$O" | norm)
 
