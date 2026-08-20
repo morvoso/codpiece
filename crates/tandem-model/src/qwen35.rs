@@ -713,9 +713,14 @@ impl Qwen35 {
         }
         let hp = &self.hp;
         unsafe {
+            // Per recurrent layer: 2 copies plus 4 views — and a view is a
+            // NODE in ggml, not a leaf. The 27B needs 48*6 = 288; sizing this
+            // by hand is what overflowed the graph before.
+            let n_recr = (0..hp.n_layer).filter(|&il| hp.is_recurrent(il)).count();
+            let n_nodes = n_recr * 8 + 32;
             let params = ffi::ggml_init_params {
-                mem_size: (hp.n_layer * 6 + 16) * ffi::ggml_tensor_overhead()
-                    + ffi::ggml_graph_overhead(),
+                mem_size: (n_recr * 8 + 32) * ffi::ggml_tensor_overhead()
+                    + ffi::ggml_graph_overhead_custom(n_nodes, false),
                 mem_buffer: std::ptr::null_mut(),
                 no_alloc: true,
             };
@@ -730,18 +735,36 @@ impl Qwen35 {
                 }
             }
             let _g = G(ctx);
-            let gf = ffi::ggml_new_graph_custom(ctx, (hp.n_layer * 4 + 16) as usize, false);
+            let gf = ffi::ggml_new_graph_custom(ctx, n_nodes, false);
             for il in 0..hp.n_layer {
                 if !hp.is_recurrent(il) {
                     continue;
                 }
-                for t in [session.conv_state[il], session.gdn_state[il]] {
-                    let slot_nb = if (*t).ne[3] > 1 { (*t).nb[3] } else { (*t).nb[2] };
-                    let elems = ffi::ggml_nelements(t) / session.k_slots;
-                    let src = ffi::ggml_view_1d(ctx, t, elems, n * slot_nb);
-                    let dst = ffi::ggml_view_1d(ctx, t, elems, 0);
-                    ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, src, dst));
-                }
+                // Views must keep the tensor's own dimensions: under tensor
+                // parallelism these states are split (conv on ne[1], gdn on
+                // ne[2]), and a flattened 1-D view erases the axis the meta
+                // backend needs to follow. Only the slot offset differs.
+                let cs = session.conv_state[il];
+                let gs = session.gdn_state[il];
+                let conv_src = ffi::ggml_view_3d(
+                    ctx, cs, (*cs).ne[0], (*cs).ne[1], 1,
+                    (*cs).nb[1], (*cs).nb[2], n * (*cs).nb[2],
+                );
+                let conv_dst = ffi::ggml_view_3d(
+                    ctx, cs, (*cs).ne[0], (*cs).ne[1], 1,
+                    (*cs).nb[1], (*cs).nb[2], 0,
+                );
+                ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, conv_src, conv_dst));
+
+                let gdn_src = ffi::ggml_view_4d(
+                    ctx, gs, (*gs).ne[0], (*gs).ne[1], (*gs).ne[2], 1,
+                    (*gs).nb[1], (*gs).nb[2], (*gs).nb[3], n * (*gs).nb[3],
+                );
+                let gdn_dst = ffi::ggml_view_4d(
+                    ctx, gs, (*gs).ne[0], (*gs).ne[1], (*gs).ne[2], 1,
+                    (*gs).nb[1], (*gs).nb[2], (*gs).nb[3], 0,
+                );
+                ffi::ggml_build_forward_expand(gf, ffi::ggml_cpy(ctx, gdn_src, gdn_dst));
             }
             if let Some(sched) = self.weights.sched() {
                 ffi::ggml_backend_sched_reset(sched);
@@ -1035,8 +1058,14 @@ impl Qwen35 {
         let dbg_gdn_zero = dbg.gdn_zero;
         let dbg_no_writes = dbg.no_writes;
 
+        // ~60 nodes per layer at the widest (GDN with K snapshot writes),
+        // plus head and inputs. Sized from the model, not a fixed guess: the
+        // 27B with speculative verify overflowed a hardcoded 8192.
+        let graph_nodes = hp.n_layer * 96 + 512;
         let params = ffi::ggml_init_params {
-            mem_size: 64 << 20,
+            mem_size: (graph_nodes * 2) * ffi::ggml_tensor_overhead()
+                + ffi::ggml_graph_overhead_custom(graph_nodes, false)
+                + (16 << 20),
             mem_buffer: std::ptr::null_mut(),
             no_alloc: true,
         };
@@ -1045,7 +1074,7 @@ impl Qwen35 {
             return Err(ModelError::Load("graph ctx init".into()));
         }
 
-        let gf = ffi::ggml_new_graph_custom(ctx, 8192, false);
+        let gf = ffi::ggml_new_graph_custom(ctx, graph_nodes, false);
         let f32t = ffi::ggml_type_GGML_TYPE_F32;
 
         // ---- inputs ----

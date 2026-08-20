@@ -95,7 +95,7 @@ impl Qwen35 {
             .ok_or_else(|| ModelError::Load("model has no MTP head".into()))?;
 
         let params = ffi::ggml_init_params {
-            mem_size: 16 << 20,
+            mem_size: 32 << 20,
             mem_buffer: std::ptr::null_mut(),
             no_alloc: true,
         };
@@ -103,7 +103,7 @@ impl Qwen35 {
         if ctx.is_null() {
             return Err(ModelError::Load("mtp ctx init".into()));
         }
-        let gf = ffi::ggml_new_graph_custom(ctx, 512, false);
+        let gf = ffi::ggml_new_graph_custom(ctx, 2048, false);
         let f32t = ffi::ggml_type_GGML_TYPE_F32;
 
         let inp_tokens = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I32, t_len);
