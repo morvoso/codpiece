@@ -183,13 +183,13 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     let prompt_ids = tok.encode(&prompt, true);
     eprintln!("prompt: {} tokens", prompt_ids.len());
 
-    // prefill (single ubatch; chunk if longer than 512)
+    // prefill (single ubatch; chunk if longer than 512). Greedy sampling
+    // happens inside the graph, so only the token id crosses the bus.
     let t0 = std::time::Instant::now();
-    let mut last_logits: Vec<f32> = Vec::new();
+    let mut next = 0u32;
     for chunk in prompt_ids.chunks(512) {
-        let out_pos = [(chunk.len() - 1) as i32];
-        last_logits = match model.step(&mut session, chunk, &out_pos, threads) {
-            Ok(l) => l,
+        next = match model.step_greedy(&mut session, chunk, threads) {
+            Ok(t) => t,
             Err(e) => {
                 eprintln!("prefill: {e}");
                 return ExitCode::FAILURE;
@@ -201,20 +201,18 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     // decode
     let t1 = std::time::Instant::now();
     let mut gen_ids: Vec<u32> = Vec::with_capacity(n_gen);
-    let mut next = tandem_model::qwen35::argmax(&last_logits);
     gen_ids.push(next);
     for _ in 1..n_gen {
         if !ignore_eos && Some(next) == tok.eos {
             break;
         }
-        let logits = match model.step(&mut session, &[next], &[0], threads) {
-            Ok(l) => l,
+        next = match model.step_greedy(&mut session, &[next], threads) {
+            Ok(t) => t,
             Err(e) => {
                 eprintln!("decode: {e}");
                 return ExitCode::FAILURE;
             }
         };
-        next = tandem_model::qwen35::argmax(&logits);
         gen_ids.push(next);
     }
     let t_decode = t1.elapsed().as_secs_f64();

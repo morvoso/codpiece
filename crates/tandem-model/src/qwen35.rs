@@ -180,6 +180,12 @@ struct SessView {
     fa: bool,
 }
 
+/// Either raw logits or an in-graph-sampled token id.
+enum StepOut {
+    Logits(Vec<f32>),
+    Token(u32),
+}
+
 enum StateSrc {
     /// Zero states, no KV cache, positions start at 0 (reference rig).
     Stateless,
@@ -201,6 +207,8 @@ struct Built {
     out: *mut ffi::ggml_tensor,
     n_kv: i64,
     fa_mask: bool,
+    /// out is an I32 token id (in-graph argmax) rather than f32 logits
+    greedy: bool,
 }
 
 /// Cached T=1 decode graph with its dedicated allocator: the same cgraph
@@ -209,6 +217,7 @@ struct CachedStep {
     built: Built,
     galloc: ffi::ggml_gallocr_t,
     bucket: i64,
+    greedy: bool,
 }
 
 impl Drop for CachedStep {
@@ -402,7 +411,18 @@ impl Qwen35 {
         out_positions: &[i32],
         n_threads: i32,
     ) -> Result<Vec<f32>, ModelError> {
-        self.run_general(tokens, StateSrc::Stateless, None, 0, out_positions, n_threads)
+        match self.run_general(
+            tokens,
+            StateSrc::Stateless,
+            None,
+            0,
+            out_positions,
+            n_threads,
+            false,
+        )? {
+            StepOut::Logits(l) => Ok(l),
+            StepOut::Token(_) => unreachable!(),
+        }
     }
 
     /// Stateful step: consume `tokens` at positions [session.n_past, ..),
@@ -416,6 +436,35 @@ impl Qwen35 {
         out_positions: &[i32],
         n_threads: i32,
     ) -> Result<Vec<f32>, ModelError> {
+        match self.step_impl(session, tokens, out_positions, n_threads, false)? {
+            StepOut::Logits(l) => Ok(l),
+            StepOut::Token(_) => unreachable!("logits requested"),
+        }
+    }
+
+    /// Greedy step: argmax runs IN the graph, so only the chosen token id
+    /// crosses the bus. Numerically identical to argmax over step()'s logits.
+    pub fn step_greedy(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        n_threads: i32,
+    ) -> Result<u32, ModelError> {
+        let last = [(tokens.len() - 1) as i32];
+        match self.step_impl(session, tokens, &last, n_threads, true)? {
+            StepOut::Token(t) => Ok(t),
+            StepOut::Logits(_) => unreachable!("token requested"),
+        }
+    }
+
+    fn step_impl(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        out_positions: &[i32],
+        n_threads: i32,
+        greedy: bool,
+    ) -> Result<StepOut, ModelError> {
         if session.n_past + tokens.len() > session.n_ctx_max {
             return Err(ModelError::Load(format!(
                 "context overflow: {} + {} > {}",
@@ -425,7 +474,7 @@ impl Qwen35 {
             )));
         }
         let out = if tokens.len() == 1 && out_positions == [0] && session.fa {
-            self.step_cached(session, tokens[0], n_threads)?
+            self.step_cached(session, tokens[0], n_threads, greedy)?
         } else {
             let view = session.view();
             let galloc = session.galloc;
@@ -438,6 +487,7 @@ impl Qwen35 {
                 session.n_past,
                 out_positions,
                 n_threads,
+                greedy,
             )?
         };
         session.n_past += tokens.len();
@@ -454,7 +504,8 @@ impl Qwen35 {
         n_past: usize,
         out_positions: &[i32],
         n_threads: i32,
-    ) -> Result<Vec<f32>, ModelError> {
+        greedy: bool,
+    ) -> Result<StepOut, ModelError> {
         assert!(!tokens.is_empty());
         assert!(!out_positions.is_empty());
         unsafe {
@@ -464,6 +515,7 @@ impl Qwen35 {
                 &state,
                 out_positions.len() as i64,
                 false,
+                greedy,
             )?;
             struct CtxGuard(*mut ffi::ggml_context, ffi::ggml_gallocr_t);
             impl Drop for CtxGuard {
@@ -492,9 +544,19 @@ impl Qwen35 {
             }
             self.fill_inputs(&built, tokens, n_past, out_positions);
             self.compute(built.gf, n_threads)?;
-            let mut logits = vec![0f32; self.hp.n_vocab as usize * out_positions.len()];
-            ffi::ggml_backend_tensor_get(built.out, logits.as_mut_ptr().cast(), 0, logits.len() * 4);
-            Ok(logits)
+            Ok(self.read_out(&built, out_positions.len()))
+        }
+    }
+
+    unsafe fn read_out(&self, b: &Built, n_out: usize) -> StepOut {
+        if b.greedy {
+            let mut ids = vec![0i32; n_out];
+            ffi::ggml_backend_tensor_get(b.out, ids.as_mut_ptr().cast(), 0, n_out * 4);
+            StepOut::Token(ids[n_out - 1] as u32)
+        } else {
+            let mut logits = vec![0f32; self.hp.n_vocab as usize * n_out];
+            ffi::ggml_backend_tensor_get(b.out, logits.as_mut_ptr().cast(), 0, logits.len() * 4);
+            StepOut::Logits(logits)
         }
     }
 
@@ -504,15 +566,27 @@ impl Qwen35 {
         session: &mut Session,
         token: u32,
         n_threads: i32,
-    ) -> Result<Vec<f32>, ModelError> {
+        greedy: bool,
+    ) -> Result<StepOut, ModelError> {
         let n_kv_exact = (session.n_past + 1) as i64;
         let bucket = (((n_kv_exact + KV_BUCKET - 1) / KV_BUCKET) * KV_BUCKET)
             .min(session.n_ctx_max as i64);
-        let stale = session.cached.as_ref().map(|c| c.bucket != bucket).unwrap_or(true);
+        let stale = session
+            .cached
+            .as_ref()
+            .map(|c| c.bucket != bucket || c.greedy != greedy)
+            .unwrap_or(true);
         if stale {
             unsafe {
-                let built =
-                    self.build_inner(1, bucket, &StateSrc::Session(session.view()), 1, true, 0)?;
+                let built = self.build_inner(
+                    1,
+                    bucket,
+                    &StateSrc::Session(session.view()),
+                    1,
+                    true,
+                    0,
+                    greedy,
+                )?;
                 let galloc = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                     self.weights.backend(),
                 ));
@@ -525,7 +599,7 @@ impl Qwen35 {
                     ffi::ggml_free(built.ctx);
                     return Err(ModelError::Load("decode graph alloc".into()));
                 }
-                session.cached = Some(CachedStep { built, galloc, bucket });
+                session.cached = Some(CachedStep { built, galloc, bucket, greedy });
             }
         }
         let cached = session.cached.as_ref().unwrap();
@@ -534,14 +608,7 @@ impl Qwen35 {
             let row: [i64; 1] = [session.n_past as i64];
             ffi::ggml_backend_tensor_set(cached.built.row_ids, row.as_ptr().cast(), 0, 8);
             self.compute(cached.built.gf, n_threads)?;
-            let mut logits = vec![0f32; self.hp.n_vocab as usize];
-            ffi::ggml_backend_tensor_get(
-                cached.built.out,
-                logits.as_mut_ptr().cast(),
-                0,
-                logits.len() * 4,
-            );
-            Ok(logits)
+            Ok(self.read_out(&cached.built, 1))
         }
     }
 
@@ -552,6 +619,7 @@ impl Qwen35 {
         state: &StateSrc,
         n_out: i64,
         use_set_rows: bool,
+        greedy: bool,
     ) -> Result<Built, ModelError> {
         let n_kv_exact = n_past as i64 + t_len;
         let n_kv = match state {
@@ -560,7 +628,7 @@ impl Qwen35 {
                 (((n_kv_exact + KV_BUCKET - 1) / KV_BUCKET) * KV_BUCKET).min(s.n_ctx_max as i64)
             }
         };
-        self.build_inner(t_len, n_kv, state, n_out, use_set_rows, n_past)
+        self.build_inner(t_len, n_kv, state, n_out, use_set_rows, n_past, greedy)
     }
 
     /// Build the forward graph. `n_past_views` is used ONLY by the
@@ -574,6 +642,7 @@ impl Qwen35 {
         n_out: i64,
         use_set_rows: bool,
         n_past_views: usize,
+        greedy: bool,
     ) -> Result<Built, ModelError> {
         let hp = &self.hp;
 
@@ -937,6 +1006,13 @@ impl Qwen35 {
         cur = rms(ctx, inp_l, output_norm);
         cur = ffi::ggml_get_rows(ctx, cur, out_ids);
         cur = ffi::ggml_mul_mat(ctx, output_w, cur);
+        if greedy {
+            // Sample in the graph: the readback becomes 4 bytes instead of
+            // n_vocab floats (993 KB for this model), removing a full
+            // device sync + PCIe transfer from every decode step. Exact for
+            // temp-0: ggml_argmax selects the same element CPU argmax would.
+            cur = ffi::ggml_argmax(ctx, cur);
+        }
         ffi::ggml_set_output(cur);
         ffi::ggml_build_forward_expand(gf, cur);
 
@@ -953,6 +1029,7 @@ impl Qwen35 {
             out: cur,
             n_kv,
             fa_mask: use_fa,
+            greedy,
         })
     }
 
