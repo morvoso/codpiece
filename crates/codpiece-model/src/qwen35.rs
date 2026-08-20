@@ -293,6 +293,8 @@ struct Built {
     draft_out: *mut ffi::ggml_tensor,
     /// chained drafts beyond the first, in order
     draft_chain: Vec<*mut ffi::ggml_tensor>,
+    /// per-link softmax peak at the drafted token, aligned with draft_out+draft_chain
+    draft_conf: Vec<*mut ffi::ggml_tensor>,
     /// candidate token ids the draft head projects onto (empty = full vocab)
     cand_ids: *mut ffi::ggml_tensor,
     mtp_pos: *mut ffi::ggml_tensor,
@@ -651,6 +653,20 @@ struct FusedStep {
     /// current one will produce — so it has to be part of the key in its own right.
     depth: usize,
     used: u64,
+}
+
+/// One fused verify+draft round's outputs.
+pub struct FusedOut {
+    /// the trunk's argmax at each requested position
+    pub preds: Vec<u32>,
+    /// draft chains: chain[link][position]
+    pub chain: Vec<Vec<u32>>,
+    /// per-link softmax peak at the drafted token, aligned with `chain`
+    pub conf: Vec<Vec<f32>>,
+    /// full-vocabulary logits per position when requested, else empty
+    pub logits: Vec<f32>,
+    /// trunk hidden per position when logits were requested, else empty
+    pub hidden: Vec<f32>,
 }
 
 /// How many fused graph shapes to keep. Adaptive depth settles on one depth but probes
@@ -1393,7 +1409,7 @@ impl Qwen35 {
         last_only: bool,
         want_logits: bool,
         n_threads: i32,
-    ) -> Result<(Vec<u32>, Vec<Vec<u32>>, Vec<f32>, Vec<f32>), ModelError> {
+    ) -> Result<FusedOut, ModelError> {
         let n_cand = cands.map(|c| c.len() as i64).unwrap_or(0);
         if session.n_past + tokens.len() > session.n_ctx_max {
             return Err(ModelError::Load("context overflow".into()));
@@ -1532,6 +1548,12 @@ impl Qwen35 {
 
             let mut preds = vec![0i32; no];
             ffi::ggml_backend_tensor_get(b.out, preds.as_mut_ptr().cast(), 0, no * 4);
+            let mut conf: Vec<Vec<f32>> = Vec::new();
+            for tnsr in &b.draft_conf {
+                let mut c = vec![0f32; no];
+                ffi::ggml_backend_tensor_get(*tnsr, c.as_mut_ptr().cast(), 0, no * 4);
+                conf.push(c);
+            }
             let mut chain: Vec<Vec<u32>> = Vec::new();
             for tnsr in std::iter::once(b.draft_out).chain(b.draft_chain.iter().copied()) {
                 let mut ids = vec![0i32; no];
@@ -1570,7 +1592,13 @@ impl Qwen35 {
             }
 
             session.n_past += t;
-            Ok((preds.into_iter().map(|v| v as u32).collect(), chain, logits, hidden))
+            Ok(FusedOut {
+                preds: preds.into_iter().map(|v| v as u32).collect(),
+                chain,
+                conf,
+                logits,
+                hidden,
+            })
         }
     }
 
@@ -2411,6 +2439,7 @@ impl Qwen35 {
         // batched drafts stay consistent with whatever prefix verification
         // ends up keeping.
         let mut draft_chain: Vec<*mut ffi::ggml_tensor> = Vec::new();
+        let mut draft_conf: Vec<*mut ffi::ggml_tensor> = Vec::new();
         let mut cand_ids: *mut ffi::ggml_tensor = std::ptr::null_mut();
         let (mut draft_out, mut mtp_pos, mut mtp_mask, mut mtp_rows, mut mtp_n_kv) = (
             std::ptr::null_mut(),
@@ -2502,9 +2531,27 @@ impl Qwen35 {
                     let l = ffi::ggml_mul_mat(ctx, sub, h_next);
                     (l, ffi::ggml_argmax(ctx, l))
                 };
-                let _ = logits_d;
                 ffi::ggml_set_output(ids);
                 ffi::ggml_build_forward_expand(gf, ids);
+                // The link's confidence: the softmax peak at its own argmax. This is
+                // what lets the host truncate a carried chain at the first link the
+                // draft head does not believe in — production's p-min — and it is why
+                // acceptance can sit above 0.9 without giving up depth. The gather is
+                // batched get_rows: the softmax viewed as [1, vocab, n_out] with the
+                // argmax ids as [1, n_out] selects element (ids[j], j) per column.
+                // Everything here inherits the head's MIRRORED split state; source
+                // ops like arange have no split axis and abort the TP meta backend.
+                let conf = {
+                    let vocab_rows = (*logits_d).ne[0];
+                    let pm = ffi::ggml_soft_max(ctx, logits_d);
+                    let table = ffi::ggml_reshape_3d(ctx, pm, 1, vocab_rows, n_out);
+                    let cols = ffi::ggml_reshape_2d(ctx, ids, 1, n_out);
+                    let peak = ffi::ggml_get_rows(ctx, table, cols);
+                    ffi::ggml_set_output(peak);
+                    ffi::ggml_build_forward_expand(gf, peak);
+                    peak
+                };
+                draft_conf.push(conf);
                 if step == 0 {
                     draft_out = ids;
                 } else {
@@ -2530,6 +2577,7 @@ impl Qwen35 {
             h_out: h_sel,
             draft_out,
             draft_chain,
+            draft_conf,
             cand_ids,
             mtp_pos,
             mtp_mask,

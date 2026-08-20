@@ -9,7 +9,9 @@
 set -u
 
 LOCK=/tmp/llama-sweep.lock
-PROD_CONTAINER=llama-qwen
+# codpiece became the deployed engine on 2026-08-20; PROD_CONTAINER may be overridden
+# when benching against a different deployment.
+PROD_CONTAINER=${PROD_CONTAINER:-codpiece-qwen}
 PROD_URL=http://localhost:8020
 LOGDIR=$HOME/llm/codpiece/logs
 TEMP_ABORT_C=83

@@ -40,6 +40,10 @@ services:
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       NCCL_P2P_DISABLE: "1"
       NCCL_SHM_DISABLE: "0"
+      # Confidence gates on speculative drafts; 0.9/0.9 holds measured
+      # acceptance >= 0.90 (greedy and temperature) on the 27B.
+      CODPIECE_CHAIN_PMIN: ${CODPIECE_CHAIN_PMIN:-0.9}
+      CODPIECE_REDRAFT_PMIN: ${CODPIECE_REDRAFT_PMIN:-0.9}
     entrypoint: /src/target/release/codpiece
     command: >-
       serve /models/qwen38/${MODEL_FILE:-Qwen3.8-27B-UD-Q8_K_XL.gguf}

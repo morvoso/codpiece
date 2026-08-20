@@ -90,6 +90,34 @@ gate holds. Speculative decode is gated on committing only trunk-predicted
 tokens, and on matching the reference implementation's behaviour — which it
 does.
 
+### Acceptance ≥ 0.90 — 2026-08-20
+
+Speculation now runs behind two confidence gates, both defaulting to 0.9:
+
+- `CODPIECE_CHAIN_PMIN` — the fused graph emits each chain link's softmax peak
+  at its own argmax (a batched `get_rows` over the softmax viewed as
+  `[1, vocab, n_out]`; in-graph, so it costs no extra readback pass), and the
+  server carries a chain link into the next round only while the draft head's
+  confidence holds above the gate.
+- `CODPIECE_REDRAFT_PMIN` — the post-divergence re-draft chain stops at the
+  first link whose softmax peak falls below the gate (this knob existed at
+  0.75; the joint sweep moved it).
+
+Verification accepts a draft with probability p(x0), so a well-calibrated 0.9
+gate puts every surviving draft near 0.93 acceptance odds — and either gate
+alone tops out near 0.86 because the other pool dilutes the ratio. Measured on
+the 27B under tensor parallel (db2 harness, 2 reps): acceptance **0.910
+greedy, 0.910 sampled short, 0.933 sampled at 32K** (0.678 / 0.637 / 0.684
+with the gates off). The ratio is bought with fewer carried drafts, so decode
+gives back some speed (32K sampled 39.5 tok/s vs 47.5 gate-off); accuracy
+ranks above speed here, and both knobs are env-tunable per deployment.
+
+One porting note for the in-graph confidence: the tensor-parallel meta backend
+infers a split axis for every tensor from its sources, so source ops like
+`ggml_arange` (no inputs, nothing to inherit) abort it. The gather sticks to
+ops that inherit the lm head's mirrored state — which is also why the lm head
+*stays* mirrored (`lm_head_is_replicated_to_keep_sampling_in_graph`).
+
 Draft depth is `--depth N` (default 3, the best single setting across the prompts
 measured). `--depth auto` chooses per round from observed acceptance and measured
 round cost, and matches fixed depth 3 within +-0.4% across four prompts while

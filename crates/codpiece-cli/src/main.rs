@@ -479,7 +479,7 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         } else {
             model
                 .step_fused_cached(session, batch, d, cands, last_only, false, threads)
-                .map(|(p, c, _logits, _hidden)| (p, c))
+                .map(|o| (o.preds, o.chain))
         }
     };
     let mut picker = codpiece_server::depth::DepthPicker::new(adaptive, depth, max_depth);
