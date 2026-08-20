@@ -15,6 +15,7 @@ use tandem_gguf::GgufFile;
 
 pub mod meta;
 pub mod mtp_graph;
+pub mod oracle;
 pub mod qwen35;
 pub mod split;
 
@@ -315,6 +316,14 @@ impl Weights {
     /// disables backend sampling for SPLIT_MODE_TENSOR.
     pub fn is_tensor_parallel(&self) -> bool {
         matches!(self.device, Device::CudaTensorParallel(_))
+    }
+
+    /// Whether sampling can run inside the graph. Under tensor parallelism
+    /// this holds only while the LM head is replicated rather than split
+    /// (see split.rs): a per-row argmax over a column-split vocabulary is
+    /// meaningless and ggml rejects it.
+    pub fn can_sample_in_graph(&self) -> bool {
+        !self.is_tensor_parallel() || std::env::var("TANDEM_SPLIT_OUTPUT").is_err()
     }
 
     pub fn n_tensors(&self) -> usize {

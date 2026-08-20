@@ -66,6 +66,8 @@ fn cmd_spec(args: &[String]) -> ExitCode {
     let mut n_ctx = 4096usize;
     let mut n_spec = 1usize;
     let mut p_min = 0.75f32;
+    let mut n_oracle = 0usize;
+    let mut oracle_conf = 0.6f32;
     let mut gpu: Option<i32> = None;
     let mut tp: Option<Vec<i32>> = None;
     let mut ignore_eos = false;
@@ -78,6 +80,10 @@ fn cmd_spec(args: &[String]) -> ExitCode {
             "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
             "--spec" => n_spec = it.next().and_then(|s| s.parse().ok()).unwrap_or(1),
             "--p-min" => p_min = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.75),
+            "--oracle" => n_oracle = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            "--oracle-conf" => {
+                oracle_conf = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.6)
+            }
             "--ignore-eos" => ignore_eos = true,
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
             "--tp" => {
@@ -106,8 +112,10 @@ fn cmd_spec(args: &[String]) -> ExitCode {
         }
     };
     let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
+    // rollback slots must cover every draft a round can produce, from both
+    // drafters
     let mut session =
-        match tandem_model::qwen35::Session::new_spec(&model, n_ctx, n_spec) {
+        match tandem_model::qwen35::Session::new_spec(&model, n_ctx, n_spec + n_oracle) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("spec: {e}");
@@ -116,6 +124,11 @@ fn cmd_spec(args: &[String]) -> ExitCode {
         };
 
     let prompt_ids = tok.encode(&prompt, true);
+    // The oracle learns from the prompt before generation starts: quoting the
+    // input back is the single most common free-token case.
+    let mut oracle = tandem_model::oracle::ContextOracle::new(oracle_conf);
+    oracle.extend(&prompt_ids);
+
     let t0 = std::time::Instant::now();
     let (mut logits, mut hidden) = match model.step_with_hidden(
         &mut session,
@@ -130,10 +143,10 @@ fn cmd_spec(args: &[String]) -> ExitCode {
         }
     };
     let t_prefill = t0.elapsed().as_secs_f64();
-    let n_vocab = model.hp.n_vocab as usize;
 
     let mut committed: Vec<u32> = vec![tandem_model::qwen35::argmax(&logits)];
     let (mut accepted, mut proposed, mut rounds) = (0usize, 0usize, 0usize);
+    let mut oracle_accepted = 0usize;
     let t1 = std::time::Instant::now();
 
     'outer: while committed.len() < n_gen {
@@ -175,11 +188,25 @@ fn cmd_spec(args: &[String]) -> ExitCode {
             }
         }
 
+        // ---- free drafts from the CPU oracle ----
+        // These cost no GPU time at all, and extending a verify batch is
+        // nearly free on bandwidth-bound hardware: the weights are read once
+        // either way. So they can only add accepted tokens to a pass we are
+        // already paying for.
+        let n_mtp_drafts = drafts.len();
+        if n_oracle > 0 {
+            let mut prefix = vec![last];
+            prefix.extend_from_slice(&drafts);
+            let extra = oracle.draft(&prefix, n_oracle);
+            drafts.extend_from_slice(&extra);
+        }
+
         // ---- verify: last token + all drafts in one trunk pass ----
         let mut batch = vec![last];
         batch.extend_from_slice(&drafts);
         let outs: Vec<i32> = (0..batch.len() as i32).collect();
-        let (vl, vh) = match model.step_with_hidden(&mut session, &batch, &outs, threads) {
+        let _ = &outs;
+        let (vp, vh) = match model.step_verify(&mut session, &batch, threads) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("verify: {e}");
@@ -192,7 +219,7 @@ fn cmd_spec(args: &[String]) -> ExitCode {
         // position i predicts token i+1; keep drafts while they match
         let mut n_keep = 0usize;
         for (i, d) in drafts.iter().enumerate() {
-            let truth = tandem_model::qwen35::argmax(&vl[i * n_vocab..(i + 1) * n_vocab]);
+            let truth = vp[i];
             if truth == *d {
                 n_keep += 1;
             } else {
@@ -200,17 +227,27 @@ fn cmd_spec(args: &[String]) -> ExitCode {
             }
         }
         accepted += n_keep;
+        let from_oracle = n_keep.saturating_sub(n_mtp_drafts);
+        oracle_accepted += from_oracle;
+        oracle.record(from_oracle);
 
         // commit accepted drafts plus the token the trunk itself produced.
         // An accepted draft can be EOS, and nothing may follow it.
+        let mut newly: Vec<u32> = Vec::with_capacity(n_keep + 1);
         for d in drafts.iter().take(n_keep) {
             committed.push(*d);
+            newly.push(*d);
             if committed.len() >= n_gen || (!ignore_eos && Some(*d) == tok.eos) {
+                oracle.extend(&newly);
                 break 'outer;
             }
         }
-        let next = tandem_model::qwen35::argmax(&vl[n_keep * n_vocab..(n_keep + 1) * n_vocab]);
+        let next = vp[n_keep];
         committed.push(next);
+        newly.push(next);
+        // only committed tokens teach the oracle; a rejected draft must never
+        // become evidence for what the model says
+        oracle.extend(&newly);
         hidden = vh[n_keep * model.hp.n_embd as usize..(n_keep + 1) * model.hp.n_embd as usize]
             .to_vec();
 
@@ -224,8 +261,7 @@ fn cmd_spec(args: &[String]) -> ExitCode {
             session.n_past -= extra;
             session.mtp_past -= extra;
         }
-        let _ = logits;
-        logits = vl;
+
     }
     let t_decode = t1.elapsed().as_secs_f64();
 
@@ -233,8 +269,9 @@ fn cmd_spec(args: &[String]) -> ExitCode {
     let rate = if proposed == 0 { 0.0 } else { accepted as f64 / proposed as f64 };
     eprintln!(
         "prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s) | \
-         spec {n_spec}/p{p_min}: acceptance {accepted}/{proposed} = {rate:.3}, {rounds} rounds, \
-         {:.2} tok/round",
+         spec {n_spec}/p{p_min} + oracle {n_oracle}: acceptance {accepted}/{proposed} = \
+         {rate:.3}, {rounds} rounds, {:.2} tok/round, oracle drafted {} kept {oracle_accepted} \
+         ({:.3})",
         prompt_ids.len(),
         t_prefill,
         prompt_ids.len() as f64 / t_prefill,
@@ -242,6 +279,8 @@ fn cmd_spec(args: &[String]) -> ExitCode {
         t_decode,
         committed.len() as f64 / t_decode,
         committed.len() as f64 / rounds.max(1) as f64,
+        oracle.proposals,
+        oracle.acceptance(),
     );
     ExitCode::SUCCESS
 }
@@ -681,10 +720,10 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
     let n_chunk_max = tokens.len() / n_ctx;
     let n_chunk = if n_chunks < 0 { n_chunk_max } else { (n_chunks as usize).min(n_chunk_max) };
     let first = n_ctx / 2;
-    let n_vocab = model.hp.n_vocab as usize;
     // logits at j for j in [first, n_ctx-1) predict token j+1
     let out_positions: Vec<i32> = (first..n_ctx - 1).map(|j| j as i32).collect();
 
+    let n_vocab = model.hp.n_vocab as usize;
     let mut nll = 0f64;
     let mut count = 0usize;
     for i in 0..n_chunk {

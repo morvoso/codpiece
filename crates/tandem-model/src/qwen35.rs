@@ -578,9 +578,7 @@ impl Qwen35 {
         n_threads: i32,
     ) -> Result<u32, ModelError> {
         let last = [(tokens.len() - 1) as i32];
-        // Tensor parallelism splits the vocabulary across devices, so the
-        // argmax has to happen after the logits are gathered host-side.
-        let in_graph = !self.weights.is_tensor_parallel();
+        let in_graph = self.weights.can_sample_in_graph();
         match self.step_impl(session, tokens, &last, n_threads, in_graph)? {
             StepOut::Token(t) => Ok(t),
             StepOut::Logits(l) => Ok(argmax(&l)),
@@ -841,6 +839,87 @@ impl Qwen35 {
                 hidden.len() * 4,
             );
             (logits, hidden)
+        };
+        session.n_past += tokens.len();
+        Ok(out)
+    }
+
+    /// Verify step: consume `tokens` and return the token the model itself
+    /// predicts at every position, plus the hidden states.
+    ///
+    /// When sampling can run in the graph, the readback is 4 bytes per
+    /// position instead of n_vocab floats — 3.9 MB each on the 27B. That is
+    /// what makes it cheap to extend a speculative round with extra
+    /// candidate tokens, since the verify pass itself is bandwidth-bound and
+    /// nearly indifferent to how many tokens ride along.
+    pub fn step_verify(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        n_threads: i32,
+    ) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
+        if session.n_past + tokens.len() > session.n_ctx_max {
+            return Err(ModelError::Load("context overflow".into()));
+        }
+        let out_positions: Vec<i32> = (0..tokens.len() as i32).collect();
+        let greedy = self.weights.can_sample_in_graph();
+        let view = session.view();
+        let galloc = session.galloc;
+        session.cached = None;
+        let out = unsafe {
+            let built = self.build(
+                tokens.len() as i64,
+                session.n_past,
+                &StateSrc::Session(view),
+                out_positions.len() as i64,
+                false,
+                greedy,
+            )?;
+            struct G(*mut ffi::ggml_context);
+            impl Drop for G {
+                fn drop(&mut self) {
+                    unsafe { ffi::ggml_free(self.0) }
+                }
+            }
+            let _g = G(built.ctx);
+            if let Some(sched) = self.weights.sched() {
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, built.gf) {
+                    return Err(ModelError::Load("sched alloc".into()));
+                }
+            } else if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
+                return Err(ModelError::Load("graph alloc".into()));
+            }
+            self.fill_inputs(&built, tokens, session.n_past, &out_positions);
+            self.compute(built.gf, n_threads)?;
+
+            let n_out = out_positions.len();
+            let preds: Vec<u32> = if greedy {
+                let mut ids = vec![0i32; n_out];
+                ffi::ggml_backend_tensor_get(built.out, ids.as_mut_ptr().cast(), 0, n_out * 4);
+                ids.into_iter().map(|v| v as u32).collect()
+            } else {
+                let mut logits = vec![0f32; self.hp.n_vocab as usize * n_out];
+                ffi::ggml_backend_tensor_get(
+                    built.out,
+                    logits.as_mut_ptr().cast(),
+                    0,
+                    logits.len() * 4,
+                );
+                (0..n_out)
+                    .map(|i| {
+                        argmax(&logits[i * self.hp.n_vocab as usize..(i + 1) * self.hp.n_vocab as usize])
+                    })
+                    .collect()
+            };
+            let mut hidden = vec![0f32; self.hp.n_embd as usize * n_out];
+            ffi::ggml_backend_tensor_get(
+                built.h_out,
+                hidden.as_mut_ptr().cast(),
+                0,
+                hidden.len() * 4,
+            );
+            (preds, hidden)
         };
         session.n_past += tokens.len();
         Ok(out)
@@ -1238,7 +1317,6 @@ impl Qwen35 {
         let mut cur;
         let mut inp_l = ffi::ggml_get_rows(ctx, tok_embd, inp_tokens);
 
-        let mut sections = hp.rope_sections;
         let elt = ffi::ggml_type_size(f32t);
         let row = |n: i64| ffi::ggml_row_size(f32t, n);
 

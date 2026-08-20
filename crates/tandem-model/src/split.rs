@@ -119,6 +119,20 @@ pub fn classify(name: &str, hp: &Hparams) -> Split {
     let Some((_il, suffix)) = layer_of(name) else {
         // non-layer tensors
         return match name {
+            // Deliberate asymmetry for THIS machine: replicating the LM head
+            // costs ~0.7 GiB of VRAM per card (of ~9 GiB free) but keeps the
+            // logits MIRRORED, which means the argmax can run inside the
+            // graph and only a token id crosses the bus instead of
+            // n_vocab floats — 3.9 MB per scored position on the 27B.
+            //
+            // With no NVLink and P2P disabled, PCIe is this box's scarce
+            // resource and VRAM is not, so the trade is strongly favorable
+            // here even though a general-purpose engine would split this
+            // tensor to save memory. TANDEM_SPLIT_OUTPUT=1 restores the
+            // memory-optimal choice.
+            "output.weight" if std::env::var("TANDEM_SPLIT_OUTPUT").is_err() => {
+                Split::mirrored()
+            }
             "output.weight" => seg(Axis::Axis1, vec![]),
             "output.bias" => seg(Axis::Axis0, vec![]),
             // token_embd, output_norm, and anything else: replicated
@@ -366,6 +380,13 @@ mod tests {
     }
 
     #[test]
+    fn lm_head_is_replicated_to_keep_sampling_in_graph() {
+        let hp = hp_27b();
+        let st = split_state("output.weight", &hp, 248320, 32, 2);
+        assert_eq!(st.axis, Axis::Mirrored, "logits must stay mirrored");
+    }
+
+    #[test]
     fn split_axes_match_llama_cpp() {
         let hp = hp_27b();
         // input projections split by columns, output projections by rows:
@@ -376,7 +397,10 @@ mod tests {
         assert_eq!(classify("blk.0.ffn_gate.weight", &hp).axis, Axis::Axis1);
         assert_eq!(classify("blk.0.ffn_down.weight", &hp).axis, Axis::Axis0);
         assert_eq!(classify("blk.0.ssm_out.weight", &hp).axis, Axis::Axis0);
-        assert_eq!(classify("output.weight", &hp).axis, Axis::Axis1);
+        // the LM head is deliberately replicated on this machine so the
+        // argmax can stay in the graph (see classify); the memory-optimal
+        // column split is still reachable via TANDEM_SPLIT_OUTPUT
+        assert_eq!(classify("output.weight", &hp).axis, Axis::Mirrored);
         // replicated
         for n in [
             "token_embd.weight",
@@ -428,8 +452,6 @@ mod tests {
             ("blk.0.ffn_up.weight", 17408, 32),
             ("blk.0.ffn_gate.weight", 17408, 32),
             ("blk.0.ffn_down.weight", 17408, 32),
-            // output head
-            ("output.weight", 248320, 32),
             // session caches
             ("cache_k_l3", 1024, 32),
             ("cache_v_l3", 1024, 32),
