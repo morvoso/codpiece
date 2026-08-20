@@ -19,6 +19,36 @@ regardless of how many tokens it checks, so throughput is
 `accepted_tokens / round`, and everything that is not "one weight-read"
 is waste to be removed.
 
+## The cost curve that reframes everything (27B, tensor parallel, measured)
+
+`tandem stepcost` times steady-state steps as a function of tokens carried:
+
+| tokens/step | ms/step | ms/token | vs T=1 |
+|---|---|---|---|
+| 1 | 26.02 | 26.02 | 1.00× |
+| 2 | 28.12 | 14.06 | 1.08× |
+| 4 | 31.36 | 7.84 | 1.21× |
+| 8 | 40.32 | 5.04 | 1.55× |
+| 16 | 48.10 | 3.01 | 1.85× |
+
+**Sixteen tokens cost 1.85× one token.** Verification really is close to free
+per token, exactly as the bandwidth argument predicts — which means the whole
+optimization problem is *accepted tokens per round*, and draft cost is the
+only thing standing in the way.
+
+It also locates the cost precisely. A bare T=4 step costs 31.4 ms, but a
+measured spec-3 round costs 51.8 ms — so **~20 ms of that round is the three
+separate draft executions**, about 6.7 ms each. At depth 1: round 37.9 ms
+against a 28.1 ms T=2 step, so ~9.8 ms for one draft.
+
+Two consequences:
+
+1. **Draft cost dominates, and it is not bandwidth.** A draft's actual weight
+   traffic is ~1.7 GiB per GPU (≈1.8 ms). It measures 6.7–9.8 ms.
+2. **Deeper verification is cheap; deeper *drafting* is not.** If drafts were
+   free, spec-3's 2.86 accepted tokens over a 31.4 ms verify would be
+   **91 tok/s**. That gap — 55 measured vs 91 available — is the prize.
+
 ---
 
 ## 1. Fuse the draft head into the verify graph — IMPLEMENTED
@@ -39,7 +69,19 @@ times located the real one instead (see below).
 Fusion is still the right shape, because it is what makes idea 4 possible:
 one graph per round has nothing to interleave with.
 
-## 2. Copy one recurrent snapshot instead of K — NOT YET DONE
+## 2. Copy one recurrent snapshot instead of K — NOT WORTH IT
+
+Arithmetic, now that it has been done properly: one GDN state slot is
+128×128×48×4 B = 3.1 MB, ×48 layers = 151 MB. Writing four slots instead of
+one costs 453 MB per round — 0.48 ms at 936 GB/s, against a ~52 ms round.
+**Under 1 %.**
+
+An earlier note in this file blamed this for the CPU oracle's 7 % loss. That
+was wrong by an order of magnitude, and the correction matters more than the
+idea: extra draft slots are cheap on the *snapshot* axis, and the real cost of
+widening a round is the draft executions (see the cost curve above).
+
+Original sketch, kept only because it is still correct as a mechanism:
 
 Rollback needs the state at the accepted position, and we do not know that
 position until after the graph runs, so today every round copies `K` snapshot

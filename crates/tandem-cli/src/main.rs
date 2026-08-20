@@ -25,6 +25,7 @@ fn main() -> ExitCode {
         Some("mtp-probe") => cmd_mtp_probe(&args[1..]),
         Some("spec") => cmd_spec(&args[1..]),
         Some("fused") => cmd_fused(&args[1..]),
+        Some("stepcost") => cmd_stepcost(&args[1..]),
         _ => {
             eprintln!(
                 "usage: tandem inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
@@ -34,6 +35,98 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Measure what a decode step actually costs as a function of how many tokens
+/// it carries.
+///
+/// This is the curve speculation lives or dies on. If the machine were purely
+/// bandwidth-bound, a step would cost the same for 1 token as for 16 — the
+/// weights are read once either way — and the right move would be to draft as
+/// deep as acceptance allows. Every extra millisecond that shows up as T grows
+/// is something other than bandwidth, and it caps useful draft depth.
+///
+/// Reports steady-state per-step time, so graph build and warmup are excluded.
+fn cmd_stepcost(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut threads = 8i32;
+    let mut n_ctx = 4096usize;
+    let mut gpu: Option<i32> = None;
+    let mut tp: Option<Vec<i32>> = None;
+    let mut reps = 8usize;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
+            "-r" => reps = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            _ => {}
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: tandem stepcost <file.gguf> [-r reps] [--gpu N|--tp 0,1]");
+        return ExitCode::from(2);
+    };
+    let dev = match (&tp, gpu) {
+        (Some(ids), _) => tandem_model::Device::CudaTensorParallel(ids.clone()),
+        (None, Some(i)) => tandem_model::Device::Cuda(i),
+        (None, None) => tandem_model::Device::Cpu,
+    };
+    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), dev) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("stepcost: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
+    let seed = tok.encode("The quick brown fox jumps over the lazy dog. ", true);
+
+    println!("tokens/step   ms/step   ms/token   vs T=1");
+    let mut base = 0f64;
+    for t_len in [1usize, 2, 4, 8, 16] {
+        let mut session =
+            match tandem_model::qwen35::Session::new_spec(&model, n_ctx, t_len) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("session: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        // warm the graph and the cache so we time steady state
+        let batch: Vec<u32> = (0..t_len).map(|i| seed[i % seed.len()]).collect();
+        let outs: Vec<i32> = (0..t_len as i32).collect();
+        for _ in 0..2 {
+            if let Err(e) = model.step(&mut session, &batch, &outs, threads) {
+                eprintln!("warmup t={t_len}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            if let Err(e) = model.step(&mut session, &batch, &outs, threads) {
+                eprintln!("step t={t_len}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+        if t_len == 1 {
+            base = ms;
+        }
+        println!(
+            "{t_len:>11}   {ms:>7.2}   {:>8.2}   {:>5.2}x",
+            ms / t_len as f64,
+            ms / base
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// Speculative generation where the draft head rides inside the verify graph.
