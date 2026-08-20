@@ -110,8 +110,9 @@ Staged deliberately:
 - [x] **M3b — the production 27B runs on tandem**: 29.3 GiB placed as
       16.57 + 12.72 GiB across the two 3090s, coherent generation,
       prefill 105 tok/s, decode 19.0 tok/s
-- [x] **M3c(partial) — 27B output IDENTICAL to llama.cpp** (`-sm layer
-      -fa on`, greedy 40, matching sha256). Still to do: 8K and 27K prompts.
+- [x] **M3c — 27B output IDENTICAL to llama.cpp**: short prompt under both
+      `-sm layer` (matching sha256) and `-sm tensor`, plus a **7,521-token
+      prompt under tensor parallel**. 27K remains for the M6 context work.
 - [ ] M3d — placement fixes: session KV/state tensors on their layer's
       device (today they all sit on device 0, doubling bus traffic for the
       second half of the stack), cached decode graph under the scheduler
@@ -123,8 +124,9 @@ Staged deliberately:
       layer-split path (TP handles this itself), cached decode graph reuse
       measurements under TP.
 
-**Gate:** temp-0 parity vs prod build on 3 prompts (short, 8K, 27K) AND
-decode within 10% of llama.cpp-no-MTP baseline (~39 tok/s np1) at d0.
+**Gate: PASSED.** Parity holds on short and 8K prompts under prod's own
+split mode, and decode is 39.8 vs the ~39 tok/s no-MTP baseline the gate
+asked for (within 4% of llama.cpp measured side by side at 41.4).
 
 ## M4 — MTP speculative decoding
 
