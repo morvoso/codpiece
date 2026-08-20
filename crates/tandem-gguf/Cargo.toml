@@ -1,0 +1,8 @@
+[package]
+name = "tandem-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-dependency GGUF v2/v3 reader: metadata, tensor directory, alignment/offset validation."
+
+[dependencies]

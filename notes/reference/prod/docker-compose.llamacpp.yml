@@ -1,0 +1,186 @@
+# Qwen3.8-27B on llama.cpp — 2x RTX 3090 (48 GiB total)
+#
+# Priority order (user, standing): ACCURACY > CONTEXT > SPEED.
+#
+# ===================================================================
+# NOTE 2026-08-16: the DEPLOYED default below is f16 KV, NOT the q8_0 that this
+# block describes -- the clean-slate shootout re-adopted f16 for accuracy, and a
+# later measurement justified it on SPEED as well: at 96K depth f16 decodes at
+# 47.8 tok/s vs q8_0's 41.8 (-12%). Dequantising KV inside the flash-attention
+# kernel costs more than the halved KV bandwidth saves, and the penalty grows
+# with depth (the two are equal at 0-32K). q8_0 KV buys CONTEXT (262144 vs
+# 196608), never speed -- do not "restore" it expecting a speedup.
+#
+# CONFIG C: q8_0 KV + tensor-parallel. Keeps every measured gain from
+# mostlygeek's config, reverts ONLY the f16 KV change.
+#
+# Why: f16 KV was adopted for "accuracy", but that gain was never
+# measured and q8_0 is near-lossless, while f16 cost 32768 tokens of
+# context outright. Since the speed gains came from --spec-draft-n-max 3
+# + --spec-draft-p-min 0.75 (MTP acceptance 0.60 -> 0.92) and from
+# -sm tensor, NOT from f16, dropping f16 should cost nothing but reclaim
+# a large amount of context. Under the stated priority order, trading
+# context for speed is backwards -- context outranks speed.
+#
+# KV arithmetic (16 of 64 layers cache; 4 kv heads; k/v length 256):
+#     f16   64 KiB/token  ->  196608 ctx = 12.0 GiB
+#     q8_0  34 KiB/token  ->  262144 ctx =  8.5 GiB   <- LESS memory, MORE context
+# 262144 is the model's native ceiling (qwen35.context_length), so it is
+# the most this model can do regardless of hardware.
+#
+# Previous configs, kept for rollback:
+#   docker-compose.yml.thermal-bak   layer split + q8_0 + 229376 (this morning)
+#   docker-compose.yml.f16-bak       f16 + tensor-parallel + 196608
+# ===================================================================
+#
+# Retained from their config because each was measured to help:
+#   -sm tensor / -ts 50,50   tensor-parallel. Needs ipc: host (below).
+#   --spec-draft-n-max 3     KEEP AT 3 -- measured, do not "optimize" upward.
+#                            Fleet logs showed mean accepted len 3.14 vs the 4.0
+#                            ceiling with 24% of tasks pinned at it, which
+#                            suggested raising n-max. A/B/A on 2026-08-15 said
+#                            otherwise: prose 52.0 / 48.7 / 49.1 tok/s and code
+#                            62.7 / 61.0 / 61.4 tok/s for n-max 3 / 4 / 5.
+#                            Mechanism: extra draft tokens push mean len up
+#                            (3.18->3.7) but acceptance DOWN (0.86->0.75), and
+#                            the larger verification batch costs more per step
+#                            than the marginal accepted tokens repay. The
+#                            saturation statistic does not imply the raise pays.
+#   --spec-draft-p-min 0.75  only draft when the MTP head is confident. This is
+#                            the big one: acceptance went 0.60-0.62 -> ~0.92,
+#                            mean accepted draft length 2.2 -> ~3.6.
+#   -kvu + -np 2             two slots sharing ONE context pool, so concurrency
+#                            does not halve per-request context (verified:
+#                            n_slots = 2, n_ctx_slot = full value).
+#   --cache-ram 40960        HOST-RAM prompt cache. Default 8192 -> 24576 on
+#                            2026-08-15 -> 40960 on 2026-08-16. MEASURED, not
+#                            estimated: ONE 96K-token session state costs ~7.5
+#                            GiB of container RSS (82 KiB/token -- MORE than the
+#                            64 KiB/token f16 KV arithmetic predicts, because the
+#                            cache also holds the 48 DeltaNet recurrent states).
+#                            So 24576 held only THREE deep sessions. Test: five
+#                            distinct 96K sessions in rotation, then return to
+#                            the first -- at 24576 that cost a full 96131-token
+#                            re-prefill = 91.1s; at 40960 it prefilled 516 tokens
+#                            = 1.3s. A 70x cut in session-switch cost, and by far
+#                            the biggest real-world speedup on this box: decode
+#                            tok/s was never the problem, re-prefill was.
+#                            RSS peaks ~33.5 GiB of the host's 62 GiB; the other
+#                            containers total ~170 MiB, so this is safe. Do not
+#                            go past ~49152 -- an OOM kill takes the server down.
+#                            A giant prefill also starves the OTHER slot's decode
+#                            to ~1-3 tok/s for its whole duration (continuous
+#                            batching advances decode ~1 token per 512-token
+#                            prefill ubatch), so cache misses cost twice.
+#   --fit off, --no-warmup   parity; --fit off also silences the benign
+#                            "failed to fit params to free device memory" warning.
+#
+# Reverted:
+#   --cache-type-k/v q8_0    back from f16. Near-lossless, half the KV bytes.
+#
+# THERMALS: tensor-parallel shards every tensor, forcing ~50/50 load, so the old
+#   -mg 1 / -ts 1,1.05 thermal bias no longer has anything to bias. GPU0's fan
+#   sits against GPU1's backplate and it runs hot: 81C uncapped, 75C with the
+#   250W cap (gpu-powerlimit.service). The cap is ON. Under tensor-parallel the
+#   cap costs more than it used to (~5% decode, ~10% prefill) because both cards
+#   run in lockstep, so the capped one sets the pace.
+#
+# CONTEXT: set by measurement, not arithmetic. Re-run scratchpad/ctxfinal.py
+#   before changing it -- three different things OOM this box at three different
+#   moments (model load, the flash-attention VMM pool during long prefill, and
+#   the clip compute buffer when an image arrives), and a value can pass the
+#   first two and still be broken.
+
+services:
+  llama:
+    image: ${LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda-b10423}
+    container_name: llama-qwen
+    restart: unless-stopped
+    runtime: nvidia            # legacy path: live UVM-major detection (CDI spec drifts across reboots)
+    # -sm tensor all-reduces through NCCL, whose shared-memory transport needs a
+    # real /dev/shm. Docker's default 64 MiB makes ncclGroupEnd() abort before
+    # the server ever listens, and it surfaces as a generic CUDA error rather
+    # than an OOM. Running llama-server natively (as upstream does) never hits
+    # this. ipc: host is what makes -sm tensor work in a container.
+    ipc: host
+    shm_size: "8gb"
+    ports:
+      - "0.0.0.0:${PORT:-8020}:8080"
+    volumes:
+      - ${MODEL_DIR:-./models}:/models:ro
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # reasoning_effort: MEDIUM is the default as of 2026-08-16, changed from
+      # xhigh. Measured on one identical trivial task (make a 5-line function
+      # thread-safe), thinking budget the ONLY variable:
+      #     xhigh   53.0s  3000 tok (hit the cap mid-thought, 9702 ch reasoning)
+      #     medium  22.2s  1371 tok
+      #     low     16.9s  1017 tok
+      #     off      3.9s   274 tok
+      # Decode was a healthy 57-76 tok/s at every level -- the engine was never
+      # slow, the model was thinking for 50 seconds about a 5-line function.
+      # This is worth 2.4x, an order of magnitude more than any engine, quant or
+      # cache change measured on this box. Raise it per-request when a problem
+      # actually needs it: chat_template_kwargs {"reasoning_effort":"xhigh"};
+      # pi's picker already maps off/low/medium/xhigh. Server-wide override:
+      # REASONING_EFFORT=xhigh docker compose -f docker-compose.llamacpp.yml up -d
+      LLAMA_ARG_CHAT_TEMPLATE_KWARGS: '{"reasoning_effort":"${REASONING_EFFORT:-medium}","preserve_thinking":true}'
+      # --reasoning-budget, set here as env because a YAML folded scalar (the
+      # `command: >-` block) treats "#" as LITERAL TEXT, not a comment, and
+      # cannot hold a quoted message containing spaces -- both break Compose arg
+      # splitting. Same trap as LLAMA_ARG_CHAT_TEMPLATE_KWARGS above.
+      #
+      # This is a SAFETY NET against runaway thinking, not a quality knob.
+      # Without it the model can think until it exhausts the client's max_tokens
+      # and return an EMPTY answer. Measured 2026-08-16 on a plain "write a
+      # TypeScript debounce utility" request: 4000 tokens generated, 15954 chars
+      # of reasoning, answer 0 chars -- at BOTH xhigh and medium. Raising the cap
+      # to 32000 did not help: it was still thinking past 3840 tokens minutes in.
+      # pi and qwen CLI both allow maxTokens 65536, so the worst case is ~18
+      # MINUTES of thinking that returns nothing.
+      # 4096 never binds in normal use (medium measured 260-2100 thinking tokens
+      # on real web-dev/Godot tasks) but caps the pathology at ~75s. 2048 was
+      # also validated and rescued the runaway case with a full answer
+      # (webdev-build: 0 chars -> 6879 chars) if you want a harder bound.
+      LLAMA_ARG_THINK_BUDGET: "${REASONING_BUDGET:-4096}"
+      LLAMA_ARG_THINK_BUDGET_MESSAGE: "Reasoning budget reached. Stop analysing now and give the best complete answer you have."
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      # GeForce cards have peer-to-peer DMA disabled in the driver, so NCCL must
+      # not attempt the P2P transport between these two 3090s.
+      NCCL_P2P_DISABLE: "1"
+      NCCL_SHM_DISABLE: "0"
+    command: >-
+      --host 0.0.0.0
+      --port 8080
+      -m /models/qwen38/${MODEL_FILE:-Qwen3.8-27B-UD-Q8_K_XL.gguf}
+      --mmproj /models/qwen38/mmproj-BF16.gguf
+      --image-min-tokens ${IMAGE_MIN_TOKENS:-1024}
+      --alias ${SERVED_NAME:-qwen3.8-27b}
+      -c ${CTX_SIZE:-196608}
+      -b ${BATCH_SIZE:-4096}
+      -ub ${UBATCH_SIZE:-512}
+      -ngl 999
+      -ngld 999
+      --fit off
+      --no-warmup
+      -sm ${SPLIT_MODE:-tensor}
+      -ts ${TENSOR_SPLIT:-50,50}
+      -fa on
+      --cache-type-k ${KV_TYPE_K:-f16}
+      --cache-type-v ${KV_TYPE_V:-f16}
+      -kvu
+      -np ${N_PARALLEL:-2}
+      --cache-ram ${CACHE_RAM:-40960}
+      --spec-type ${SPEC_TYPE:-draft-mtp}
+      --spec-draft-n-max ${MTP_DRAFT_N_MAX:-3}
+      --spec-draft-p-min ${MTP_DRAFT_P_MIN:-0.75}
+      --jinja
+      --reasoning ${REASONING:-on}
+      --reasoning-format deepseek
+      --temp ${TEMP:-1.0}
+      --top-p ${TOP_P:-0.95}
+      --top-k ${TOP_K:-20}
+      --min-p ${MIN_P:-0.0}
+      --presence-penalty ${PRESENCE_PENALTY:-0.0}
+      --repeat-penalty ${REPEAT_PENALTY:-1.0}

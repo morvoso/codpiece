@@ -1,0 +1,10 @@
+[package]
+name = "tandem-tok"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGUF-embedded byte-level BPE tokenizer (gpt2 model, qwen35 pretokenizer)."
+
+[dependencies]
+tandem-gguf = { path = "../tandem-gguf" }
+fancy-regex = "0.16"

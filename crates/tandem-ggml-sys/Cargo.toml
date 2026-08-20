@@ -1,0 +1,15 @@
+[package]
+name = "tandem-ggml-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FFI bindings to vendored ggml (llama.cpp pin), tandem's compute substrate."
+links = "ggml"
+
+[features]
+default = []
+# Build ggml's CUDA backend (requires CUDA toolkit; sm_86 targeted).
+cuda = []
+
+[build-dependencies]
+bindgen = "0.72"

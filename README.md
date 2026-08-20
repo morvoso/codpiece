@@ -1,0 +1,55 @@
+# tandem
+
+A from-scratch LLM inference engine for exactly one machine shape: **2× RTX 3090
+(24 GiB, ~936 GB/s each) connected over PCIe with no P2P DMA**, serving
+**Qwen3.8-27B** (hybrid Gated-DeltaNet/attention with an embedded MTP head).
+
+tandem replaces the *engine layer* of llama.cpp and vLLM — scheduling,
+batching, KV + recurrent-state management, speculative decoding orchestration,
+session caching, and the server API — while inheriting the battle-tested
+compute kernels underneath (vendored ggml CUDA, MIT-licensed, pinned to the
+exact build production runs today). Accuracy is a bit-parity property by
+construction, not a hope.
+
+## Design priorities (standing, from the box's operating doc)
+
+**ACCURACY > CONTEXT > SPEED.** Every milestone gates on temp-0 token-identical
+output vs. llama.cpp before any speed claim counts. f16 KV is the default.
+The GGUF-embedded chat template is authoritative.
+
+## The physics (read ENGINE.md first)
+
+Single-stream decode on this hardware is memory-bandwidth-bound at ~65 tok/s
+per stream (Q8 weights, tensor-split). Tuned llama.cpp already sits at 80–85%
+of that wall. tandem does not promise to break physics; it targets the wins
+that measurement says exist:
+
+| lever | evidence |
+|---|---|
+| Continuous batching / concurrency | vLLM: +245% at 4-way on this box |
+| Single-stream decode overhead | vLLM: +33–49% vs llama.cpp, same GPUs |
+| MTP verify batching ≥0.92 acceptance | llama.cpp measured, must not regress |
+| Host-RAM session cache incl. GDN states | 70× on session revisit (llama.cpp `--cache-ram`) |
+| f16-KV fidelity at 196K+ context | vLLM cannot (forced fp8); tandem must |
+| DFlash2 block-diffusion drafting, multi-GPU | nobody has it; +10–15% measured prize |
+
+The end state is one engine that holds all rows at once — which today no
+engine does.
+
+## Layout
+
+- `crates/tandem-gguf` — zero-dependency GGUF v2/v3 reader (done, tested
+  against the production 31 GB file).
+- `crates/tandem-cli` — `tandem inspect`, header-only model analysis (done).
+- `crates/tandem-ggml-sys` — FFI bindings to vendored ggml (in progress).
+- `docs/ARCHITECTURE.md` — full design and rationale.
+- `docs/ROADMAP.md` — milestones M0–M7, each with a hard accuracy gate.
+- `docs/SAFETY.md` — hardware- and production-safety protocol for the
+  llm-host box. **Read before running anything on the server.**
+- `notes/` — recon logs and reference snapshots (llama.cpp qwen35 sources,
+  prod config, chat template).
+- `ENGINE.md` — the measured knowledge base this project is built on.
+
+## License
+
+MIT. Vendored ggml/llama.cpp sources are MIT (ggml-org).

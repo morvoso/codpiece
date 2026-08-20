@@ -1,0 +1,13 @@
+[package]
+name = "tandem-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tandem"
+path = "src/main.rs"
+
+[dependencies]
+tandem-gguf = { path = "../tandem-gguf" }
+tandem-tok = { path = "../tandem-tok" }
