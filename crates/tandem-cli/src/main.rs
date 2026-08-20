@@ -19,6 +19,7 @@ fn main() -> ExitCode {
         Some("tokenize") => cmd_tokenize(&args[1..]),
         Some("load") => cmd_load(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
+        Some("ppl") => cmd_ppl(&args[1..]),
         _ => {
             eprintln!(
                 "usage: tandem inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
@@ -28,6 +29,101 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Perplexity over a text file, mirroring llama-perplexity's methodology
+/// exactly (tools/perplexity/perplexity.cpp @ b10423): consecutive n_ctx
+/// chunks evaluated fresh; positions [n_ctx/2, n_ctx-1) score the next token;
+/// ppl = exp(nll/count). qwen35 has add_bos=false, so no BOS substitution.
+fn cmd_ppl(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut file: Option<&str> = None;
+    let mut n_ctx = 512usize;
+    let mut n_chunks = -1i64;
+    let mut threads = 8i32;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-f" => file = it.next().map(String::as_str),
+            "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(512),
+            "--chunks" => n_chunks = it.next().and_then(|s| s.parse().ok()).unwrap_or(-1),
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            s => {
+                eprintln!("unknown arg: {s}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(path), Some(file)) = (path, file) else {
+        eprintln!("usage: tandem ppl <file.gguf> -f <text> [-c n_ctx] [--chunks N] [-t threads]");
+        return ExitCode::from(2);
+    };
+
+    let model = match tandem_model::qwen35::Qwen35::load(Path::new(path)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("tandem ppl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = match tandem_tok::Tokenizer::from_gguf(&model.weights.gguf) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tandem ppl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tandem ppl: {file}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    let tokens = tok.encode(&text, true);
+    eprintln!("tokenized {} chars -> {} tokens in {:.1}s", text.len(), tokens.len(), t0.elapsed().as_secs_f64());
+    if tokens.len() < 2 * n_ctx {
+        eprintln!("need at least {} tokens, got {}", 2 * n_ctx, tokens.len());
+        return ExitCode::FAILURE;
+    }
+
+    let n_chunk_max = tokens.len() / n_ctx;
+    let n_chunk = if n_chunks < 0 { n_chunk_max } else { (n_chunks as usize).min(n_chunk_max) };
+    let first = n_ctx / 2;
+    let n_vocab = model.hp.n_vocab as usize;
+    // logits at j for j in [first, n_ctx-1) predict token j+1
+    let out_positions: Vec<i32> = (first..n_ctx - 1).map(|j| j as i32).collect();
+
+    let mut nll = 0f64;
+    let mut count = 0usize;
+    for i in 0..n_chunk {
+        let chunk = &tokens[i * n_ctx..(i + 1) * n_ctx];
+        let logits = match model.forward(chunk, &out_positions, threads) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("chunk {i}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        for (row, j) in (first..n_ctx - 1).enumerate() {
+            let lrow = &logits[row * n_vocab..(row + 1) * n_vocab];
+            let target = chunk[j + 1] as usize;
+            // stable log-softmax, f64 accumulation (mirrors oracle numerics)
+            let max = lrow.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f64 = lrow.iter().map(|&x| ((x - max) as f64).exp()).sum();
+            nll -= (lrow[target] - max) as f64 - sum.ln();
+            count += 1;
+        }
+        print!("[{}]{:.4},", i + 1, (nll / count as f64).exp());
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
+    }
+    println!();
+    println!("Final estimate: PPL = {:.4} over {} scored tokens", (nll / count as f64).exp(), count);
+    ExitCode::SUCCESS
 }
 
 /// Greedy generation on the CPU backend (M1 correctness rig: stateless
@@ -94,6 +190,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
         let next = tandem_model::qwen35::argmax(&logits);
         ids.push(next);
         eprint!("{next} ");
+        if Some(next) == tok.eos {
+            eprintln!("[eos]");
+            break;
+        }
     }
     eprintln!();
     let gen_ids = &ids[prompt_ids.len()..];

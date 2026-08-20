@@ -194,7 +194,19 @@ impl Qwen35 {
 
     /// Stateless forward over `tokens`; returns logits for the LAST position.
     pub fn forward_logits(&self, tokens: &[u32], n_threads: i32) -> Result<Vec<f32>, ModelError> {
+        self.forward(tokens, &[(tokens.len() - 1) as i32], n_threads)
+    }
+
+    /// Stateless forward over `tokens`; returns logits at `out_positions`,
+    /// row-major [n_out][n_vocab]. Positions must be in-range and ascending.
+    pub fn forward(
+        &self,
+        tokens: &[u32],
+        out_positions: &[i32],
+        n_threads: i32,
+    ) -> Result<Vec<f32>, ModelError> {
         assert!(!tokens.is_empty());
+        assert!(!out_positions.is_empty());
         let hp = &self.hp;
         let t_len = tokens.len() as i64;
 
@@ -248,7 +260,11 @@ impl Qwen35 {
                 1,
             );
             ffi::ggml_set_input(state_zero);
-            let out_ids = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I32, 1);
+            let out_ids = ffi::ggml_new_tensor_1d(
+                ctx,
+                ffi::ggml_type_GGML_TYPE_I32,
+                out_positions.len() as i64,
+            );
             ffi::ggml_set_input(out_ids);
 
             // Elementwise ops (mul/add/ssm_conv) need f32 operands; quantized
@@ -417,7 +433,7 @@ impl Qwen35 {
                 inp_l = cur;
             }
 
-            // final norm → select last position → lm head
+            // final norm → select requested positions → lm head
             let output_norm = self.t("output_norm.weight")?;
             let output_w = self
                 .weights
@@ -464,8 +480,12 @@ impl Qwen35 {
                 vec![0f32; (hp.gdn_head_v() * hp.gdn_head_v() * hp.n_v_heads) as usize];
             ffi::ggml_backend_tensor_set(state_zero, zeros_state.as_ptr().cast(), 0, zeros_state.len() * 4);
 
-            let last = [(tokens.len() - 1) as i32];
-            ffi::ggml_backend_tensor_set(out_ids, last.as_ptr().cast(), 0, 4);
+            ffi::ggml_backend_tensor_set(
+                out_ids,
+                out_positions.as_ptr().cast(),
+                0,
+                out_positions.len() * 4,
+            );
 
             ffi::ggml_backend_cpu_set_n_threads(backend, n_threads);
             let st = ffi::ggml_backend_graph_compute(backend, gf);
@@ -473,7 +493,7 @@ impl Qwen35 {
                 return Err(ModelError::Load(format!("graph compute status {st}")));
             }
 
-            let mut logits = vec![0f32; hp.n_vocab as usize];
+            let mut logits = vec![0f32; hp.n_vocab as usize * out_positions.len()];
             ffi::ggml_backend_tensor_get(cur, logits.as_mut_ptr().cast(), 0, logits.len() * 4);
             Ok(logits)
         }
