@@ -14,6 +14,7 @@ use tandem_ggml_sys as ffi;
 use tandem_gguf::GgufFile;
 
 pub mod qwen35;
+pub mod split;
 
 /// Copy chunk size for streaming weights into backend buffers (bounds RSS).
 const COPY_CHUNK: usize = 32 << 20;

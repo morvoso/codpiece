@@ -29,7 +29,18 @@ use crate::{ModelError, Weights};
 /// KV window bucket: decode graphs keep identical shapes while n_past + T
 /// stays within the same bucket multiple. Padded cells are zero-initialized
 /// and masked to -inf.
-const KV_BUCKET: i64 = 256;
+const KV_BUCKET_DEFAULT: i64 = 256;
+
+/// Bucket granularity: bigger = fewer graph rebuilds but more masked-out
+/// attention work per step; smaller = tighter attention but more rebuilds.
+/// TANDEM_KV_BUCKET overrides for measurement.
+fn kv_bucket() -> i64 {
+    std::env::var("TANDEM_KV_BUCKET")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(KV_BUCKET_DEFAULT)
+}
 
 pub struct Hparams {
     pub n_layer: usize,
@@ -230,15 +241,9 @@ struct HostStaging {
     pos: Vec<i32>,
     mask_f16: Vec<u16>,
     row_ids: Vec<i64>,
-    /// how many leading mask cells are already visible (0.0); the rest are
-    /// -inf, so each step only needs to flip the newest cell
+    /// how many leading mask cells are visible (0.0); the rest stay -inf
     mask_visible: usize,
-    /// the device-side mask starts as UNINITIALIZED compute memory, not -inf:
-    /// the first step of a graph must upload the whole buffer before the
-    /// incremental single-cell updates are valid
-    mask_initialized: bool,
-    /// out_ids is constant for cached decode; upload it exactly once
-    out_ids_uploaded: bool,
+    out_ids: Vec<i32>,
 }
 
 impl Drop for CachedStep {
@@ -590,8 +595,8 @@ impl Qwen35 {
         greedy: bool,
     ) -> Result<StepOut, ModelError> {
         let n_kv_exact = (session.n_past + 1) as i64;
-        let bucket = (((n_kv_exact + KV_BUCKET - 1) / KV_BUCKET) * KV_BUCKET)
-            .min(session.n_ctx_max as i64);
+        let kvb = kv_bucket();
+        let bucket = (((n_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
         let stale = session
             .cached
             .as_ref()
@@ -626,8 +631,7 @@ impl Qwen35 {
                     mask_f16: vec![0xFC00u16; bucket as usize],
                     row_ids: vec![0i64; 1],
                     mask_visible: 0,
-                    mask_initialized: false,
-                    out_ids_uploaded: false,
+                    out_ids: vec![0i32; 1],
                 };
                 session.cached = Some(CachedStep { built, galloc, bucket, greedy, host });
             }
@@ -656,37 +660,33 @@ impl Qwen35 {
             h.row_ids[0] = n_past as i64;
             ffi::ggml_backend_tensor_set_async(backend, b.row_ids, h.row_ids.as_ptr().cast(), 0, 8);
 
-            // Mask: whole buffer on the first step of a graph (device memory
-            // is uninitialized), then only the newly visible cells.
+            // EVERY input is re-uploaded before EVERY compute. ggml's graph
+            // allocator may place intermediates over an input's storage once
+            // that input's last consumer has run, so device-side values do
+            // NOT survive between computes of the same graph. Skipping a
+            // re-upload (out_ids "is constant"; the mask "only changed by one
+            // cell") clobbered the out_ids index and aborted get_rows at
+            // n_past 2333 — silent until the allocation happened to overlap.
             let want_visible = (n_past + 1).min(h.mask_f16.len());
             for c in h.mask_visible..want_visible {
                 h.mask_f16[c] = 0;
             }
-            if !h.mask_initialized {
-                ffi::ggml_backend_tensor_set_async(
-                    backend,
-                    b.kq_mask,
-                    h.mask_f16.as_ptr().cast(),
-                    0,
-                    h.mask_f16.len() * 2,
-                );
-                h.mask_initialized = true;
-            } else if want_visible > h.mask_visible {
-                ffi::ggml_backend_tensor_set_async(
-                    backend,
-                    b.kq_mask,
-                    h.mask_f16.as_ptr().add(h.mask_visible).cast(),
-                    h.mask_visible * 2,
-                    (want_visible - h.mask_visible) * 2,
-                );
-            }
             h.mask_visible = want_visible;
+            ffi::ggml_backend_tensor_set_async(
+                backend,
+                b.kq_mask,
+                h.mask_f16.as_ptr().cast(),
+                0,
+                h.mask_f16.len() * 2,
+            );
 
-            if !h.out_ids_uploaded {
-                let zero = [0i32; 1];
-                ffi::ggml_backend_tensor_set(b.out_ids, zero.as_ptr().cast(), 0, 4);
-                h.out_ids_uploaded = true;
-            }
+            ffi::ggml_backend_tensor_set_async(
+                backend,
+                b.out_ids,
+                h.out_ids.as_ptr().cast(),
+                0,
+                4,
+            );
 
             self.compute(b.gf, n_threads)?;
             Ok(self.read_out(b, 1))
@@ -706,7 +706,8 @@ impl Qwen35 {
         let n_kv = match state {
             StateSrc::Stateless => n_kv_exact,
             StateSrc::Session(s) => {
-                (((n_kv_exact + KV_BUCKET - 1) / KV_BUCKET) * KV_BUCKET).min(s.n_ctx_max as i64)
+                let kvb = kv_bucket();
+                (((n_kv_exact + kvb - 1) / kvb) * kvb).min(s.n_ctx_max as i64)
             }
         };
         self.build_inner(t_len, n_kv, state, n_out, use_set_rows, n_past, greedy)
