@@ -37,11 +37,17 @@ pub enum Axis {
 pub struct Split {
     pub axis: Axis,
     pub segments: Vec<(i64, u32)>,
+    /// Suffix of the tensor that is split along axis 0 for this same
+    /// operation (e.g. an input projection's reference is the block's output
+    /// projection). Its quantization block size sets the split granularity,
+    /// so a column-split matrix and its row-split partner divide identically
+    /// — otherwise the halves of a matmul chain stop lining up.
+    pub axis0_ref: Option<&'static str>,
 }
 
 impl Split {
     fn mirrored() -> Split {
-        Split { axis: Axis::Mirrored, segments: vec![] }
+        Split { axis: Axis::Mirrored, segments: vec![], axis0_ref: None }
     }
 
     /// Total extent described by the segment list.
@@ -69,21 +75,35 @@ pub fn classify(name: &str, hp: &Hparams) -> Split {
     let key_dim = hp.key_dim();
     let head_v = hp.gdn_head_v();
 
-    let seg = |axis: Axis, segments: Vec<(i64, u32)>| Split { axis, segments };
+    let seg = |axis: Axis, segments: Vec<(i64, u32)>| Split {
+        axis,
+        segments,
+        axis0_ref: None,
+    };
+    let seg_ref = |axis: Axis, segments: Vec<(i64, u32)>, r: &'static str| Split {
+        axis,
+        segments,
+        axis0_ref: Some(r),
+    };
 
     // cache tensors first (they carry a layer suffix but not a blk. prefix)
     if let Some(rest) = name.strip_prefix("cache_") {
         let kind = rest.split("_l").next().unwrap_or("");
         return match kind {
             // KV cache rows are per-head: split like attn_output's input side
-            "k" | "v" => seg(Axis::Axis0, vec![]),
+            "k" | "v" => seg_ref(Axis::Axis0, vec![], "attn_output.weight"),
             // conv state: [q|k|v] channels, same segmentation as ssm_conv1d
-            "conv" => seg(
+            "conv" => seg_ref(
                 Axis::Axis0,
                 vec![(key_dim * (hp.d_conv - 1), 2 + head_ratio)],
+                "ssm_out.weight",
             ),
             // GDN recurrent state: one [S,S] matrix per V head
-            "gdn" => seg(Axis::Axis0, vec![(hp.n_k_heads * head_v * head_v, head_ratio)]),
+            "gdn" => seg_ref(
+                Axis::Axis0,
+                vec![(hp.n_k_heads * head_v * head_v, head_ratio)],
+                "ssm_out.weight",
+            ),
             _ => Split::mirrored(),
         };
     }
@@ -101,8 +121,12 @@ pub fn classify(name: &str, hp: &Hparams) -> Split {
     match suffix {
         // ---- attention ----
         // fused QKV: 2 key-sized parts (Q,K) plus head_ratio value parts
-        "attn_qkv.weight" => seg(Axis::Axis1, vec![(key_dim, 2 + head_ratio)]),
-        "attn_q.weight" | "attn_k.weight" | "attn_v.weight" => seg(Axis::Axis1, vec![]),
+        "attn_qkv.weight" => {
+            seg_ref(Axis::Axis1, vec![(key_dim, 2 + head_ratio)], "ssm_out.weight")
+        }
+        "attn_q.weight" | "attn_k.weight" | "attn_v.weight" => {
+            seg_ref(Axis::Axis1, vec![], "attn_output.weight")
+        }
         "attn_q.bias" | "attn_k.bias" | "attn_v.bias" | "attn_qkv.bias" => {
             seg(Axis::Axis0, vec![])
         }
@@ -110,19 +134,27 @@ pub fn classify(name: &str, hp: &Hparams) -> Split {
         "attn_q_norm.weight" | "attn_k_norm.weight" => Split::mirrored(),
         "attn_output.weight" => seg(Axis::Axis0, vec![]),
         "attn_output.bias" => Split::mirrored(),
-        "attn_gate.weight" => seg(Axis::Axis1, vec![(key_dim, head_ratio)]),
+        "attn_gate.weight" => {
+            seg_ref(Axis::Axis1, vec![(key_dim, head_ratio)], "ssm_out.weight")
+        }
 
         // ---- gated delta net ----
-        "ssm_dt.bias" | "ssm_a" => seg(Axis::Axis0, vec![(hp.n_k_heads, head_ratio)]),
-        "ssm_alpha.weight" | "ssm_beta.weight" => {
-            seg(Axis::Axis1, vec![(hp.n_k_heads, head_ratio)])
+        "ssm_dt.bias" | "ssm_a" => {
+            seg_ref(Axis::Axis0, vec![(hp.n_k_heads, head_ratio)], "ssm_out.weight")
         }
-        "ssm_conv1d.weight" => seg(Axis::Axis1, vec![(key_dim, 2 + head_ratio)]),
+        "ssm_alpha.weight" | "ssm_beta.weight" => {
+            seg_ref(Axis::Axis1, vec![(hp.n_k_heads, head_ratio)], "ssm_out.weight")
+        }
+        "ssm_conv1d.weight" => {
+            seg_ref(Axis::Axis1, vec![(key_dim, 2 + head_ratio)], "ssm_out.weight")
+        }
         "ssm_out.weight" => seg(Axis::Axis0, vec![(key_dim, head_ratio)]),
         "ssm_norm.weight" => Split::mirrored(),
 
         // ---- ffn ----
-        "ffn_up.weight" | "ffn_gate.weight" => seg(Axis::Axis1, vec![]),
+        "ffn_up.weight" | "ffn_gate.weight" => {
+            seg_ref(Axis::Axis1, vec![], "ffn_down.weight")
+        }
         "ffn_up.bias" | "ffn_gate.bias" => seg(Axis::Axis0, vec![]),
         "ffn_down.weight" => seg(Axis::Axis0, vec![]),
         "ffn_down.bias" => Split::mirrored(),
@@ -151,6 +183,120 @@ pub fn rotation(name: &str, hp: &Hparams, n_devices: usize) -> usize {
         }
         None => hp.n_layer % n_devices,
     }
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { a.abs() } else { gcd(b, a % b) }
+}
+
+fn lcm(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 { 0 } else { (a / gcd(a, b)).abs() * b.abs() }
+}
+
+/// Split granularity: each device's slice must be a multiple of this, so that
+/// quantization blocks are never cut in half and the per-device shapes stay
+/// kernel-friendly. `blck` is the block size of the axis-0 reference tensor's
+/// type (see `Split::axis0_ref`).
+pub fn granularity(name: &str, hp: &Hparams, blck: i64, n_devices: usize) -> i64 {
+    let Some((il, suffix)) = layer_of(name).or_else(|| {
+        name.strip_prefix("cache_")
+            .and_then(|r| r.split_once("_l"))
+            .and_then(|(kind, n)| n.parse::<usize>().ok().map(|il| (il, kind)))
+            .map(|(il, kind)| (il, kind))
+    }) else {
+        return 1;
+    };
+
+    if hp.is_recurrent(il) {
+        let head_dim = hp.d_state;
+        let blck_perf = lcm(blck, 128);
+        let g_qkv = lcm(blck_perf, head_dim);
+        match suffix {
+            "attn_qkv.weight" | "attn_gate.weight" | "ssm_conv1d.weight"
+            | "ssm_out.weight" => return g_qkv,
+            "ssm_dt.bias" | "ssm_a" | "ssm_alpha.weight" | "ssm_beta.weight" => {
+                return g_qkv / head_dim
+            }
+            // cache_* suffixes arrive as the bare kind
+            "conv" => return g_qkv * (hp.d_conv - 1),
+            "gdn" => return g_qkv * head_dim,
+            _ => {}
+        }
+    } else {
+        let n_gqa = hp.n_head / hp.n_head_kv;
+        let n_embd_q = n_gqa * hp.head_k;
+        // raise granularity only while every device still gets work
+        let mut blck_perf = blck;
+        while blck_perf < 128 && blck_perf * (n_devices as i64) < n_embd_q {
+            blck_perf *= 2;
+        }
+        let g_q = lcm(n_embd_q, blck_perf);
+        match suffix {
+            // qwen35 packs a gate beside Q, so its granularity doubles
+            "attn_q.weight" | "attn_q.bias" => return lcm(2 * n_embd_q, blck_perf),
+            "attn_output.weight" => return g_q,
+            "attn_k.weight" | "attn_v.weight" | "attn_k.bias" | "attn_v.bias" | "k" | "v" => {
+                return g_q / n_gqa
+            }
+            _ => {}
+        }
+    }
+
+    match suffix {
+        "ffn_up.weight" | "ffn_gate.weight" | "ffn_down.weight" | "ffn_up.bias"
+        | "ffn_gate.bias" => lcm(blck, 128),
+        _ => 1,
+    }
+}
+
+/// The C-facing split description: per-(segment, device) extents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitState {
+    pub axis: Axis,
+    /// ne[segment * n_devices + device]
+    pub ne: Vec<i64>,
+    /// repeats per segment
+    pub nr: Vec<u32>,
+    pub n_segments: usize,
+}
+
+/// Divide `tensor_extent` (the tensor's size along the split axis) across
+/// devices, honoring segments, granularity and rotation.
+pub fn split_state(
+    name: &str,
+    hp: &Hparams,
+    tensor_extent: i64,
+    blck: i64,
+    n_devices: usize,
+) -> SplitState {
+    let split = classify(name, hp);
+    if !matches!(split.axis, Axis::Axis0 | Axis::Axis1) {
+        return SplitState { axis: split.axis, ne: vec![], nr: vec![1], n_segments: 1 };
+    }
+
+    // an empty segment list means "one segment covering the whole axis"
+    let segments: Vec<(i64, u32)> = if split.segments.is_empty() {
+        vec![(tensor_extent, 1)]
+    } else {
+        split.segments.clone()
+    };
+    let g = granularity(name, hp, blck, n_devices).max(1);
+    let rot = rotation(name, hp, n_devices);
+
+    let mut ne = vec![0i64; segments.len() * n_devices];
+    let mut nr = vec![0u32; segments.len()];
+    for (is, &(ne_s, nr_s)) in segments.iter().enumerate() {
+        let mut low = 0i64;
+        for j in 0..n_devices - 1 {
+            let mut high = ne_s * (j as i64 + 1) / n_devices as i64;
+            high -= high % g;
+            ne[is * n_devices + (j + rot) % n_devices] = high - low;
+            low = high;
+        }
+        ne[is * n_devices + (n_devices - 1 + rot) % n_devices] = ne_s - low;
+        nr[is] = nr_s;
+    }
+    SplitState { axis: split.axis, ne, nr, n_segments: segments.len() }
 }
 
 #[cfg(test)]
@@ -244,6 +390,85 @@ mod tests {
         let gdn = classify("cache_gdn_l0", &hp);
         // one head_v x head_v matrix per V head
         assert_eq!(gdn.extent(), hp.n_v_heads * hp.gdn_head_v() * hp.gdn_head_v());
+    }
+
+    #[test]
+    fn split_state_conserves_every_element() {
+        let hp = hp_27b();
+        // (name, extent along the split axis, block size of the axis-0 ref)
+        let cases: &[(&str, i64, i64)] = &[
+            // GDN layer 0
+            ("blk.0.attn_qkv.weight", 10240, 32),
+            ("blk.0.attn_gate.weight", 6144, 32),
+            ("blk.0.ssm_conv1d.weight", 10240, 1),
+            ("blk.0.ssm_out.weight", 6144, 32),
+            ("blk.0.ssm_a", 48, 32),
+            ("blk.0.ssm_dt.bias", 48, 32),
+            ("blk.0.ssm_alpha.weight", 48, 32),
+            ("blk.0.ssm_beta.weight", 48, 32),
+            // attention layer 3
+            ("blk.3.attn_q.weight", 12288, 32), // 24 heads * 256 * 2 (Q+gate)
+            ("blk.3.attn_k.weight", 1024, 32),  // 4 kv heads * 256
+            ("blk.3.attn_v.weight", 1024, 32),
+            ("blk.3.attn_output.weight", 6144, 32),
+            // ffn
+            ("blk.0.ffn_up.weight", 17408, 32),
+            ("blk.0.ffn_gate.weight", 17408, 32),
+            ("blk.0.ffn_down.weight", 17408, 32),
+            // output head
+            ("output.weight", 248320, 32),
+            // session caches
+            ("cache_k_l3", 1024, 32),
+            ("cache_v_l3", 1024, 32),
+            ("cache_conv_l0", 30720, 32),
+            ("cache_gdn_l0", 786432, 32),
+        ];
+        for &(name, extent, blck) in cases {
+            let st = split_state(name, &hp, extent, blck, 2);
+            // every element lands on exactly one device
+            let total: i64 = (0..st.n_segments)
+                .map(|is| {
+                    let per: i64 = (0..2).map(|d| st.ne[is * 2 + d]).sum();
+                    per * st.nr[is] as i64
+                })
+                .sum();
+            assert_eq!(total, extent, "{name}: split must conserve the axis");
+            // no device gets a negative or absurd share
+            for d in 0..2 {
+                for is in 0..st.n_segments {
+                    let v = st.ne[is * 2 + d];
+                    assert!(v >= 0, "{name}: negative share on device {d}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_state_respects_granularity_and_balance() {
+        let hp = hp_27b();
+        // Q is split at 3072 granularity (2*n_embd_q = 2*6*256): 12288 halves
+        // cleanly into 6144 each.
+        let q = split_state("blk.3.attn_q.weight", &hp, 12288, 32, 2);
+        assert_eq!(q.ne[0], 6144);
+        assert_eq!(q.ne[1], 6144);
+        // KV granularity is 256: 1024 -> 512/512
+        let k = split_state("blk.3.attn_k.weight", &hp, 1024, 32, 2);
+        assert_eq!(k.ne[0] + k.ne[1], 1024);
+        assert_eq!(k.ne[0] % 256, 0);
+        // GDN fused qkv: 3 segment kinds via repeats (2 key + 3 value at
+        // key scale), each segment split at 128 granularity
+        let qkv = split_state("blk.0.attn_qkv.weight", &hp, 10240, 32, 2);
+        assert_eq!(qkv.n_segments, 1);
+        assert_eq!(qkv.nr[0], 5); // 2 + head_ratio(3)
+        assert_eq!(qkv.ne[0] + qkv.ne[1], 2048); // one key-sized segment
+        assert_eq!(qkv.ne[0] % 128, 0);
+        // FFN splits at 128
+        let up = split_state("blk.0.ffn_up.weight", &hp, 17408, 32, 2);
+        assert_eq!(up.ne[0] % 128, 0);
+        assert_eq!(up.ne[0] + up.ne[1], 17408);
+        // mirrored tensors carry no per-device extents
+        let n = split_state("blk.0.attn_norm.weight", &hp, 5120, 1, 2);
+        assert_eq!(n.axis, Axis::Mirrored);
     }
 
     #[test]

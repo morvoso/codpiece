@@ -43,12 +43,18 @@ fn cmd_selftest(args: &[String]) -> ExitCode {
     let mut threads = 8i32;
     let mut gpu: Option<i32> = None;
     let mut split: Option<Vec<i32>> = None;
+    let mut tp: Option<Vec<i32>> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-p" => prompt = it.next().cloned().unwrap_or_default(),
             "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
             "--gpu-split" => {
                 split = it.next().map(|v| {
                     v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
@@ -62,10 +68,11 @@ fn cmd_selftest(args: &[String]) -> ExitCode {
         eprintln!("usage: tandem selftest <file.gguf> [-p prompt]");
         return ExitCode::from(2);
     };
-    let model = tandem_model::qwen35::Qwen35::load_on(Path::new(path), match (&split, gpu) {
-        (Some(ids), _) => tandem_model::Device::CudaSplit(ids.clone()),
-        (None, Some(i)) => tandem_model::Device::Cuda(i),
-        (None, None) => tandem_model::Device::Cpu,
+    let model = tandem_model::qwen35::Qwen35::load_on(Path::new(path), match (&tp, &split, gpu) {
+        (Some(ids), _, _) => tandem_model::Device::CudaTensorParallel(ids.clone()),
+        (None, Some(ids), _) => tandem_model::Device::CudaSplit(ids.clone()),
+        (None, None, Some(i)) => tandem_model::Device::Cuda(i),
+        (None, None, None) => tandem_model::Device::Cpu,
     }).expect("load");
     let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
     let ids = tok.encode(&prompt, true);
@@ -147,6 +154,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     let mut n_ctx = 4096usize;
     let mut gpu: Option<i32> = None;
     let mut split: Option<Vec<i32>> = None;
+    let mut tp: Option<Vec<i32>> = None;
     let mut ignore_eos = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -155,6 +163,11 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(16),
             "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
             "--gpu-split" => {
                 split = it.next().map(|v| {
                     v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
@@ -174,10 +187,11 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), match (&split, gpu) {
-        (Some(ids), _) => tandem_model::Device::CudaSplit(ids.clone()),
-        (None, Some(i)) => tandem_model::Device::Cuda(i),
-        (None, None) => tandem_model::Device::Cpu,
+    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), match (&tp, &split, gpu) {
+        (Some(ids), _, _) => tandem_model::Device::CudaTensorParallel(ids.clone()),
+        (None, Some(ids), _) => tandem_model::Device::CudaSplit(ids.clone()),
+        (None, None, Some(i)) => tandem_model::Device::Cuda(i),
+        (None, None, None) => tandem_model::Device::Cpu,
     }) {
         Ok(m) => m,
         Err(e) => {
@@ -272,6 +286,7 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
     let mut threads = 8i32;
     let mut gpu: Option<i32> = None;
     let mut split: Option<Vec<i32>> = None;
+    let mut tp: Option<Vec<i32>> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -280,6 +295,11 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
             "--chunks" => n_chunks = it.next().and_then(|s| s.parse().ok()).unwrap_or(-1),
             "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
             "--gpu-split" => {
                 split = it.next().map(|v| {
                     v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
@@ -297,10 +317,11 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), match (&split, gpu) {
-        (Some(ids), _) => tandem_model::Device::CudaSplit(ids.clone()),
-        (None, Some(i)) => tandem_model::Device::Cuda(i),
-        (None, None) => tandem_model::Device::Cpu,
+    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), match (&tp, &split, gpu) {
+        (Some(ids), _, _) => tandem_model::Device::CudaTensorParallel(ids.clone()),
+        (None, Some(ids), _) => tandem_model::Device::CudaSplit(ids.clone()),
+        (None, None, Some(i)) => tandem_model::Device::Cuda(i),
+        (None, None, None) => tandem_model::Device::Cpu,
     }) {
         Ok(m) => m,
         Err(e) => {
@@ -376,6 +397,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut threads = 8i32;
     let mut gpu: Option<i32> = None;
     let mut split: Option<Vec<i32>> = None;
+    let mut tp: Option<Vec<i32>> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -383,6 +405,11 @@ fn cmd_run(args: &[String]) -> ExitCode {
             "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(16),
             "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
             "--gpu-split" => {
                 split = it.next().map(|v| {
                     v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
@@ -401,10 +428,11 @@ fn cmd_run(args: &[String]) -> ExitCode {
     };
 
     let t0 = std::time::Instant::now();
-    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), match (&split, gpu) {
-        (Some(ids), _) => tandem_model::Device::CudaSplit(ids.clone()),
-        (None, Some(i)) => tandem_model::Device::Cuda(i),
-        (None, None) => tandem_model::Device::Cpu,
+    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), match (&tp, &split, gpu) {
+        (Some(ids), _, _) => tandem_model::Device::CudaTensorParallel(ids.clone()),
+        (None, Some(ids), _) => tandem_model::Device::CudaSplit(ids.clone()),
+        (None, None, Some(i)) => tandem_model::Device::Cuda(i),
+        (None, None, None) => tandem_model::Device::Cpu,
     }) {
         Ok(m) => m,
         Err(e) => {

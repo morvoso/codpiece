@@ -13,6 +13,7 @@ use std::path::Path;
 use tandem_ggml_sys as ffi;
 use tandem_gguf::GgufFile;
 
+pub mod meta;
 pub mod qwen35;
 pub mod split;
 
@@ -56,6 +57,11 @@ pub enum Device {
     Cpu,
     /// Single CUDA device; requires the `cuda` feature.
     Cuda(i32),
+    /// Tensor-parallel across several CUDA devices via ggml's meta device:
+    /// every matrix is sliced, both GPUs work on every token, and ggml
+    /// inserts the all-reduce. This is what production llama.cpp uses
+    /// (`-sm tensor`).
+    CudaTensorParallel(Vec<i32>),
     /// Layer-split across several CUDA devices: contiguous layer ranges are
     /// assigned per device and a ggml scheduler moves activations between
     /// them. Required for models larger than one card (the 27B is 29.3 GiB).
@@ -68,6 +74,8 @@ pub enum Device {
 /// Weights resident on one or more backends, addressable by GGUF name.
 pub struct Weights {
     pub gguf: GgufFile,
+    /// kept alive because the meta device holds a raw pointer to it
+    split_ctx: Option<Box<crate::meta::SplitCtx>>,
     /// one context+buffer per backend (single-device models use index 0)
     ctxs: Vec<*mut ffi::ggml_context>,
     buffers: Vec<ffi::ggml_backend_buffer_t>,
@@ -100,7 +108,33 @@ impl Weights {
             .unwrap_or(0);
 
         unsafe {
-            let backends = init_backends(&device)?;
+            // Tensor parallel: one meta backend that internally owns both
+            // GPUs. From here on the model looks single-device, so it keeps
+            // the fast path (raw backend + gallocr + cached decode graph).
+            let mut split_ctx: Option<Box<crate::meta::SplitCtx>> = None;
+            let backends = match &device {
+                Device::CudaTensorParallel(ids) => {
+                    let hp = crate::qwen35::Hparams::from_gguf(&gguf)?;
+                    let blck: HashMap<String, i64> = gguf
+                        .tensors
+                        .iter()
+                        .map(|t| {
+                            let b = t.ty.traits().map(|tr| tr.block as i64).unwrap_or(1);
+                            (t.name.clone(), b)
+                        })
+                        .collect();
+                    let ctx = Box::new(crate::meta::SplitCtx {
+                        hp,
+                        n_devices: ids.len(),
+                        blck,
+                    });
+                    let (backend, kept) = crate::meta::make_meta_backend(ids, ctx)
+                        .map_err(ModelError::Load)?;
+                    split_ctx = Some(kept);
+                    vec![backend]
+                }
+                _ => init_backends(&device)?,
+            };
             let n_backends = backends.len();
             // set when a CPU fallback is appended for the scheduler
             let mut backends_all: Vec<ffi::ggml_backend_t> = Vec::new();
@@ -224,6 +258,7 @@ impl Weights {
 
             Ok(Weights {
                 gguf,
+                split_ctx,
                 ctxs,
                 buffers,
                 // own every backend we created, including the CPU fallback
@@ -322,6 +357,10 @@ unsafe fn init_backends(device: &Device) -> Result<Vec<ffi::ggml_backend_t>, Mod
         #[cfg(not(feature = "cuda"))]
         Device::Cuda(_) | Device::CudaSplit(_) => {
             return Err(ModelError::Load("built without the cuda feature".into()))
+        }
+        // built by load() itself: the meta device needs model hparams
+        Device::CudaTensorParallel(_) => {
+            return Err(ModelError::Load("tensor-parallel handled in load()".into()))
         }
     }
     if out.iter().any(|b| b.is_null()) {

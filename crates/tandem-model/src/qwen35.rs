@@ -294,6 +294,14 @@ impl Session {
             let mut v_cache = vec![std::ptr::null_mut(); hp.n_layer];
             let mut conv_state = vec![std::ptr::null_mut(); hp.n_layer];
             let mut gdn_state = vec![std::ptr::null_mut(); hp.n_layer];
+            // Names matter: under tensor parallelism the meta device asks the
+            // split callback how to divide each allocated tensor, and the
+            // callback classifies by name (see split.rs).
+            let name_it = |t: *mut ffi::ggml_tensor, n: String| {
+                if let Ok(c) = std::ffi::CString::new(n) {
+                    ffi::ggml_set_name(t, c.as_ptr());
+                }
+            };
             for il in 0..hp.n_layer {
                 if hp.is_recurrent(il) {
                     conv_state[il] =
@@ -301,6 +309,8 @@ impl Session {
                     gdn_state[il] = ffi::ggml_new_tensor_3d(
                         ctx, f32t, hp.gdn_head_v(), hp.gdn_head_v(), hp.n_v_heads,
                     );
+                    name_it(conv_state[il], format!("cache_conv_l{il}"));
+                    name_it(gdn_state[il], format!("cache_gdn_l{il}"));
                 } else {
                     // f16 KV, like production llama.cpp.
                     k_cache[il] = ffi::ggml_new_tensor_2d(
@@ -316,6 +326,8 @@ impl Session {
                             ctx, f16t, n_ctx_max as i64, hp.head_v * hp.n_head_kv,
                         )
                     };
+                    name_it(k_cache[il], format!("cache_k_l{il}"));
+                    name_it(v_cache[il], format!("cache_v_l{il}"));
                 }
             }
             // NOTE: session KV/state tensors all live on device 0 for now.
