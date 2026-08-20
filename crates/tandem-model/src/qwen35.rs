@@ -233,6 +233,10 @@ struct HostStaging {
     /// how many leading mask cells are already visible (0.0); the rest are
     /// -inf, so each step only needs to flip the newest cell
     mask_visible: usize,
+    /// the device-side mask starts as UNINITIALIZED compute memory, not -inf:
+    /// the first step of a graph must upload the whole buffer before the
+    /// incremental single-cell updates are valid
+    mask_initialized: bool,
     /// out_ids is constant for cached decode; upload it exactly once
     out_ids_uploaded: bool,
 }
@@ -622,6 +626,7 @@ impl Qwen35 {
                     mask_f16: vec![0xFC00u16; bucket as usize],
                     row_ids: vec![0i64; 1],
                     mask_visible: 0,
+                    mask_initialized: false,
                     out_ids_uploaded: false,
                 };
                 session.cached = Some(CachedStep { built, galloc, bucket, greedy, host });
@@ -651,23 +656,31 @@ impl Qwen35 {
             h.row_ids[0] = n_past as i64;
             ffi::ggml_backend_tensor_set_async(backend, b.row_ids, h.row_ids.as_ptr().cast(), 0, 8);
 
-            // Mask: only the newly visible cells changed since the last step.
+            // Mask: whole buffer on the first step of a graph (device memory
+            // is uninitialized), then only the newly visible cells.
             let want_visible = (n_past + 1).min(h.mask_f16.len());
-            if want_visible > h.mask_visible {
-                for c in h.mask_visible..want_visible {
-                    h.mask_f16[c] = 0;
-                }
-                let off = h.mask_visible * 2;
-                let len = (want_visible - h.mask_visible) * 2;
+            for c in h.mask_visible..want_visible {
+                h.mask_f16[c] = 0;
+            }
+            if !h.mask_initialized {
+                ffi::ggml_backend_tensor_set_async(
+                    backend,
+                    b.kq_mask,
+                    h.mask_f16.as_ptr().cast(),
+                    0,
+                    h.mask_f16.len() * 2,
+                );
+                h.mask_initialized = true;
+            } else if want_visible > h.mask_visible {
                 ffi::ggml_backend_tensor_set_async(
                     backend,
                     b.kq_mask,
                     h.mask_f16.as_ptr().add(h.mask_visible).cast(),
-                    off,
-                    len,
+                    h.mask_visible * 2,
+                    (want_visible - h.mask_visible) * 2,
                 );
-                h.mask_visible = want_visible;
             }
+            h.mask_visible = want_visible;
 
             if !h.out_ids_uploaded {
                 let zero = [0i32; 1];

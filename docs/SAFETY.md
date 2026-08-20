@@ -57,6 +57,20 @@ them was paid for in downtime (ENGINE.md §8).
 14. Server-class processes always tee stderr to a file; a crash at arg-parse
     with output on `/dev/null` is indistinguishable from a hang.
 
+## Correctness discipline (learned the hard way, 2026-08-19)
+
+17. **The CPU backend cannot validate GPU paths.** Two bugs passed every CPU
+    check and only appeared on CUDA: all-f32 KV caches (undertested kernels)
+    and an uninitialized device-side mask (CPU's sync fallback hid it).
+    Any change touching buffers, layouts, or upload paths must run
+    `tandem selftest --gpu` in a bench window before it is believed.
+18. **Compare path-matched.** tandem-FA vs oracle `-fa on`; tandem non-FA vs
+    `-fa off`. At fp16 both are correct and round differently; an unmatched
+    comparison produces a fake regression.
+19. **Device memory is not zero.** Compute buffers hold whatever the
+    allocator last left there. Anything read before being fully written in
+    the same graph must be explicitly initialized.
+
 ## Standing invariants
 
 15. Priority order: **ACCURACY > CONTEXT > SPEED** (user's standing rule).
