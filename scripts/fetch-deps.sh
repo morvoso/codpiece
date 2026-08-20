@@ -30,3 +30,20 @@ if [ "$have" != "$PIN_COMMIT" ]; then
     exit 1
 fi
 echo "vendored llama.cpp @ $PIN_TAG ($PIN_COMMIT)"
+
+# tandem's fixes to the vendored ggml — the meta backend's graph-reuse lifetime
+# bugs, ggml_graph_set_new_uid(), and a flash-attention shape diagnostic. The
+# engine's measured numbers depend on these; a build without them is a different
+# engine. See notes/results-2026-08-19.md for what each hunk fixes.
+patch="$root/patches/ggml-tandem.patch"
+if [ -f "$patch" ]; then
+    if git -C "$dst" apply --check "$patch" 2>/dev/null; then
+        git -C "$dst" apply "$patch"
+        echo "applied patches/ggml-tandem.patch"
+    elif git -C "$dst" apply --check --reverse "$patch" 2>/dev/null; then
+        echo "patches/ggml-tandem.patch already applied"
+    else
+        echo "ERROR: patches/ggml-tandem.patch applies neither forward nor reverse" >&2
+        exit 1
+    fi
+fi

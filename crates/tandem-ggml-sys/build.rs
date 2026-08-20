@@ -129,6 +129,11 @@ fn main() {
         .expect("write bindings");
 
     println!("cargo:rerun-if-changed=wrapper.h");
+    // Track the vendored compute sources: without this cargo never re-runs cmake after
+    // a ggml edit, so a patched backend would silently not make it into the binary.
+    for sub in ["ggml/src", "ggml/include", "ggml/CMakeLists.txt"] {
+        println!("cargo:rerun-if-changed=../../third_party/llama.cpp/{sub}");
+    }
     println!("cargo:rerun-if-changed=../../scripts/fetch-deps.sh");
 }
 
