@@ -307,6 +307,10 @@ pub struct Session {
     mtp_v: *mut ffi::ggml_tensor,
     /// how many tokens the MTP block has consumed
     pub mtp_past: usize,
+    /// MTP draft graph, rebuilt only when the KV bucket changes. Building it
+    /// per draft cost ~6 ms on the 27B — several times the head's actual
+    /// compute — and prevented CUDA-graph reuse.
+    mtp_cached: Option<(crate::mtp_graph::MtpGraph, ffi::ggml_gallocr_t, i64)>,
     cached: Option<CachedStep>,
 }
 
@@ -423,6 +427,7 @@ impl Session {
                 mtp_k,
                 mtp_v,
                 mtp_past: 0,
+                mtp_cached: None,
                 cached: None,
             })
         }
@@ -445,6 +450,7 @@ impl Session {
             ffi::ggml_backend_buffer_clear(self.buffer, 0);
         }
         self.cached = None;
+        self.mtp_cached = None;
         self.n_past = 0;
         self.mtp_past = 0;
     }
@@ -452,6 +458,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some((_, ga, _)) = self.mtp_cached.take() {
+            unsafe { ffi::ggml_gallocr_free(ga) }
+        }
         self.cached = None;
         unsafe {
             ffi::ggml_gallocr_free(self.galloc);
@@ -851,23 +860,33 @@ impl Qwen35 {
         let kvb = kv_bucket();
         let n_kv = (((n_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
         unsafe {
-            let g = self.build_mtp(
-                1,
-                n_kv,
-                session.mtp_past,
-                session.mtp_k,
-                session.mtp_v,
-                session.n_ctx_max,
-                session.fa,
-            )?;
-            if let Some(sched) = self.weights.sched() {
-                ffi::ggml_backend_sched_reset(sched);
-                if !ffi::ggml_backend_sched_alloc_graph(sched, g.gf) {
-                    return Err(ModelError::Load("mtp sched alloc".into()));
+            let stale = session
+                .mtp_cached
+                .as_ref()
+                .map(|(_, _, b)| *b != n_kv)
+                .unwrap_or(true);
+            if stale {
+                if let Some((_, ga, _)) = session.mtp_cached.take() {
+                    ffi::ggml_gallocr_free(ga);
                 }
-            } else if !ffi::ggml_gallocr_alloc_graph(session.galloc, g.gf) {
-                return Err(ModelError::Load("mtp graph alloc".into()));
+                let g = self.build_mtp(
+                    1,
+                    n_kv,
+                    0, // set_rows-free: writes go through row offsets below
+                    session.mtp_k,
+                    session.mtp_v,
+                    session.n_ctx_max,
+                    session.fa,
+                )?;
+                let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
+                    self.weights.backend(),
+                ));
+                if ga.is_null() || !ffi::ggml_gallocr_alloc_graph(ga, g.gf) {
+                    return Err(ModelError::Load("mtp graph alloc".into()));
+                }
+                session.mtp_cached = Some((g, ga, n_kv));
             }
+            let (g, _, _) = session.mtp_cached.as_ref().unwrap();
 
             let tok = [token as i32];
             ffi::ggml_backend_tensor_set(g.inp_tokens, tok.as_ptr().cast(), 0, 4);
@@ -896,13 +915,16 @@ impl Qwen35 {
             }
             let zero = [0i32];
             ffi::ggml_backend_tensor_set(g.out_ids, zero.as_ptr().cast(), 0, 4);
+            ffi::ggml_backend_tensor_set(
+                g.row_ids,
+                [session.mtp_past as i64].as_ptr().cast(),
+                0,
+                8,
+            );
 
             self.compute(g.gf, n_threads)?;
             let mut logits = vec![0f32; self.hp.n_vocab as usize];
             ffi::ggml_backend_tensor_get(g.out, logits.as_mut_ptr().cast(), 0, logits.len() * 4);
-            // the draft head's own hidden: chained drafts must consume this,
-            // not the trunk's, or every draft past the first is predicted
-            // from a stale state (measured: acceptance 0.40 vs 0.72 at depth 3)
             let mut h = vec![0f32; self.hp.n_embd as usize];
             ffi::ggml_backend_tensor_get(g.h_out, h.as_mut_ptr().cast(), 0, h.len() * 4);
             session.mtp_past += 1;

@@ -32,6 +32,9 @@ pub struct MtpGraph {
     pub inp_pos: *mut ffi::ggml_tensor,
     pub kq_mask: *mut ffi::ggml_tensor,
     pub out_ids: *mut ffi::ggml_tensor,
+    /// set_rows write position: keeps the graph independent of n_past so it
+    /// can be built once per KV bucket and replayed
+    pub row_ids: *mut ffi::ggml_tensor,
     pub out: *mut ffi::ggml_tensor,
     /// the draft head's own pre-LM-head hidden, which chained drafts consume
     pub h_out: *mut ffi::ggml_tensor,
@@ -77,7 +80,9 @@ pub(crate) struct MtpExtras {
 
 impl Qwen35 {
     /// Build the MTP draft graph for `t_len` tokens against a KV window of
-    /// `n_kv`, writing into the session's MTP cache at `n_past`.
+    /// `n_kv`. Cache writes go through set_rows, so the graph does not depend
+    /// on the write position and can be built once per bucket and replayed —
+    /// the same trick that lets the trunk's decode step reuse a CUDA graph.
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn build_mtp(
         &self,
@@ -117,6 +122,8 @@ impl Qwen35 {
         ffi::ggml_set_input(kq_mask);
         let out_ids = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I32, 1);
         ffi::ggml_set_input(out_ids);
+        let row_ids = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I64, t_len);
+        ffi::ggml_set_input(row_ids);
 
         let as_f32 = |t: *mut ffi::ggml_tensor| {
             if (*t).type_ == f32t {
@@ -148,14 +155,14 @@ impl Qwen35 {
             &l,
             inp_pos,
             kq_mask,
-            std::ptr::null_mut(),
+            row_ids,
             Some((mtp_k, mtp_v, n_ctx_max)),
             t_len,
             n_kv,
             n_past,
             fa,
             fa,
-            false,
+            /* use_set_rows */ true,
             Default::default(),
         );
         cur = ffi::ggml_add(ctx, cur, inp_sa);
@@ -195,6 +202,7 @@ impl Qwen35 {
             inp_pos,
             kq_mask,
             out_ids,
+            row_ids,
             out: cur,
             h_out,
             n_kv,
