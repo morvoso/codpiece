@@ -106,6 +106,14 @@ pub struct ContextOracle {
     pub min_confidence: f32,
     pub hits: usize,
     pub proposals: usize,
+    /// recent acceptance, exponentially weighted — the signal the gate tunes on
+    recent: f32,
+    /// how many drafts the recent estimate is based on
+    seen: usize,
+    /// when true, min_confidence self-tunes toward `target`
+    pub adaptive: bool,
+    /// acceptance the gate aims to hold
+    pub target: f32,
 }
 
 fn hash_ctx(order: usize, ctx: &[u32]) -> u64 {
@@ -125,6 +133,10 @@ impl ContextOracle {
             min_confidence,
             hits: 0,
             proposals: 0,
+            recent: 1.0,
+            seen: 0,
+            adaptive: true,
+            target: 0.55,
         }
     }
 
@@ -204,9 +216,40 @@ impl ContextOracle {
         out
     }
 
-    /// Record how many of the oracle's drafts a verify pass accepted.
-    pub fn record(&mut self, accepted: usize) {
+    /// Record how many of this round's oracle drafts the verify pass kept.
+    ///
+    /// This closes a control loop that costs nothing and runs on the CPU: the
+    /// oracle's value is workload-dependent (measured 0.80 acceptance on
+    /// prose that quotes itself, 0.26 while writing novel code), so rather
+    /// than pick a threshold per workload, it watches what it is getting and
+    /// tightens or loosens itself. Predicting less on unpredictable text is
+    /// the correct response — those draft slots were free, and a wrong draft
+    /// truncates the accepted prefix.
+    pub fn record(&mut self, proposed_this_round: usize, accepted: usize) {
         self.hits += accepted;
+        if proposed_this_round == 0 {
+            return;
+        }
+        let rate = accepted as f32 / proposed_this_round as f32;
+        // heavier weight early, then settle
+        let alpha = if self.seen < 32 { 0.25 } else { 0.08 };
+        self.recent = (1.0 - alpha) * self.recent + alpha * rate;
+        self.seen += proposed_this_round;
+
+        if !self.adaptive {
+            return;
+        }
+        if self.recent < self.target {
+            // demand more evidence before drafting
+            self.min_confidence = (self.min_confidence + 0.05).min(0.95);
+        } else if self.recent > self.target + 0.2 {
+            // it is being too shy; free tokens are being left on the table
+            self.min_confidence = (self.min_confidence - 0.03).max(0.20);
+        }
+    }
+
+    pub fn confidence_gate(&self) -> f32 {
+        self.min_confidence
     }
 
     pub fn acceptance(&self) -> f32 {
@@ -235,6 +278,32 @@ mod tests {
         // after "10, 20" the continuation is unambiguous
         let d = o.draft(&[10, 20], 2);
         assert_eq!(d, vec![30, 40], "should continue an established pattern");
+    }
+
+    #[test]
+    fn gate_tightens_when_drafts_keep_missing() {
+        let mut o = ContextOracle::new(0.4);
+        let before = o.confidence_gate();
+        for _ in 0..10 {
+            o.record(2, 0); // proposed two, kept none
+        }
+        assert!(
+            o.confidence_gate() > before,
+            "a drafter that keeps missing must demand more evidence"
+        );
+    }
+
+    #[test]
+    fn gate_loosens_when_drafts_land() {
+        let mut o = ContextOracle::new(0.8);
+        let before = o.confidence_gate();
+        for _ in 0..10 {
+            o.record(2, 2); // everything kept
+        }
+        assert!(
+            o.confidence_gate() < before,
+            "a drafter that keeps landing should draft more"
+        );
     }
 
     #[test]

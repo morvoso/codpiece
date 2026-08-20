@@ -229,7 +229,7 @@ fn cmd_spec(args: &[String]) -> ExitCode {
         accepted += n_keep;
         let from_oracle = n_keep.saturating_sub(n_mtp_drafts);
         oracle_accepted += from_oracle;
-        oracle.record(from_oracle);
+        oracle.record(drafts.len().saturating_sub(n_mtp_drafts), from_oracle);
 
         // commit accepted drafts plus the token the trunk itself produced.
         // An accepted draft can be EOS, and nothing may follow it.
@@ -271,7 +271,7 @@ fn cmd_spec(args: &[String]) -> ExitCode {
         "prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s) | \
          spec {n_spec}/p{p_min} + oracle {n_oracle}: acceptance {accepted}/{proposed} = \
          {rate:.3}, {rounds} rounds, {:.2} tok/round, oracle drafted {} kept {oracle_accepted} \
-         ({:.3})",
+         ({:.3}, gate {:.2})",
         prompt_ids.len(),
         t_prefill,
         prompt_ids.len() as f64 / t_prefill,
@@ -281,6 +281,7 @@ fn cmd_spec(args: &[String]) -> ExitCode {
         committed.len() as f64 / rounds.max(1) as f64,
         oracle.proposals,
         oracle.acceptance(),
+        oracle.confidence_gate(),
     );
     ExitCode::SUCCESS
 }
