@@ -59,13 +59,23 @@ fi
 docker rm -f tandem-ref-server >/dev/null 2>&1
 sleep 5
 
-echo "== tandem, MTP speculative depth 3 =="
-for rep in 1 2 3; do
+tandem() { # $@ = subcommand and flags
     timeout 1800 docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all \
       -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=0 \
       -v "$HOME/llm/tandem/codpiece:/src" -v "$HOME/llm/models:/models" \
-      --entrypoint /src/target/release/tandem tandem-builder \
-      spec "$M" -p "$PROMPT" -n "$NPRED" -c 4096 --spec 3 --tp 0,1 \
+      --entrypoint /src/target/release/tandem tandem-builder "$@" \
       >/dev/null 2>/tmp/hh.txt
-    echo "  tandem   rep$rep: $(grep -oE 'decode:.*' /tmp/hh.txt)"
+    grep -oE 'decode:.*' /tmp/hh.txt
+}
+
+echo "== tandem, MTP speculative depth 3 (separate draft graphs) =="
+for rep in 1 2 3; do
+    echo "  tandem spec-3   rep$rep: $(tandem spec "$M" -p "$PROMPT" -n "$NPRED" -c 4096 --spec 3 --tp 0,1)"
+done
+
+echo "== tandem, fused verify+draft chain, cached graphs =="
+for D in 2 3; do
+    for rep in 1 2 3; do
+        echo "  tandem fused-d$D rep$rep: $(tandem fused "$M" -p "$PROMPT" -n "$NPRED" -c 4096 --depth $D --tp 0,1 --path cached)"
+    done
 done

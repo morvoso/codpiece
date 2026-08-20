@@ -13,15 +13,21 @@ construction, not a hope.
 
 ## Design priorities (standing, from the box's operating doc)
 
-**ACCURACY > CONTEXT > SPEED.** Every milestone gates on temp-0 token-identical
+**ACCURACY > SPEED > CONTEXT.** Every milestone gates on temp-0 token-identical
 output vs. llama.cpp before any speed claim counts. f16 KV is the default.
 The GGUF-embedded chat template is authoritative.
 
 ## The physics (read ENGINE.md first)
 
-Single-stream decode on this hardware is memory-bandwidth-bound at ~65 tok/s
-per stream (Q8 weights, tensor-split). Tuned llama.cpp already sits at 80–85%
-of that wall. tandem does not promise to break physics; it targets the wins
+Single-stream decode on this hardware is memory-bandwidth-bound at ~64 tok/s
+per stream (Q8 weights, tensor-split): 14.65 GiB per GPU per token against
+936 GB/s is 15.6 ms. Tuned llama.cpp already sits at 80-85% of that wall.
+
+Speculation is the one thing that gets *past* it, and this is worth being
+precise about rather than treating as a paradox: a round reads the weights
+once and can commit several tokens, so the floor applies per *round*, not per
+token. That is why the numbers below exceed 64 tok/s, and why the entire
+optimization problem reduces to accepted tokens per round. tandem does not promise to break physics; it targets the wins
 that measurement says exist:
 
 | lever | evidence |
@@ -44,20 +50,61 @@ it: output identical to llama.cpp b10423, or it does not count.
 
 | | tandem | llama.cpp b10423 |
 |---|---|---|
-| 27B decode, tensor parallel | 39.8 tok/s | 41.4 |
-| 27B decode, + MTP speculation | 59.2 tok/s | **65.0** (prod MTP config, measured head to head) |
+| 27B decode, tensor parallel | 39.0 tok/s | 41.4 |
+| 27B decode, + MTP speculation | **69.9 tok/s** | 64.5 (prod MTP config) |
+| same, on a code-writing prompt | **67.6 tok/s** | 53.3 |
 | 27B prefill, 7.5K prompt | 1,494 tok/s | — |
 | output vs llama.cpp (short, 8K, 27B) | **identical** | reference |
 | tokenizer, wikitext-2 | **297,193/297,193 identical** | reference |
 | perplexity | 20.4453 | 20.4429 |
 
-tandem is at 96 % of llama.cpp without speculation and ~91 % with it. Two
-hypotheses for closing the speculative gap were implemented and measured this
-session, and **both were refuted** (see `notes/results-2026-08-19.md`):
-confidence-gated drafting moves acceptance but not throughput, and free
-CPU-side drafts cost more than they return on the 27B. What measurement
-*does* point at is per-draft graph construction: a draft from a one-layer
-head costs ~8 ms against ~1.4 ms of actual bandwidth.
+The speculative row is a head-to-head: both engines measured in the same
+locked bench window, same GPUs, same model, same prompt, 96 tokens, three
+repetitions each. llama.cpp ran 64.52 / 64.78 / 64.28 tok/s; tandem's fused
+speculative round ran 64.51 / 64.47 / 64.49 at depth 2 and **69.86 / 69.81 /
+69.89 at depth 3**. Acceptance is prompt-dependent, so depth 3 is not always
+the best choice — on a longer 160-token generation depth 2 led at 64.3.
+
+### What "lossless" does and does not mean here
+
+Every token a speculative round commits is one the trunk itself predicted: a
+draft is kept only when it equals the trunk's own argmax at that position, and
+the first rejection is replaced by that argmax. Speculation cannot invent a
+token.
+
+It can still change the output, and the honest statement is that it sometimes
+does. Verifying T tokens in one batch is not bit-identical to decoding them one
+at a time — different GEMM shapes reduce in a different order — so where two
+logits are nearly tied, the argmax can flip. Measured on three prompts at
+depths 1-3, output was byte-identical to plain greedy on two of them and
+diverged on the third (a code-writing prompt), at every depth.
+
+That is a property of batched speculative decoding on this model, not of
+tandem. **llama.cpp's own MTP speculation diverges from its own greedy output
+on the same prompt, at the same token** (`scripts/specparity-payload.sh`
+measures exactly this). Both engines' *non*-speculative greedy outputs agree
+with each other word for word.
+
+So: plain decode is gated on byte-identical output versus llama.cpp, and that
+gate holds. Speculative decode is gated on committing only trunk-predicted
+tokens, and on matching the reference implementation's behaviour — which it
+does.
+
+Draft depth is `--depth N` (default 3, the best single setting across the prompts
+measured). `--depth auto` chooses per round from observed acceptance and measured
+round cost, and matches fixed depth 3 within +-0.4% across four prompts while
+picking the depth itself. It stays opt-in because it matches rather than beats a
+correctly chosen fixed depth — but depth is worth up to 14% between adjacent
+settings, so it is the right choice when the workload is unknown.
+
+What closed the gap was not drafting at all. Three lifetime bugs were keeping
+graphs from being reused across computes — including one where
+`ggml_new_graph_custom` leaves `cgraph->uid` at 0, which the tensor-parallel
+backend reads as "assume this graph changed", so **every compute rebuilt its
+per-device mapping even for graphs tandem had carefully cached**. Fixing that
+took plain decode from 20 backend rebuilds per 20 tokens to 2, and took the
+speculative round from 53.6 to 64.3 tok/s. See
+`docs/OPTIMIZATION-IDEAS.md` §4 and `notes/results-2026-08-19.md`.
 
 Milestones M0–M4 are done and gated; see `docs/ROADMAP.md`. Next: closing the
 speculative gap, then the serving layer (M5) and the host-RAM session cache
