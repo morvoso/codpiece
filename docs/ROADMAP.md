@@ -117,8 +117,8 @@ Staged deliberately:
       second half of the stack), cached decode graph under the scheduler
 - [x] **M3e — tensor parallel DONE**: `Device::CudaTensorParallel` over
       ggml's meta device, tandem supplying the split classification.
-      **27B decode 39.9 tok/s vs llama.cpp's prod config 40.4 (98.8 %),
-      output identical.** 2.1× the layer-split path.
+      **27B decode 39.8 tok/s (3 reps) vs llama.cpp's prod config 41.4
+      (2 reps) = 96 %, output identical.** 2.1× the layer-split path.
 - [ ] M3d — remaining placement work: session KV/state per device under the
       layer-split path (TP handles this itself), cached decode graph reuse
       measurements under TP.
