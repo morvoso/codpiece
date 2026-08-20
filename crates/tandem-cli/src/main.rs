@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         Some("selftest") => cmd_selftest(&args[1..]),
         Some("mtp-probe") => cmd_mtp_probe(&args[1..]),
         Some("spec") => cmd_spec(&args[1..]),
+        Some("fused") => cmd_fused(&args[1..]),
         _ => {
             eprintln!(
                 "usage: tandem inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
@@ -33,6 +34,146 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Speculative generation where the draft head rides inside the verify graph.
+///
+/// The classic loop runs K+1 graph executions per round: one per draft, plus
+/// the verify. Measured on the 27B, a draft from a one-layer head costs ~8 ms
+/// against ~1.4 ms of bandwidth — almost all of it graph construction and
+/// allocation. So this mode runs exactly ONE execution per round: the verify
+/// pass carries the draft head as a tail and emits, for every verified
+/// position, the draft to use if exactly that many proposals were accepted.
+/// The host picks the one matching what it kept.
+///
+/// Still lossless: drafts are only ever kept when they equal what the model
+/// itself produced.
+fn cmd_fused(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut prompt = String::from("The capital of France is");
+    let mut n_gen = 64usize;
+    let mut threads = 8i32;
+    let mut n_ctx = 4096usize;
+    let mut gpu: Option<i32> = None;
+    let mut tp: Option<Vec<i32>> = None;
+    let mut ignore_eos = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-p" => prompt = it.next().cloned().unwrap_or_default(),
+            "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(64),
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            "-c" => n_ctx = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096),
+            "--ignore-eos" => ignore_eos = true,
+            "--gpu" => gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "--tp" => {
+                tp = it.next().map(|v| {
+                    v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
+                })
+            }
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            _ => {}
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: tandem fused <file.gguf> [-p prompt] [-n N] [--gpu N|--tp 0,1]");
+        return ExitCode::from(2);
+    };
+    let dev = match (&tp, gpu) {
+        (Some(ids), _) => tandem_model::Device::CudaTensorParallel(ids.clone()),
+        (None, Some(i)) => tandem_model::Device::Cuda(i),
+        (None, None) => tandem_model::Device::Cpu,
+    };
+    let model = match tandem_model::qwen35::Qwen35::load_on(Path::new(path), dev) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("fused: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = tandem_tok::Tokenizer::from_gguf(&model.weights.gguf).expect("tok");
+    // one draft per round, so a single rollback slot beyond the live state
+    let mut session = match tandem_model::qwen35::Session::new_spec(&model, n_ctx, 1) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fused: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let prompt_ids = tok.encode(&prompt, true);
+    let t0 = std::time::Instant::now();
+    let (preds, drafts) = match model.step_verify_drafting(&mut session, &prompt_ids, threads) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("prefill: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let t_prefill = t0.elapsed().as_secs_f64();
+    session.mtp_past += prompt_ids.len();
+
+    let mut committed: Vec<u32> = vec![*preds.last().unwrap()];
+    let mut draft = *drafts.last().unwrap();
+    let (mut accepted, mut proposed, mut rounds) = (0usize, 0usize, 0usize);
+
+    let t1 = std::time::Instant::now();
+    while committed.len() < n_gen {
+        let last = *committed.last().unwrap();
+        if !ignore_eos && Some(last) == tok.eos {
+            break;
+        }
+        // one execution: verifies [last, draft] and drafts the next round
+        let batch = [last, draft];
+        let (preds, drafts) = match model.step_verify_drafting(&mut session, &batch, threads) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("round: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        rounds += 1;
+        proposed += 1;
+
+        let keep = preds[0] == draft;
+        if keep {
+            accepted += 1;
+            committed.push(draft);
+            if committed.len() >= n_gen || (!ignore_eos && Some(draft) == tok.eos) {
+                break;
+            }
+            committed.push(preds[1]);
+            draft = drafts[1];
+            session.mtp_past += 2;
+        } else {
+            committed.push(preds[0]);
+            draft = drafts[0];
+            session.mtp_past += 1;
+            // the rejected draft advanced the recurrent layers one token too
+            // far; undo it from the snapshot slots
+            if let Err(e) = model.rollback_recurrent(&mut session, 1, threads) {
+                eprintln!("rollback: {e}");
+                return ExitCode::FAILURE;
+            }
+            session.n_past -= 1;
+        }
+    }
+    let t_decode = t1.elapsed().as_secs_f64();
+
+    println!("{}", tok.decode(&committed, true));
+    let rate = if proposed == 0 { 0.0 } else { accepted as f64 / proposed as f64 };
+    eprintln!(
+        "prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s) | \
+         fused: acceptance {accepted}/{proposed} = {rate:.3}, {rounds} rounds, {:.2} tok/round",
+        prompt_ids.len(),
+        t_prefill,
+        prompt_ids.len() as f64 / t_prefill,
+        committed.len(),
+        t_decode,
+        committed.len() as f64 / t_decode,
+        committed.len() as f64 / rounds.max(1) as f64,
+    );
+    ExitCode::SUCCESS
 }
 
 /// Speculative greedy generation with the MTP draft head.

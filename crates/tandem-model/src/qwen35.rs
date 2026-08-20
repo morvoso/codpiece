@@ -192,6 +192,16 @@ struct SessView {
     fa: bool,
 }
 
+/// What the fused draft tail needs from the session.
+#[derive(Clone, Copy)]
+pub(crate) struct MtpTail {
+    pub k_cache: *mut ffi::ggml_tensor,
+    pub v_cache: *mut ffi::ggml_tensor,
+    pub n_ctx_max: usize,
+    pub n_past: usize,
+    pub n_kv: i64,
+}
+
 /// Kernel-path bisect switches, kept from the CUDA debugging campaign.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct DebugToggles {
@@ -242,6 +252,11 @@ struct Built {
     out: *mut ffi::ggml_tensor,
     /// pre-LM-head hidden states at the requested positions (MTP input)
     h_out: *mut ffi::ggml_tensor,
+    /// fused draft head outputs, when the MTP tail is attached
+    draft_out: *mut ffi::ggml_tensor,
+    mtp_pos: *mut ffi::ggml_tensor,
+    mtp_mask: *mut ffi::ggml_tensor,
+    mtp_n_kv: i64,
     n_kv: i64,
     fa_mask: bool,
     /// out is an I32 token id (in-graph argmax) rather than f32 logits
@@ -647,6 +662,7 @@ impl Qwen35 {
                 out_positions.len() as i64,
                 false,
                 greedy,
+                None,
             )?;
             struct CtxGuard(*mut ffi::ggml_context, ffi::ggml_gallocr_t);
             impl Drop for CtxGuard {
@@ -810,6 +826,7 @@ impl Qwen35 {
                 out_positions.len() as i64,
                 false,
                 false,
+                None,
             )?;
             struct G(*mut ffi::ggml_context);
             impl Drop for G {
@@ -874,6 +891,7 @@ impl Qwen35 {
                 out_positions.len() as i64,
                 false,
                 greedy,
+                None,
             )?;
             struct G(*mut ffi::ggml_context);
             impl Drop for G {
@@ -920,6 +938,123 @@ impl Qwen35 {
                 hidden.len() * 4,
             );
             (preds, hidden)
+        };
+        session.n_past += tokens.len();
+        Ok(out)
+    }
+
+    /// Verify `tokens` AND produce the next round's draft candidates in a
+    /// single graph execution.
+    ///
+    /// Returns (predictions, drafts): `predictions[i]` is what the model
+    /// itself says follows position i, and `drafts[i]` is the draft head's
+    /// guess for the token after that — i.e. the draft to use if exactly the
+    /// first `i` proposals were accepted. The caller picks the one matching
+    /// the accept count it computes, so a whole graph execution per round
+    /// disappears.
+    pub fn step_verify_drafting(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        n_threads: i32,
+    ) -> Result<(Vec<u32>, Vec<u32>), ModelError> {
+        if session.n_past + tokens.len() > session.n_ctx_max {
+            return Err(ModelError::Load("context overflow".into()));
+        }
+        if !self.weights.can_sample_in_graph() {
+            return Err(ModelError::Load(
+                "fused drafting needs in-graph sampling (see split.rs)".into(),
+            ));
+        }
+        let n_out = tokens.len();
+        let out_positions: Vec<i32> = (0..n_out as i32).collect();
+        let kvb = kv_bucket();
+        let mtp_kv_exact = (session.mtp_past + n_out) as i64;
+        let mtp_n_kv =
+            (((mtp_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
+
+        let view = session.view();
+        let galloc = session.galloc;
+        session.cached = None;
+        let out = unsafe {
+            let tail = MtpTail {
+                k_cache: session.mtp_k,
+                v_cache: session.mtp_v,
+                n_ctx_max: session.n_ctx_max,
+                n_past: session.mtp_past,
+                n_kv: mtp_n_kv,
+            };
+            let built = self.build(
+                n_out as i64,
+                session.n_past,
+                &StateSrc::Session(view),
+                n_out as i64,
+                false,
+                true,
+                Some(tail),
+            )?;
+            struct G(*mut ffi::ggml_context);
+            impl Drop for G {
+                fn drop(&mut self) {
+                    unsafe { ffi::ggml_free(self.0) }
+                }
+            }
+            let _g = G(built.ctx);
+            if let Some(sched) = self.weights.sched() {
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, built.gf) {
+                    return Err(ModelError::Load("sched alloc".into()));
+                }
+            } else if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
+                return Err(ModelError::Load("graph alloc".into()));
+            }
+            self.fill_inputs(&built, tokens, session.n_past, &out_positions);
+
+            // the draft head's own positions and causal window
+            let mut mpos = vec![0i32; n_out * 4];
+            for i in 0..n_out {
+                let p = (session.n_past + i + 1) as i32;
+                mpos[i] = p;
+                mpos[n_out + i] = p;
+                mpos[2 * n_out + i] = p;
+            }
+            ffi::ggml_backend_tensor_set(built.mtp_pos, mpos.as_ptr().cast(), 0, mpos.len() * 4);
+
+            let nkv = built.mtp_n_kv as usize;
+            let mut mask16 = vec![0xFC00u16; nkv * n_out];
+            let mut mask32 = vec![f32::NEG_INFINITY; nkv * n_out];
+            let f16 = (*built.mtp_mask).type_ == ffi::ggml_type_GGML_TYPE_F16;
+            for q in 0..n_out {
+                for kv in 0..=(session.mtp_past + q).min(nkv - 1) {
+                    if f16 {
+                        mask16[q * nkv + kv] = 0;
+                    } else {
+                        mask32[q * nkv + kv] = 0.0;
+                    }
+                }
+            }
+            if f16 {
+                ffi::ggml_backend_tensor_set(
+                    built.mtp_mask, mask16.as_ptr().cast(), 0, mask16.len() * 2,
+                );
+            } else {
+                ffi::ggml_backend_tensor_set(
+                    built.mtp_mask, mask32.as_ptr().cast(), 0, mask32.len() * 4,
+                );
+            }
+
+            self.compute(built.gf, n_threads)?;
+
+            let mut preds = vec![0i32; n_out];
+            ffi::ggml_backend_tensor_get(built.out, preds.as_mut_ptr().cast(), 0, n_out * 4);
+            let mut drafts = vec![0i32; n_out];
+            ffi::ggml_backend_tensor_get(
+                built.draft_out, drafts.as_mut_ptr().cast(), 0, n_out * 4,
+            );
+            (
+                preds.into_iter().map(|v| v as u32).collect::<Vec<u32>>(),
+                drafts.into_iter().map(|v| v as u32).collect::<Vec<u32>>(),
+            )
         };
         session.n_past += tokens.len();
         Ok(out)
@@ -1131,6 +1266,7 @@ impl Qwen35 {
                     true,
                     0,
                     greedy,
+                    None,
                 )?;
                 let galloc = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                     self.weights.backend(),
@@ -1220,6 +1356,7 @@ impl Qwen35 {
         n_out: i64,
         use_set_rows: bool,
         greedy: bool,
+        mtp_tail: Option<MtpTail>,
     ) -> Result<Built, ModelError> {
         let n_kv_exact = n_past as i64 + t_len;
         let n_kv = match state {
@@ -1229,7 +1366,7 @@ impl Qwen35 {
                 (((n_kv_exact + kvb - 1) / kvb) * kvb).min(s.n_ctx_max as i64)
             }
         };
-        self.build_inner(t_len, n_kv, state, n_out, use_set_rows, n_past, greedy)
+        self.build_inner(t_len, n_kv, state, n_out, use_set_rows, n_past, greedy, mtp_tail)
     }
 
     /// Build the forward graph. `n_past_views` is used ONLY by the
@@ -1244,6 +1381,7 @@ impl Qwen35 {
         use_set_rows: bool,
         n_past_views: usize,
         greedy: bool,
+        mtp_tail: Option<MtpTail>,
     ) -> Result<Built, ModelError> {
         let hp = &self.hp;
 
@@ -1507,6 +1645,82 @@ impl Qwen35 {
         ffi::ggml_set_output(cur);
         ffi::ggml_build_forward_expand(gf, cur);
 
+        // ---- fused MTP draft tail ----
+        //
+        // The draft head normally runs as its own graph execution, and on the
+        // 27B that costs ~8 ms against ~1.4 ms of actual bandwidth: almost all
+        // of it is building and allocating a graph, not computing one. So the
+        // draft is built into the verify graph instead, where it is just a few
+        // dozen more nodes on a launch we are already paying for.
+        //
+        // It works because the token the draft head needs — the model's own
+        // prediction at each verified position — is available *inside* the
+        // graph: ggml_argmax emits I32 and ggml_get_rows consumes I32, so
+        // `embed(argmax(logits))` is expressible with no host round-trip.
+        //
+        // Entry i assumes positions before it were accepted, which is exactly
+        // the condition under which its draft is the one we use, so the
+        // batched drafts stay consistent with whatever prefix verification
+        // ends up keeping.
+        let (mut draft_out, mut mtp_pos, mut mtp_mask, mut mtp_n_kv) =
+            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0i64);
+        if let (Some(tail), true) = (mtp_tail, greedy) {
+            let (ml, mx) = self
+                .mtp_layer()
+                .ok_or_else(|| ModelError::Load("model has no MTP head".into()))?;
+            mtp_n_kv = tail.n_kv;
+
+            let mp = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I32, n_out * 4);
+            ffi::ggml_set_input(mp);
+            mtp_pos = mp;
+            let mm = ffi::ggml_new_tensor_2d(
+                ctx,
+                if use_fa { ffi::ggml_type_GGML_TYPE_F16 } else { f32t },
+                tail.n_kv,
+                n_out,
+            );
+            ffi::ggml_set_input(mm);
+            mtp_mask = mm;
+
+            // the model's own next-token prediction, embedded, without ever
+            // leaving the graph
+            let next_emb = ffi::ggml_get_rows(
+                ctx,
+                mx.embed_tokens.unwrap_or(tok_embd),
+                cur,
+            );
+            let e_norm = rms(ctx, next_emb, mx.enorm);
+            let h_norm = rms(ctx, h_sel, mx.hnorm);
+            let cat = ffi::ggml_concat(ctx, e_norm, h_norm, 0);
+            let mut d = ffi::ggml_mul_mat(ctx, mx.eh_proj, cat);
+
+            let d_sa = d;
+            d = rms(ctx, d, ml.attn_norm);
+            d = self.build_attn_block(
+                ctx, gf, d, &ml, mp, mm, std::ptr::null_mut(),
+                Some((tail.k_cache, tail.v_cache, tail.n_ctx_max)),
+                n_out, tail.n_kv, tail.n_past, use_fa, use_fa, false, dbg,
+            );
+            d = ffi::ggml_add(ctx, d, d_sa);
+
+            let d_res = d;
+            let dn = rms(ctx, d, ml.post_attn_norm);
+            let du = ffi::ggml_mul_mat(ctx, ml.ffn_up, dn);
+            let dgt = ffi::ggml_mul_mat(ctx, ml.ffn_gate, dn);
+            let da = ffi::ggml_mul(ctx, ffi::ggml_silu(ctx, dgt), du);
+            d = ffi::ggml_mul_mat(ctx, ml.ffn_down, da);
+            d = ffi::ggml_add(ctx, d, d_res);
+
+            let hn = mx.shared_head_norm.unwrap_or(output_norm);
+            d = rms(ctx, d, hn);
+            let head_w = mx.shared_head_head.unwrap_or(output_w);
+            d = ffi::ggml_mul_mat(ctx, head_w, d);
+            d = ffi::ggml_argmax(ctx, d);
+            ffi::ggml_set_output(d);
+            ffi::ggml_build_forward_expand(gf, d);
+            draft_out = d;
+        }
+
         Ok(Built {
             ctx,
             gf,
@@ -1519,6 +1733,10 @@ impl Qwen35 {
             out_ids,
             out: cur,
             h_out: h_sel,
+            draft_out,
+            mtp_pos,
+            mtp_mask,
+            mtp_n_kv,
             n_kv,
             fa_mask: use_fa,
             greedy,
