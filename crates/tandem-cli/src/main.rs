@@ -125,7 +125,8 @@ fn cmd_fused(args: &[String]) -> ExitCode {
         }
         // one execution: verifies [last, draft] and drafts the next round
         let batch = [last, draft];
-        let (preds, drafts) = match model.step_verify_drafting(&mut session, &batch, threads) {
+        // fixed shape every round, so the graph is built once and replayed
+        let (preds, drafts, _h) = match model.step_fused_cached(&mut session, &batch, threads) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("round: {e}");

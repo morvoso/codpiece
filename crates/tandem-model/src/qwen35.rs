@@ -258,6 +258,7 @@ struct Built {
     draft_out: *mut ffi::ggml_tensor,
     mtp_pos: *mut ffi::ggml_tensor,
     mtp_mask: *mut ffi::ggml_tensor,
+    mtp_rows: *mut ffi::ggml_tensor,
     mtp_n_kv: i64,
     n_kv: i64,
     fa_mask: bool,
@@ -330,6 +331,8 @@ pub struct Session {
     /// per draft cost ~6 ms on the 27B — several times the head's actual
     /// compute — and prevented CUDA-graph reuse.
     mtp_cached: Option<(crate::mtp_graph::MtpGraph, ffi::ggml_gallocr_t, i64)>,
+    /// the fused verify+draft graph, built per (bucket, mtp_bucket)
+    fused: Option<FusedStep>,
     cached: Option<CachedStep>,
 }
 
@@ -447,6 +450,7 @@ impl Session {
                 mtp_v,
                 mtp_past: 0,
                 mtp_cached: None,
+                fused: None,
                 cached: None,
             })
         }
@@ -470,13 +474,33 @@ impl Session {
         }
         self.cached = None;
         self.mtp_cached = None;
+        if let Some(c) = self.fused.take() {
+            unsafe {
+                ffi::ggml_gallocr_free(c.galloc);
+                ffi::ggml_free(c.built.ctx);
+            }
+        }
         self.n_past = 0;
         self.mtp_past = 0;
     }
 }
 
+struct FusedStep {
+    built: Built,
+    galloc: ffi::ggml_gallocr_t,
+    bucket: i64,
+    mtp_bucket: i64,
+    t_len: i64,
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some(c) = self.fused.take() {
+            unsafe {
+                ffi::ggml_gallocr_free(c.galloc);
+                ffi::ggml_free(c.built.ctx);
+            }
+        }
         if let Some((_, ga, _)) = self.mtp_cached.take() {
             unsafe { ffi::ggml_gallocr_free(ga) }
         }
@@ -973,6 +997,123 @@ impl Qwen35 {
         };
         session.n_past += tokens.len();
         Ok(out)
+    }
+
+    /// Cached fused round: ONE graph, built once per (KV bucket, MTP bucket)
+    /// and replayed.
+    ///
+    /// This shape exists because of a hard constraint measured on this
+    /// machine: under tensor parallelism the meta backend cannot replay a
+    /// cached graph when other graphs are computed in between — interleaving
+    /// a cached verify with per-draft graphs aborts. Folding the draft head
+    /// into the verify graph leaves exactly one graph per round, which is
+    /// both cacheable and free of that interleaving.
+    pub fn step_fused_cached(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        n_threads: i32,
+    ) -> Result<(Vec<u32>, Vec<u32>, Vec<f32>), ModelError> {
+        if session.n_past + tokens.len() > session.n_ctx_max {
+            return Err(ModelError::Load("context overflow".into()));
+        }
+        if !self.weights.can_sample_in_graph() {
+            return Err(ModelError::Load("fused round needs in-graph sampling".into()));
+        }
+        let t_len = tokens.len() as i64;
+        let kvb = kv_bucket();
+        let bucket = ((((session.n_past as i64 + t_len) + kvb - 1) / kvb) * kvb)
+            .min(session.n_ctx_max as i64);
+        let mtp_bucket = ((((session.mtp_past as i64 + t_len) + kvb - 1) / kvb) * kvb)
+            .min(session.n_ctx_max as i64);
+
+        unsafe {
+            let stale = session
+                .fused
+                .as_ref()
+                .map(|c| c.bucket != bucket || c.mtp_bucket != mtp_bucket || c.t_len != t_len)
+                .unwrap_or(true);
+            if stale {
+                if let Some(c) = session.fused.take() {
+                    ffi::ggml_gallocr_free(c.galloc);
+                    ffi::ggml_free(c.built.ctx);
+                }
+                let tail = MtpTail {
+                    k_cache: session.mtp_k,
+                    v_cache: session.mtp_v,
+                    n_ctx_max: session.n_ctx_max,
+                    n_past: 0,
+                    n_kv: mtp_bucket,
+                };
+                let built = self.build_inner(
+                    t_len,
+                    bucket,
+                    &StateSrc::Session(session.view()),
+                    t_len,
+                    /* use_set_rows */ true,
+                    0,
+                    /* greedy */ true,
+                    Some(tail),
+                )?;
+                let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
+                    self.weights.backend(),
+                ));
+                if ga.is_null() || !ffi::ggml_gallocr_alloc_graph(ga, built.gf) {
+                    return Err(ModelError::Load("fused graph alloc".into()));
+                }
+                session.fused = Some(FusedStep {
+                    built,
+                    galloc: ga,
+                    bucket,
+                    mtp_bucket,
+                    t_len,
+                });
+            }
+            let c = session.fused.as_ref().unwrap();
+            let b = &c.built;
+            let t = tokens.len();
+
+            let out_positions: Vec<i32> = (0..t as i32).collect();
+            self.fill_inputs(b, tokens, session.n_past, &out_positions);
+            let rows: Vec<i64> = (0..t).map(|i| (session.n_past + i) as i64).collect();
+            ffi::ggml_backend_tensor_set(b.row_ids, rows.as_ptr().cast(), 0, t * 8);
+
+            let mut mpos = vec![0i32; t * 4];
+            for i in 0..t {
+                let p = (session.n_past + i + 1) as i32;
+                mpos[i] = p;
+                mpos[t + i] = p;
+                mpos[2 * t + i] = p;
+            }
+            ffi::ggml_backend_tensor_set(b.mtp_pos, mpos.as_ptr().cast(), 0, mpos.len() * 4);
+            let mrows: Vec<i64> = (0..t).map(|i| (session.mtp_past + i) as i64).collect();
+            ffi::ggml_backend_tensor_set(b.mtp_rows, mrows.as_ptr().cast(), 0, t * 8);
+
+            let nkv = b.mtp_n_kv as usize;
+            let mut mask = vec![0xFC00u16; nkv * t];
+            for q in 0..t {
+                for kv in 0..=(session.mtp_past + q).min(nkv - 1) {
+                    mask[q * nkv + kv] = 0;
+                }
+            }
+            ffi::ggml_backend_tensor_set(b.mtp_mask, mask.as_ptr().cast(), 0, mask.len() * 2);
+
+            self.compute(b.gf, n_threads)?;
+
+            let mut preds = vec![0i32; t];
+            ffi::ggml_backend_tensor_get(b.out, preds.as_mut_ptr().cast(), 0, t * 4);
+            let mut drafts = vec![0i32; t];
+            ffi::ggml_backend_tensor_get(b.draft_out, drafts.as_mut_ptr().cast(), 0, t * 4);
+            let mut hidden = vec![0f32; self.hp.n_embd as usize * t];
+            ffi::ggml_backend_tensor_get(b.h_out, hidden.as_mut_ptr().cast(), 0, hidden.len() * 4);
+
+            session.n_past += t;
+            Ok((
+                preds.into_iter().map(|v| v as u32).collect(),
+                drafts.into_iter().map(|v| v as u32).collect(),
+                hidden,
+            ))
+        }
     }
 
     /// Verify `tokens` AND produce the next round's draft candidates in a
@@ -1718,8 +1859,13 @@ impl Qwen35 {
         // the condition under which its draft is the one we use, so the
         // batched drafts stay consistent with whatever prefix verification
         // ends up keeping.
-        let (mut draft_out, mut mtp_pos, mut mtp_mask, mut mtp_n_kv) =
-            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0i64);
+        let (mut draft_out, mut mtp_pos, mut mtp_mask, mut mtp_rows, mut mtp_n_kv) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0i64,
+        );
         if let (Some(tail), true) = (mtp_tail, greedy) {
             let (ml, mx) = self
                 .mtp_layer()
@@ -1737,6 +1883,9 @@ impl Qwen35 {
             );
             ffi::ggml_set_input(mm);
             mtp_mask = mm;
+            let mr = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I64, n_out);
+            ffi::ggml_set_input(mr);
+            mtp_rows = mr;
 
             // the model's own next-token prediction, embedded, without ever
             // leaving the graph
@@ -1753,9 +1902,10 @@ impl Qwen35 {
             let d_sa = d;
             d = rms(ctx, d, ml.attn_norm);
             d = self.build_attn_block(
-                ctx, gf, d, &ml, mp, mm, std::ptr::null_mut(),
+                ctx, gf, d, &ml, mp, mm, mr,
                 Some((tail.k_cache, tail.v_cache, tail.n_ctx_max)),
-                n_out, tail.n_kv, tail.n_past, use_fa, use_fa, false, dbg,
+                n_out, tail.n_kv, tail.n_past, use_fa, use_fa,
+                /* use_set_rows */ use_set_rows, dbg,
             );
             d = ffi::ggml_add(ctx, d, d_sa);
 
@@ -1792,6 +1942,7 @@ impl Qwen35 {
             draft_out,
             mtp_pos,
             mtp_mask,
+            mtp_rows,
             mtp_n_kv,
             n_kv,
             fa_mask: use_fa,
