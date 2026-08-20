@@ -62,18 +62,29 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         tools: Option<&serde_json::Value>,
         enable_thinking: bool,
+        template_kwargs: Option<&serde_json::Value>,
     ) -> Result<String, String> {
         let tmpl = self
             .env
             .get_template("chat")
             .map_err(|e| format!("chat template missing: {e}"))?;
-        tmpl.render(context! {
-            messages => Value::from_serialize(messages),
-            add_generation_prompt => add_generation_prompt,
-            tools => tools.map(Value::from_serialize),
-            enable_thinking => enable_thinking,
-            add_vision_id => false,
-        })
+        // The client's chat_template_kwargs (reasoning_effort, preserve_thinking, ...)
+        // are template variables, not request fields — this template reads
+        // reasoning_effort|default('xhigh'), so without forwarding them every request
+        // renders at xhigh and the model over-thinks. Spread them into the context
+        // alongside the ones tandem controls; enable_thinking here wins if both set it.
+        let mut ctx = std::collections::BTreeMap::<String, Value>::new();
+        if let Some(serde_json::Value::Object(m)) = template_kwargs {
+            for (k, v) in m {
+                ctx.insert(k.clone(), Value::from_serialize(v));
+            }
+        }
+        ctx.insert("messages".into(), Value::from_serialize(messages));
+        ctx.insert("add_generation_prompt".into(), Value::from(add_generation_prompt));
+        ctx.insert("tools".into(), tools.map(Value::from_serialize).unwrap_or(Value::from(())));
+        ctx.insert("enable_thinking".into(), Value::from(enable_thinking));
+        ctx.insert("add_vision_id".into(), Value::from(false));
+        tmpl.render(ctx)
         .map_err(|e| {
             // minijinja chains causes; the root is what says which line refused
             let mut s = format!("chat template failed to render: {e}");
@@ -110,7 +121,7 @@ mod tests {
     #[test]
     fn renders_a_plain_exchange() {
         let out = template()
-            .render(&[msg("user", "Hi there")], true, None, true)
+            .render(&[msg("user", "Hi there")], true, None, true, None)
             .expect("render");
         assert!(out.contains("<|im_start|>user"), "{out}");
         assert!(out.contains("Hi there"), "{out}");
@@ -127,10 +138,10 @@ mod tests {
     #[test]
     fn thinking_mode_changes_the_generation_prompt() {
         let on = template()
-            .render(&[msg("user", "Hi")], true, None, true)
+            .render(&[msg("user", "Hi")], true, None, true, None)
             .expect("render");
         let off = template()
-            .render(&[msg("user", "Hi")], true, None, false)
+            .render(&[msg("user", "Hi")], true, None, false, None)
             .expect("render");
         assert!(on.trim_end().ends_with("<think>"), "thinking on, tail: {:?}", tail(&on));
         assert_ne!(on, off, "enable_thinking must change the prompt");
@@ -149,6 +160,7 @@ mod tests {
                 true,
                 None,
                 true,
+                None,
             )
             .expect("render");
         assert!(out.contains("You are terse."), "{out}");
@@ -167,6 +179,7 @@ mod tests {
                 true,
                 None,
                 true,
+                None,
             )
             .expect("render");
         let a = out.find("first question").expect("q1");
@@ -178,7 +191,7 @@ mod tests {
     #[test]
     fn without_generation_prompt_the_turn_is_closed() {
         let out = template()
-            .render(&[msg("user", "Hi")], false, None, true)
+            .render(&[msg("user", "Hi")], false, None, true, None)
             .expect("render");
         assert!(!out.trim_end().ends_with("<|im_start|>assistant"), "{out}");
     }
@@ -193,7 +206,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
         };
-        let out = template().render(&[m], true, None, true).expect("render");
+        let out = template().render(&[m], true, None, true, None).expect("render");
         assert!(out.contains("part one"), "{out}");
     }
 
@@ -207,7 +220,7 @@ mod tests {
     fn rerendering_extends_the_previous_render() {
         let t = template();
         let turn1 = t
-            .render(&[msg("user", "What is 2+2?")], true, None, true)
+            .render(&[msg("user", "What is 2+2?")], true, None, true, None)
             .expect("turn 1");
         // what the model would have produced, thinking included
         let reply = "<think>
@@ -225,6 +238,7 @@ Four.";
                 true,
                 None,
                 true,
+                None,
             )
             .expect("turn 2");
         let keeps_think = turn2.contains("Two plus two.");
@@ -258,7 +272,7 @@ Four.";
     fn reasoning_round_trip_is_byte_exact() {
         let t = template();
         let turn1 = t
-            .render(&[msg("user", "What is 2+2?")], true, None, true)
+            .render(&[msg("user", "What is 2+2?")], true, None, true, None)
             .expect("turn 1");
         assert!(turn1.ends_with("<think>\n"), "tail: {:?}", &turn1[turn1.len() - 30..]);
 
@@ -277,6 +291,7 @@ Four.";
                 true,
                 None,
                 true,
+                None,
             )
             .expect("turn 2");
 
@@ -300,7 +315,7 @@ Four.";
             tool_calls: None,
             reasoning_content: None,
         };
-        let err = template().render(&[m], true, None, true).unwrap_err();
+        let err = template().render(&[m], true, None, true, None).unwrap_err();
         assert!(err.to_lowercase().contains("system message"), "{err}");
     }
 }

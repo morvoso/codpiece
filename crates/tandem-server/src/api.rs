@@ -126,6 +126,11 @@ struct ChatBody {
 
 pub struct Ctx {
     pub engine: Engine,
+    /// The tokenization of the think-block close, computed once. `<think>` opens the
+    /// generation prompt, so the model only has to emit the closer.
+    pub think_close: Vec<u32>,
+    /// Tokens allowed inside `<think>` before the closer is forced; 0 disables.
+    pub think_budget: usize,
     /// A second copy of the tokenizer, so `/tokenize` does not have to queue behind
     /// whatever the engine thread is generating.
     pub tokenizer: std::sync::Arc<tandem_tok::Tokenizer>,
@@ -206,6 +211,8 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 max_tokens: body.sampling.max_tokens(ctx.default_max_tokens),
                 stop: body.sampling.stop(),
                 ignore_eos: body.sampling.ignore_eos.unwrap_or(false),
+                think_budget: 0,
+                think_close: Vec::new(),
             };
             serve_with(ctx, gen, body.sampling.stream.unwrap_or(false), "text_completion", false, w)
         }
@@ -221,19 +228,21 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                     "this model has no chat template; use /v1/completions with a raw prompt",
                 );
             };
+            let thinking = body
+                .enable_thinking
+                .or_else(|| {
+                    body.chat_template_kwargs
+                        .as_ref()
+                        .and_then(|v| v.get("enable_thinking"))
+                        .and_then(|v| v.as_bool())
+                })
+                .unwrap_or(true);
             let prompt = match tmpl.render(
                 &body.messages,
                 true,
                 body.tools.as_ref(),
-                body
-                    .enable_thinking
-                    .or_else(|| {
-                        body.chat_template_kwargs
-                            .as_ref()
-                            .and_then(|v| v.get("enable_thinking"))
-                            .and_then(|v| v.as_bool())
-                    })
-                    .unwrap_or(true),
+                thinking,
+                body.chat_template_kwargs.as_ref(),
             ) {
                 Ok(p) => p,
                 Err(e) => return write_error(w, 400, &e),
@@ -244,16 +253,9 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 max_tokens: body.sampling.max_tokens(ctx.default_max_tokens),
                 stop: body.sampling.stop(),
                 ignore_eos: body.sampling.ignore_eos.unwrap_or(false),
+                think_budget: if thinking { ctx.think_budget } else { 0 },
+                think_close: ctx.think_close.clone(),
             };
-            let thinking = body
-                .enable_thinking
-                .or_else(|| {
-                    body.chat_template_kwargs
-                        .as_ref()
-                        .and_then(|v| v.get("enable_thinking"))
-                        .and_then(|v| v.as_bool())
-                })
-                .unwrap_or(true);
             serve_with(ctx, gen, body.sampling.stream.unwrap_or(false), "chat.completion", thinking, w)
         }
         ("GET", _) | ("POST", _) => write_error(w, 404, "no such endpoint"),

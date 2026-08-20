@@ -120,6 +120,13 @@ pub struct GenRequest {
     pub max_tokens: usize,
     pub stop: Vec<String>,
     pub ignore_eos: bool,
+    /// Tokens the model may spend inside a `<think>` block before it is forced to
+    /// stop and answer. 0 disables. This is a safety net, not a quality knob: without
+    /// it the model can think until it exhausts `max_tokens` and return an empty
+    /// answer — a pathology production caps at 4096. `think_close` is the token
+    /// sequence that ends the block, provided by the caller who has the tokenizer.
+    pub think_budget: usize,
+    pub think_close: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -823,7 +830,21 @@ fn run_job(
     );
     let mut round_depth = picker.choose();
     let n_vocab = model.hp.n_vocab as usize;
+    // Thinking budget: if the model is still inside a <think> block after this many
+    // generated tokens, its close sequence is force-fed so it resumes in answer mode
+    // instead of thinking until max_tokens and returning nothing. `thinking` is true
+    // only while no </think> has been emitted.
+    let budget_on = req.think_budget > 0 && !req.think_close.is_empty();
+    let mut forced: Vec<u32> = Vec::new();
     'outer: loop {
+        // Decide whether to inject the forced close this round.
+        if forced.is_empty()
+            && budget_on
+            && generated.len() >= req.think_budget
+            && !text.contains("</think>")
+        {
+            forced = req.think_close.clone();
+        }
         if !req.ignore_eos && Some(next) == tok.eos {
             reason = "stop";
             break;
@@ -845,7 +866,18 @@ fn run_job(
         }
 
         if !can_speculate {
-            // no draft head: one token per step, sampled or greedy
+            // no draft head: one token per step, sampled or greedy. The budget is
+            // enforced here too, by force-feeding the close tokens one at a time.
+            if !forced.is_empty() {
+                let f = forced.remove(0);
+                if let Err(e) = model.step_greedy(session, &[next], cfg.threads) {
+                    return Err(format!("decode: {e}"));
+                }
+                history.push(next);
+                sampler.accept(f);
+                next = f;
+                continue;
+            }
             let r = if greedy {
                 model.step_greedy(session, &[next], cfg.threads)
             } else {
@@ -867,8 +899,12 @@ fn run_job(
             continue;
         }
 
+        // While closing thinking, the forced tokens ARE the drafts, and they are
+        // committed verbatim regardless of what the model would have predicted.
+        let forcing = !forced.is_empty();
+        let round_drafts: Vec<u32> = if forcing { forced.clone() } else { drafts.clone() };
         let mut batch = vec![next];
-        batch.extend_from_slice(&drafts);
+        batch.extend_from_slice(&round_drafts);
         let t_round = std::time::Instant::now();
         let (preds, chain, logits) = match model.step_fused_cached(
             session,
@@ -884,14 +920,16 @@ fn run_job(
                 return Err(format!("decode: {e}"));
             }
         };
-        proposed += drafts.len();
+        proposed += round_drafts.len();
         rounds += 1;
         let round_secs = t_round.elapsed().as_secs_f64();
 
         let mut n_keep = 0usize;
         let mut replacement: Option<u32> = None;
-        for (j, draft) in drafts.iter().enumerate() {
-            let keep = if greedy {
+        for (j, draft) in round_drafts.iter().enumerate() {
+            let keep = if forcing {
+                true // committed verbatim to close the think block
+            } else if greedy {
                 preds[j] == *draft
             } else {
                 let dist = sampler.distribution(&logits[j * n_vocab..(j + 1) * n_vocab]);
@@ -911,10 +949,12 @@ fn run_job(
             sampler.accept(*draft);
         }
         accepted += n_keep;
-        picker.observe(drafts.len(), round_depth, n_keep, round_secs);
+        if !forcing {
+            picker.observe(round_drafts.len(), round_depth, n_keep, round_secs);
+        }
 
         // commit the accepted drafts, then the token that follows them
-        for d in drafts.iter().take(n_keep) {
+        for d in round_drafts.iter().take(n_keep) {
             generated.push(*d);
             push(&generated, &mut text);
             if let Some(hit) = req.stop.iter().find_map(|s| text.find(s.as_str())) {
@@ -936,6 +976,19 @@ fn run_job(
             }
         }
         next = match replacement {
+            _ if forcing => {
+                // the block is closed; the token after it is the model's own first
+                // answer token, drawn or argmaxed as the request asks
+                forced.clear();
+                round_depth = picker.choose();
+                if greedy {
+                    preds[n_keep]
+                } else {
+                    let dist =
+                        sampler.distribution(&logits[n_keep * n_vocab..(n_keep + 1) * n_vocab]);
+                    sampler.draw_from(&dist)
+                }
+            }
             Some(t) => t,
             None if greedy => {
                 round_depth = picker.choose();
@@ -948,7 +1001,11 @@ fn run_job(
             }
         };
         sampler.accept(next);
-        drafts = chain.iter().map(|c| c[n_keep]).collect();
+        drafts = if forcing {
+            Vec::new()
+        } else {
+            chain.iter().map(|c| c[n_keep]).collect()
+        };
         // The chain was generated by the draft head continuing from the trunk's ARGMAX
         // at this position — that is what the in-graph argmax->get_rows feeds it. At
         // temperature the committed token is sampled and may differ, and then these

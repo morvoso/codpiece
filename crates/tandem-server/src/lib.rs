@@ -23,10 +23,14 @@ pub struct ServeConfig {
     pub max_depth: usize,
     pub draft_gate: f32,
     pub default_max_tokens: usize,
+    /// Served model id in `/v1/models` (the alias clients send as `model`).
+    pub served_name: Option<String>,
+    /// Tokens allowed inside `<think>` before the closer is forced; 0 disables.
+    pub think_budget: usize,
 }
 
 pub fn run(cfg: ServeConfig) -> Result<(), String> {
-    let (engine, template_src) = engine::Engine::start(engine::EngineConfig {
+    let (mut engine, template_src) = engine::Engine::start(engine::EngineConfig {
         model_path: cfg.model_path.clone(),
         n_ctx: cfg.n_ctx,
         threads: cfg.threads,
@@ -55,15 +59,23 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
     // Only the header and metadata are read here, not the tensor data.
     let gguf = tandem_gguf::GgufFile::open(std::path::Path::new(&cfg.model_path))
         .map_err(|e| format!("reopen for tokenizer: {e}"))?;
+    if let Some(name) = cfg.served_name.clone() {
+        engine.model_name = name;
+    }
     let tokenizer = Arc::new(
         tandem_tok::Tokenizer::from_gguf(&gguf).map_err(|e| format!("tokenizer: {e}"))?,
     );
 
+    // `<think>\n` is opened by the generation prompt, so the model only emits the
+    // closer; tokenize it once for the budget's forced continuation.
+    let think_close = tokenizer.encode("\n</think>\n\n", false);
     let ctx = Arc::new(api::Ctx {
         engine,
         tokenizer,
         template,
         default_max_tokens: cfg.default_max_tokens,
+        think_close,
+        think_budget: cfg.think_budget,
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);

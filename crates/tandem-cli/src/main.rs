@@ -187,6 +187,8 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let mut depth = 3usize;
     let mut default_max_tokens = 512usize;
     let mut draft_gate = 0.0f32;
+    let mut served_name: Option<String> = None;
+    let mut think_budget = 4096usize;
     let mut serve_max_depth = 3usize;
     let mut gpu: Option<i32> = None;
     let mut tp: Option<Vec<i32>> = None;
@@ -203,6 +205,10 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             }
             "--draft-gate" => {
                 draft_gate = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0)
+            }
+            "--alias" | "--served-name" => served_name = it.next().cloned(),
+            "--think-budget" => {
+                think_budget = it.next().and_then(|s| s.parse().ok()).unwrap_or(4096)
             }
             "--max-tokens" => {
                 default_max_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(512)
@@ -224,7 +230,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         eprintln!(
             "usage: tandem serve <file.gguf> [--host H] [--port P] [-c n_ctx] [-t threads]\n\
              \x20      [--depth K|0=adaptive] [--max-depth M] [--draft-gate P]\n\
-             \x20      [--max-tokens N] [--tp 0,1 | --gpu N]"
+             \x20      [--max-tokens N] [--alias NAME] [--think-budget N] [--tp 0,1 | --gpu N]"
         );
         return ExitCode::from(2);
     };
@@ -240,6 +246,8 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         max_depth: serve_max_depth,
         draft_gate,
         default_max_tokens,
+        served_name,
+        think_budget,
     }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
