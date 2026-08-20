@@ -136,3 +136,19 @@ Block-diffusion drafter (arch `dflash`) through the pluggable drafter
 interface. Prize: mean accepted length 4.80 vs MTP's 4.28 (+10–15% decode).
 
 **Gate:** lossless (parity) + ≥ +8% decode over M4 on prose.
+
+## M3 design brief (from b10423 source reading, 2026-08-19)
+
+llama.cpp's `-sm tensor` (prod's mode) = `ggml_backend_meta_device(devs, n,
+get_split_state, ud)`: a Meta device wrapping both CUDA devices. All TP
+execution + NCCL all-reduce (PHB-safe, NCCL_P2P_DISABLE honored) lives in
+ggml's meta backend. The model supplies ONE callback classifying each tensor
+by name into a `ggml_backend_meta_split_state` (row/col/segment splits; fused
+tensors like attn_qkv described as segments). llama's callback
+(`llama_meta_device_get_split_state`, llama-model.cpp:353) already covers the
+whole qwen35 tensor family incl. ssm_*. tandem M3 = port that classification
++ create the meta device + point Weights::load at it. Session caches/states
+also classified (their `cache_[kv]_l\d` patterns → tandem's own names).
+DFlash2's historical crash ("buffer Meta() cannot run the operation") was
+draft-model code colliding with this meta backend — tandem's drafter design
+must be meta-aware from day one.

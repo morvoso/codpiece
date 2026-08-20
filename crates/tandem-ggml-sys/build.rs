@@ -57,7 +57,12 @@ fn main() {
     }
     if cuda {
         cfg.arg("-DGGML_CUDA=ON")
-            .arg("-DCMAKE_CUDA_ARCHITECTURES=86");
+            .arg("-DCMAKE_CUDA_ARCHITECTURES=86")
+            // standalone ggml defaults this OFF (llama.cpp's root cmake turns
+            // it on); without it the whole CUDA-graph capture path — the
+            // mechanism tandem's cached decode graph exists to exploit — is
+            // compiled out
+            .arg("-DGGML_CUDA_GRAPHS=ON");
     }
     run(&mut cfg, "cmake configure");
 
