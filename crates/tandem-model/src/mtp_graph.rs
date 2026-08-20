@@ -94,6 +94,37 @@ impl Qwen35 {
         n_ctx_max: usize,
         fa: bool,
     ) -> Result<MtpGraph, ModelError> {
+        self.build_mtp_impl(t_len, n_kv, n_past, mtp_k, mtp_v, n_ctx_max, fa, true)
+    }
+
+    /// Position-dependent variant: cache writes use view offsets, so the
+    /// graph is only valid for this `n_past` and must be rebuilt each step.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build_mtp_at(
+        &self,
+        t_len: i64,
+        n_kv: i64,
+        n_past: usize,
+        mtp_k: *mut ffi::ggml_tensor,
+        mtp_v: *mut ffi::ggml_tensor,
+        n_ctx_max: usize,
+        fa: bool,
+    ) -> Result<MtpGraph, ModelError> {
+        self.build_mtp_impl(t_len, n_kv, n_past, mtp_k, mtp_v, n_ctx_max, fa, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build_mtp_impl(
+        &self,
+        t_len: i64,
+        n_kv: i64,
+        n_past: usize,
+        mtp_k: *mut ffi::ggml_tensor,
+        mtp_v: *mut ffi::ggml_tensor,
+        n_ctx_max: usize,
+        fa: bool,
+        use_set_rows: bool,
+    ) -> Result<MtpGraph, ModelError> {
         let hp = &self.hp;
         let (l, x) = self
             .mtp_layer()
@@ -162,7 +193,7 @@ impl Qwen35 {
             n_past,
             fa,
             fa,
-            /* use_set_rows */ true,
+            use_set_rows,
             Default::default(),
         );
         cur = ffi::ggml_add(ctx, cur, inp_sa);

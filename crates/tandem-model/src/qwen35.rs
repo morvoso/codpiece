@@ -859,7 +859,18 @@ impl Qwen35 {
         let n_kv_exact = (session.mtp_past + 1) as i64;
         let kvb = kv_bucket();
         let n_kv = (((n_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
+        // Caching the draft graph is a large win (it removes a full graph
+        // build per draft) but the tensor-parallel meta backend rejects the
+        // cached, set_rows-based MTP graph: it cannot produce a per-device
+        // tensor for one of its nodes (ggml-backend-meta.cpp:1838). The
+        // trunk's cached decode graph uses the same mechanism and is fine, so
+        // this is specific to the MTP head and unresolved — under TP the
+        // draft graph is rebuilt per round, as before.
+        let cacheable = !self.weights.is_tensor_parallel();
         unsafe {
+            if !cacheable {
+                return self.mtp_draft_uncached(session, hidden, token, pos, n_threads);
+            }
             let stale = session
                 .mtp_cached
                 .as_ref()
@@ -930,6 +941,86 @@ impl Qwen35 {
             session.mtp_past += 1;
             Ok((logits, h))
         }
+    }
+
+    /// Draft with a freshly built graph. Slower, but the only path the
+    /// tensor-parallel backend accepts today.
+    fn mtp_draft_uncached(
+        &self,
+        session: &mut Session,
+        hidden: &[f32],
+        token: u32,
+        pos: usize,
+        n_threads: i32,
+    ) -> Result<(Vec<f32>, Vec<f32>), ModelError> {
+        let n_kv_exact = (session.mtp_past + 1) as i64;
+        let kvb = kv_bucket();
+        let n_kv = (((n_kv_exact + kvb - 1) / kvb) * kvb).min(session.n_ctx_max as i64);
+        unsafe {
+            let g = self.build_mtp_at(
+                1,
+                n_kv,
+                session.mtp_past,
+                session.mtp_k,
+                session.mtp_v,
+                session.n_ctx_max,
+                session.fa,
+            )?;
+            if let Some(sched) = self.weights.sched() {
+                ffi::ggml_backend_sched_reset(sched);
+                if !ffi::ggml_backend_sched_alloc_graph(sched, g.gf) {
+                    return Err(ModelError::Load("mtp sched alloc".into()));
+                }
+            } else if !ffi::ggml_gallocr_alloc_graph(session.galloc, g.gf) {
+                return Err(ModelError::Load("mtp graph alloc".into()));
+            }
+            self.fill_mtp_inputs(&g, hidden, token, pos, session.mtp_past, n_kv);
+            self.compute(g.gf, n_threads)?;
+            let mut logits = vec![0f32; self.hp.n_vocab as usize];
+            ffi::ggml_backend_tensor_get(g.out, logits.as_mut_ptr().cast(), 0, logits.len() * 4);
+            let mut h = vec![0f32; self.hp.n_embd as usize];
+            ffi::ggml_backend_tensor_get(g.h_out, h.as_mut_ptr().cast(), 0, h.len() * 4);
+            session.mtp_past += 1;
+            Ok((logits, h))
+        }
+    }
+
+    unsafe fn fill_mtp_inputs(
+        &self,
+        g: &crate::mtp_graph::MtpGraph,
+        hidden: &[f32],
+        token: u32,
+        pos: usize,
+        mtp_past: usize,
+        n_kv: i64,
+    ) {
+        let tok = [token as i32];
+        ffi::ggml_backend_tensor_set(g.inp_tokens, tok.as_ptr().cast(), 0, 4);
+        ffi::ggml_backend_tensor_set(
+            g.inp_h,
+            hidden.as_ptr().cast(),
+            0,
+            self.hp.n_embd as usize * 4,
+        );
+        let p = pos as i32;
+        let posv = [p, p, p, 0];
+        ffi::ggml_backend_tensor_set(g.inp_pos, posv.as_ptr().cast(), 0, 16);
+        let nkv = n_kv as usize;
+        if g.fa_mask {
+            let mut mask = vec![0xFC00u16; nkv];
+            for c in mask.iter_mut().take((mtp_past + 1).min(nkv)) {
+                *c = 0;
+            }
+            ffi::ggml_backend_tensor_set(g.kq_mask, mask.as_ptr().cast(), 0, nkv * 2);
+        } else {
+            let mut mask = vec![f32::NEG_INFINITY; nkv];
+            for c in mask.iter_mut().take((mtp_past + 1).min(nkv)) {
+                *c = 0.0;
+            }
+            ffi::ggml_backend_tensor_set(g.kq_mask, mask.as_ptr().cast(), 0, nkv * 4);
+        }
+        let zero = [0i32];
+        ffi::ggml_backend_tensor_set(g.out_ids, zero.as_ptr().cast(), 0, 4);
     }
 
     /// Cached T=1 decode: reuse the per-bucket graph + frozen allocation.
