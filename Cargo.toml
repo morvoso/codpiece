@@ -4,6 +4,7 @@ members = [
     "crates/tandem-gguf",
     "crates/tandem-ggml-sys",
     "crates/tandem-tok",
+    "crates/tandem-model",
     "crates/tandem-cli",
 ]
 

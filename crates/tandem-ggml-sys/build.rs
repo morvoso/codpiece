@@ -43,6 +43,18 @@ fn main() {
         .arg("-DGGML_BUILD_EXAMPLES=OFF")
         .arg("-DGGML_CCACHE=OFF")
         .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
+    // Portable-by-default: binaries built on the workstation must run on
+    // llm-host (i9-12900KF = AVX2/FMA/F16C, no AVX512). -march=native once
+    // shipped an illegal-instruction binary; never again. Opt back in with
+    // TANDEM_NATIVE_CPU=1 for machine-local perf experiments.
+    if env::var("TANDEM_NATIVE_CPU").ok().as_deref() != Some("1") {
+        cfg.arg("-DGGML_NATIVE=OFF")
+            .arg("-DGGML_AVX=ON")
+            .arg("-DGGML_AVX2=ON")
+            .arg("-DGGML_FMA=ON")
+            .arg("-DGGML_F16C=ON")
+            .arg("-DGGML_BMI2=ON");
+    }
     if cuda {
         cfg.arg("-DGGML_CUDA=ON")
             .arg("-DCMAKE_CUDA_ARCHITECTURES=86");

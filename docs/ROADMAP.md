@@ -24,20 +24,39 @@ Baselines to beat (ENGINE.md, measured 2026-08-19 unless noted):
 - [x] `tandem-gguf` parser + `tandem inspect`, validated against all four
       production GGUFs (27B Q8_K_XL, Q6_K_XL-v3, DFlash2 Q8, mmproj)
 - [x] qwen35 architecture fully mapped from GGUF metadata + llama.cpp source
-- [ ] Vendored ggml pinned @ b10423; `tandem-ggml-sys` links and runs a CPU
-      graph locally and on llm-host (container build, sm_86 compile proven)
+- [x] Vendored ggml pinned @ b10423; `tandem-ggml-sys` links and runs CPU
+      graphs on both machines (portable-AVX2 build after a -march=native
+      illegal-instruction lesson); CUDA sm_86 compile proven via the oracle
+      container build on llm-host
 
-**Gate:** inspector tensor census matches llama.cpp's loader expectations
-(866 tensors, layer schedule 48 GDN / 16 attn / 1 MTP). ✅ + FFI smoke test.
+**Gate:** inspector census matches llama.cpp's loader (866 tensors, 48 GDN /
+16 attn / 1 MTP schedule) ✅; FFI smoke (matmul + fused-GDN op present) ✅.
 
-## M1 — CPU correctness on a small dense sibling
+## M1 — CPU correctness on a small same-arch sibling  ◕ mostly done 2026-08-19
 
-Small Qwen3-family dense GGUF (0.6B/1.7B class) end to end on ggml CPU:
-tokenizer → graph → sampler.
+Target upgraded from "dense qwen3" to **Qwen3.5-0.8B** (same qwen35 arch as
+prod's 27B: 18 GDN + 6 attn layers): tokenizer → weights → stateless forward
+graph (fused GDN, IMROPE, packed Q+gate attention) → greedy sampler.
 
-**Gate:** (a) tokenizer token-identical to `llama-tokenize` on ≥1 MB of mixed
-corpus incl. CJK + code; (b) temp-0, 64-token continuation token-identical to
-`llama-cli` b10423; max |logit diff| < 1e-3 on first 8 steps.
+Status 2026-08-19, all vs oracles built at b10423, CPU, GPU-blind:
+- [x] Tokenizer parity: **token-identical** with `llama-tokenize` in both
+      parse-special modes on a 236 KB adversarial corpus (68,347 tokens:
+      CJK, Arabic diacritics, Devanagari, Zalgo, emoji ZWJ, code). Includes
+      the USER_DEFINED-always-parsed subtlety.
+- [x] Generation parity: greedy continuation **token-identical to EOS**
+      (43 tokens) vs `llama-completion --temp 0` on the wrapped prompt,
+      BF16 weights.
+- [ ] Formal gate remainder: ≥1 MB corpus run; 3 diverse prompts × 64 tokens;
+      numeric logit maxdiff (< 1e-3) via eval-callback; EOS stop in the rig.
+
+## M1.5 — hygiene before M2
+
+- [ ] tok-parity + gen-parity as scripted harness (scripts/), runnable in one
+      command; corpus checked in or fetched deterministically.
+- [ ] `tandem-tok` perf pass (BPE merge is O(n²) scan; fine for corpora,
+      wrong for serving) + decode SIGPIPE/broken-pipe hardening.
+- [ ] Builder image for llm-host with rust + CUDA so `cargo build
+      --features cuda` runs there (oracle recipe already proves the pieces).
 
 ## M2 — Single-GPU CUDA + decode loop
 

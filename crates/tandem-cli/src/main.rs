@@ -9,16 +9,140 @@ use std::process::ExitCode;
 use tandem_gguf::{GgufFile, TensorInfo, Value};
 
 fn main() -> ExitCode {
+    // Piping into `head` must truncate output, not panic the process.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("tokenize") => cmd_tokenize(&args[1..]),
+        Some("load") => cmd_load(&args[1..]),
+        Some("run") => cmd_run(&args[1..]),
         _ => {
             eprintln!(
                 "usage: tandem inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
-                 usage: tandem tokenize <file.gguf> [--special] [--pieces] < text"
+                 usage: tandem tokenize <file.gguf> [--special] [--pieces] < text\n\
+                 usage: tandem load <file.gguf>"
             );
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Greedy generation on the CPU backend (M1 correctness rig: stateless
+/// forward, full-prefix recompute per token).
+fn cmd_run(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut prompt = String::from("The capital of France is");
+    let mut n_gen = 16usize;
+    let mut threads = 8i32;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-p" => prompt = it.next().cloned().unwrap_or_default(),
+            "-n" => n_gen = it.next().and_then(|s| s.parse().ok()).unwrap_or(16),
+            "-t" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
+            s if !s.starts_with('-') && path.is_none() => path = Some(s),
+            s => {
+                eprintln!("unknown arg: {s}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: tandem run <file.gguf> [-p prompt] [-n tokens] [-t threads]");
+        return ExitCode::from(2);
+    };
+
+    let t0 = std::time::Instant::now();
+    let model = match tandem_model::qwen35::Qwen35::load(Path::new(path)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("tandem run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = match tandem_tok::Tokenizer::from_gguf(&model.weights.gguf) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tandem run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "loaded {} ({} layers, {} embd) in {:.2}s",
+        path,
+        model.hp.n_layer,
+        model.hp.n_embd,
+        t0.elapsed().as_secs_f64()
+    );
+
+    let prompt_ids = tok.encode(&prompt, true);
+    eprintln!("prompt ids: {prompt_ids:?}");
+
+    let t1 = std::time::Instant::now();
+    let mut ids = prompt_ids.clone();
+    for i in 0..n_gen {
+        let logits = match model.forward_logits(&ids, threads) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("forward failed at step {i}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let next = tandem_model::qwen35::argmax(&logits);
+        ids.push(next);
+        eprint!("{next} ");
+    }
+    eprintln!();
+    let gen_ids = &ids[prompt_ids.len()..];
+    println!("{}", tok.decode(gen_ids, true));
+    eprintln!(
+        "{} tokens in {:.2}s ({:.2} tok/s, stateless O(n^2) rig)",
+        n_gen,
+        t1.elapsed().as_secs_f64(),
+        n_gen as f64 / t1.elapsed().as_secs_f64()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Load all weights onto the CPU backend and verify integrity. Exercises the
+/// full loader path (tensor creation, size cross-check, streaming copy).
+fn cmd_load(args: &[String]) -> ExitCode {
+    let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
+        eprintln!("usage: tandem load <file.gguf>");
+        return ExitCode::from(2);
+    };
+    let t0 = std::time::Instant::now();
+    match tandem_model::Weights::load(Path::new(path), tandem_model::Device::Cpu) {
+        Ok(w) => {
+            let dt = t0.elapsed().as_secs_f64();
+            let gib = w.bytes_loaded as f64 / (1u64 << 30) as f64;
+            println!(
+                "loaded {} tensors, {:.3} GiB in {:.2}s ({:.2} GiB/s) [arch {}]",
+                w.n_tensors(),
+                gib,
+                dt,
+                gib / dt,
+                w.gguf.architecture().unwrap_or("?"),
+            );
+            // Deterministic fingerprint of the embedding table's first bytes:
+            // reruns and machines must agree (catches copy/offset bugs).
+            if let Some(bytes) = w.tensor_bytes("token_embd.weight") {
+                let n = bytes.len().min(1 << 20);
+                let mut h: u64 = 0xcbf29ce484222325;
+                for &b in &bytes[..n] {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                println!("token_embd.weight[..{n}] fnv1a = {h:016x}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("tandem load: {e}");
+            ExitCode::FAILURE
         }
     }
 }

@@ -238,7 +238,9 @@ dependencies = [
 name = "tandem-cli"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "tandem-gguf",
+ "tandem-model",
  "tandem-tok",
 ]
 
@@ -252,6 +254,14 @@ dependencies = [
 [[package]]
 name = "tandem-gguf"
 version = "0.0.1"
+
+[[package]]
+name = "tandem-model"
+version = "0.0.1"
+dependencies = [
+ "tandem-ggml-sys",
+ "tandem-gguf",
+]
 
 [[package]]
 name = "tandem-tok"

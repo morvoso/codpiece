@@ -72,7 +72,9 @@ pub struct Tokenizer {
     /// BPE merge ranks, keyed "left\0right" (NUL never occurs in symbols).
     ranks: HashMap<String, u32>,
     /// Special tokens (control + user-defined) sorted longest-first.
-    specials: Vec<(String, u32)>,
+    /// bool = is_control: CONTROL tokens partition only when `parse_special`;
+    /// USER_DEFINED tokens ALWAYS partition (llama.cpp tokenizer_st_partition).
+    specials: Vec<(String, u32, bool)>,
     pre: Regex,
     byte_enc: [char; 256],
     byte_dec: HashMap<char, u8>,
@@ -171,12 +173,12 @@ impl Tokenizer {
             ranks.insert(format!("{l}\0{r}"), rank as u32);
         }
 
-        let mut specials: Vec<(String, u32)> = tokens
+        let mut specials: Vec<(String, u32, bool)> = tokens
             .iter()
             .zip(types.iter())
             .enumerate()
             .filter(|(_, (_, ty))| matches!(ty, TokenType::Control | TokenType::UserDefined))
-            .map(|(i, (t, _))| (t.clone(), i as u32))
+            .map(|(i, (t, ty))| (t.clone(), i as u32, matches!(ty, TokenType::Control)))
             .collect();
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.1.cmp(&b.1)));
 
@@ -213,41 +215,41 @@ impl Tokenizer {
         self.types.get(id as usize).copied()
     }
 
-    /// Tokenize. `parse_special` = treat control/user-defined token strings in
-    /// `text` as single tokens (template rendering path uses true).
+    /// Tokenize. `parse_special` = also match CONTROL token strings in `text`
+    /// (template rendering path uses true). USER_DEFINED tokens are always
+    /// matched regardless, mirroring llama.cpp.
     pub fn encode(&self, text: &str, parse_special: bool) -> Vec<u32> {
         let mut out = Vec::new();
-        if parse_special && !self.specials.is_empty() {
-            let mut rest = text;
-            while !rest.is_empty() {
-                // earliest match wins; specials are longest-first so equal
-                // positions prefer the longer token.
-                let mut best: Option<(usize, usize, u32)> = None; // (pos, len, id)
-                for (s, id) in &self.specials {
-                    if let Some(pos) = rest.find(s.as_str()) {
-                        let better = match best {
-                            None => true,
-                            Some((bp, bl, _)) => pos < bp || (pos == bp && s.len() > bl),
-                        };
-                        if better {
-                            best = Some((pos, s.len(), *id));
-                        }
-                    }
+        let mut rest = text;
+        while !rest.is_empty() {
+            // earliest match wins; specials are longest-first so equal
+            // positions prefer the longer token.
+            let mut best: Option<(usize, usize, u32)> = None; // (pos, len, id)
+            for (s, id, is_control) in &self.specials {
+                if *is_control && !parse_special {
+                    continue;
                 }
-                match best {
-                    Some((pos, len, id)) => {
-                        self.encode_plain(&rest[..pos], &mut out);
-                        out.push(id);
-                        rest = &rest[pos + len..];
-                    }
-                    None => {
-                        self.encode_plain(rest, &mut out);
-                        break;
+                if let Some(pos) = rest.find(s.as_str()) {
+                    let better = match best {
+                        None => true,
+                        Some((bp, bl, _)) => pos < bp || (pos == bp && s.len() > bl),
+                    };
+                    if better {
+                        best = Some((pos, s.len(), *id));
                     }
                 }
             }
-        } else {
-            self.encode_plain(text, &mut out);
+            match best {
+                Some((pos, len, id)) => {
+                    self.encode_plain(&rest[..pos], &mut out);
+                    out.push(id);
+                    rest = &rest[pos + len..];
+                }
+                None => {
+                    self.encode_plain(rest, &mut out);
+                    break;
+                }
+            }
         }
         out
     }

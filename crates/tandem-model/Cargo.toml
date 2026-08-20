@@ -1,0 +1,10 @@
+[package]
+name = "tandem-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model weight loading and (soon) qwen35 graph construction on ggml."
+
+[dependencies]
+tandem-gguf = { path = "../tandem-gguf" }
+tandem-ggml-sys = { path = "../tandem-ggml-sys" }
