@@ -1064,20 +1064,26 @@ fn run_job(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    // p-min for links carried from the fused chain; 0 carries everything as before.
-    // Both gates default to 0.9 from the joint sweep on the 27B: verification
-    // accepts a draft with probability p(x0), so gating both draft sources at 0.9
-    // confidence is what holds measured acceptance >= 0.90 across greedy and
-    // temperature-1.0 requests (0.910 greedy / 0.910 short / 0.933 at 32K); one
-    // gate alone tops out at 0.86 because the other pool dilutes the ratio.
+    // Confidence gates, tuned for VALUE, not for the acceptance ratio.
+    // Acceptance is a conversion statistic — the output distribution is provably
+    // unchanged by speculation at any ratio — and the two draft pools have very
+    // different economics. A link carried from the fused chain was computed last
+    // round and is nearly free to verify, so dropping one is refusing a free bet:
+    // gating the chain at 0.9 raised the ratio to 0.93 but cost 17% of 32K decode
+    // (47.5 -> 39.5 tok/s). It stays ungated. A re-draft link costs a real ~6 ms
+    // MTP pass, so declining low-confidence ones genuinely saves time; 0.75 is the
+    // measured optimum (49.2 tok/s vs 46.9 without re-drafting). Deployments that
+    // want the ratio to READ >= 0.90 can set both to 0.9 — that configuration
+    // measured 0.910 greedy / 0.933 at 32K — but it buys no accuracy, only the
+    // number.
     let chain_pmin: f32 = std::env::var("CODPIECE_CHAIN_PMIN")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0.9);
+        .unwrap_or(0.0);
     let redraft_pmin: f32 = std::env::var("CODPIECE_REDRAFT_PMIN")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0.9);
+        .unwrap_or(0.75);
     let mut forced: Vec<u32> = Vec::new();
     'outer: loop {
         // Decide whether to inject the forced close this round.

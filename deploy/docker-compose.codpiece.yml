@@ -40,10 +40,13 @@ services:
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       NCCL_P2P_DISABLE: "1"
       NCCL_SHM_DISABLE: "0"
-      # Confidence gates on speculative drafts; 0.9/0.9 holds measured
-      # acceptance >= 0.90 (greedy and temperature) on the 27B.
-      CODPIECE_CHAIN_PMIN: ${CODPIECE_CHAIN_PMIN:-0.9}
-      CODPIECE_REDRAFT_PMIN: ${CODPIECE_REDRAFT_PMIN:-0.9}
+      # Confidence gates on speculative drafts, tuned for throughput: carried
+      # chain links are free to verify (gate off), re-drafts cost ~6ms each
+      # (gate 0.75, the measured optimum). Set both to 0.9 to make the
+      # acceptance ratio read >= 0.90 — it costs ~15% decode and changes no
+      # output.
+      CODPIECE_CHAIN_PMIN: ${CODPIECE_CHAIN_PMIN:-0}
+      CODPIECE_REDRAFT_PMIN: ${CODPIECE_REDRAFT_PMIN:-0.75}
       # Vision tower: set to the mmproj path to enable image requests
       # (~0.9 GiB weights + compute buffer on CODPIECE_MMPROJ_GPU).
       CODPIECE_MMPROJ: ${CODPIECE_MMPROJ:-}

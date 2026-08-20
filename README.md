@@ -101,15 +101,18 @@ streaming and non-streaming responses.
 | `--depth N` | 3 | speculation depth; `0` disables, `auto` self-tunes |
 | `--think-budget N` | 4096 | max tokens in a `<think>` block before it is force-closed |
 | `--alias NAME` | file stem | model id reported to clients |
-| `CODPIECE_CHAIN_PMIN` | 0.9 | draft confidence gate; higher = fewer, better drafts |
-| `CODPIECE_REDRAFT_PMIN` | 0.9 | same gate for post-divergence re-drafts |
+| `CODPIECE_CHAIN_PMIN` | 0 (off) | confidence gate on carried drafts; raise to trade speed for acceptance ratio |
+| `CODPIECE_REDRAFT_PMIN` | 0.75 | confidence gate on re-drafts, which cost real time; 0.75 is the measured optimum |
 | `CODPIECE_SESSIONS` | 2 (≤70K ctx) | conversations kept resident in VRAM |
 | `CODPIECE_BATCH` | 4 | slots for concurrent requests |
 | `CODPIECE_MMPROJ` | unset | vision tower path (alternative to `--mmproj`) |
 | `CODPIECE_IMAGE_MIN_TOKENS` | 1024 | image detail floor; Qwen-VL reads text poorly below this |
 
-The two `PMIN` gates hold measured speculation acceptance at or above 0.90.
-Lowering them trades acceptance for a little long-context speed.
+The defaults maximize throughput. Acceptance ratio is a conversion
+statistic, not a quality metric — the output is identical at any setting —
+so the gates only filter drafts whose *cost* matters: carried chain links
+are free to verify (gate off), re-drafts cost a ~6 ms pass each (gate 0.75).
+Setting both to 0.9 makes the ratio read >= 0.90 at ~15% decode cost.
 
 ### Deploying
 
@@ -128,21 +131,23 @@ windows. llama.cpp is b10423 in its production configuration.
 |---|---|---|---|
 | greedy decode, prose | **69.9 tok/s** | 64.5 | 76–95 |
 | greedy decode, code | **67.6** | 53.3 | — |
-| sampled (temp 1.0), short | **42.8** | 32.4 | — |
-| sampled, 32K context | 39.5 | **52.7** | — |
+| sampled (temp 1.0), short | **45.2** | 32.4 | — |
+| sampled, 32K context | 47.4 | **52.7** | — |
 | prefill, 32K prompt | 1,337 | 1,353 | — |
 | 8 concurrent requests | **153.5** | ~101 | 251–260 |
 | return to a 32K conversation | **0.9 s** | 1.3 s | — |
-| speculation acceptance | **0.91–0.93** | ~0.78 | — |
+| speculation acceptance | 0.64–0.73 (0.91–0.93 opt-in) | ~0.78 | — |
 | vision (same page, same question) | same answer, 847 tok/s prefill | same, 837 | n/a |
 | greedy output parity | byte-identical | reference | not comparable (FP8) |
 
-Honest caveats: llama.cpp still wins sampled decode at 32K (a consequence of
-the 0.9 confidence gates; at gate 0 codpiece measures 47.5 there) and can run
-196K context where codpiece's speculation stops near 145K. vLLM wins raw
-throughput at high concurrency, but only at FP8 weight precision — this
-project's quant keeps the sensitive tensors in BF16, and accuracy outranks
-speed here by design.
+Honest caveats: llama.cpp still wins sampled decode at 32K by ~10% and can
+run 196K context where codpiece's speculation stops near 145K. Its higher
+acceptance ratio is denominator filtering (`--spec-draft-p-min 0.75` declines
+low-confidence drafts), not better text — the same filtering is available
+here via the `PMIN` knobs and is off by default because it costs throughput.
+vLLM wins raw throughput at high concurrency, but only at FP8 weight
+precision — this project's quant keeps the sensitive tensors in BF16, and
+accuracy outranks speed here by design.
 
 ## Technical details
 
@@ -179,14 +184,16 @@ accepted with probability p(draft) and rejections re-drawn from the residual,
 which provably emits the target distribution unchanged (verified on the 27B:
 total-variation test/null ratio 1.039 over 24K sampled tokens).
 
-Acceptance is held at ≥ 0.90 by two confidence gates. The graph emits each
-chain link's softmax peak (a batched `get_rows` over the softmax viewed as
-`[1, vocab, n_out]`), and the server drops carried links below
-`CODPIECE_CHAIN_PMIN`; the post-divergence re-draft chain stops below
-`CODPIECE_REDRAFT_PMIN`. Since verification accepts with probability p(x0),
-a calibrated 0.9 gate puts each surviving draft near 0.93 acceptance odds;
-either gate alone tops out near 0.86 because the ungated pool dilutes the
-ratio. Measured: 0.910 greedy, 0.910 sampled short, 0.933 sampled at 32K.
+Two confidence gates filter drafts by cost, not by ratio. The fused graph
+emits each chain link's softmax peak (a batched `get_rows` over the softmax
+viewed as `[1, vocab, n_out]`); `CODPIECE_CHAIN_PMIN` gates carried chain
+links and defaults off, because a link computed last round is nearly free to
+verify and rejecting a 60%-likely free draft loses tokens (gating the chain
+at 0.9 measured -17% at 32K). `CODPIECE_REDRAFT_PMIN` gates post-divergence
+re-drafts, which cost a real ~6 ms MTP pass each; 0.75 is the measured
+optimum. Since verification accepts with probability p(x0), setting both to
+0.9 pushes the measured ratio to 0.91–0.93 for deployments that want that
+number — the output is identical either way.
 
 Speculative output is not always byte-identical to one-token-at-a-time
 greedy decoding: batched verification reduces GEMMs in a different order, and

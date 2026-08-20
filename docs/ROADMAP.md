@@ -372,6 +372,15 @@ scheduling (the oracle's eval callback splits the graph per node; codpiece
 computes fused) — well under BF16 weight precision. `codpiece vision
 <mmproj> --pattern gray|rainbow` prints dumps diffable against the oracle.
 
+**Gate defaults retuned for value (2026-08-20, late).** Acceptance ratio is
+a conversion statistic, not accuracy — the output distribution is identical
+at any setting — and the two draft pools price differently: carried chain
+links are free to verify, re-drafts cost ~6 ms each. Defaults moved to
+CHAIN_PMIN=0 / REDRAFT_PMIN=0.75 (measured on the shipped build: greedy 68.5,
+short sampled 45.2, 32K sampled 47.4 tok/s, acceptance 0.64-0.73); 0.9/0.9
+remains available by env for deployments that want the ratio to read >=0.90
+(costs ~15% decode). Prod recreated on the new defaults.
+
 **Vision SHIPPED end to end (2026-08-20, same day).** Preprocessing ported
 from mtmd's dyn-size pipeline (smart-resize, PAD_CEIL bilinear, min-tokens
 1024 like prod); the trunk gained an embd-input graph (`step_embd`) with the
