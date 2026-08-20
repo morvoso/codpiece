@@ -36,6 +36,24 @@ that measurement says exist:
 The end state is one engine that holds all rows at once — which today no
 engine does.
 
+## Status — 2026-08-19
+
+Running the production Qwen3.8-27B on 2×3090, tensor-parallel, with MTP
+speculative decoding. Every speed number below has an accuracy gate behind
+it: output identical to llama.cpp b10423, or it does not count.
+
+| | tandem | llama.cpp b10423 |
+|---|---|---|
+| 27B decode, tensor parallel | 39.8 tok/s | 41.4 |
+| 27B decode, + MTP speculation | **59.3 tok/s** | (prod's documented ~50 with MTP) |
+| 27B prefill, 7.5K prompt | 1,494 tok/s | — |
+| output vs llama.cpp (short, 8K, 27B) | **identical** | reference |
+| tokenizer, wikitext-2 | **297,193/297,193 identical** | reference |
+| perplexity | 20.4453 | 20.4429 |
+
+Milestones M0–M4 are done and gated; see `docs/ROADMAP.md`. Next: the
+serving layer (M5) and the host-RAM session cache (M6).
+
 ## Layout
 
 - `crates/tandem-gguf` — zero-dependency GGUF v2/v3 reader (done, tested
