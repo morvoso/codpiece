@@ -79,6 +79,32 @@ pub enum Device {
     CudaSplit(Vec<i32>),
 }
 
+/// Per-GPU `(name, used, total)` in bytes, as the driver sees it — so it
+/// counts the CUDA context and anything else sharing the card, not just what
+/// this process allocated. Reported at startup because on a 48 GiB box every
+/// context decision is a memory decision, and guessing at the split between
+/// weights, KV and compute buffers is how those decisions go wrong.
+pub fn device_memory() -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    unsafe {
+        for i in 0..ffi::ggml_backend_dev_count() {
+            let dev = ffi::ggml_backend_dev_get(i);
+            if dev.is_null()
+                || ffi::ggml_backend_dev_type(dev) != ffi::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+            {
+                continue;
+            }
+            let (mut free, mut total) = (0usize, 0usize);
+            ffi::ggml_backend_dev_memory(dev, &mut free, &mut total);
+            let name = std::ffi::CStr::from_ptr(ffi::ggml_backend_dev_name(dev))
+                .to_string_lossy()
+                .into_owned();
+            out.push((name, total.saturating_sub(free), total));
+        }
+    }
+    out
+}
+
 /// Weights resident on one or more backends, addressable by GGUF name.
 pub struct Weights {
     pub gguf: GgufFile,

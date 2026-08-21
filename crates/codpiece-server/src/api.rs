@@ -179,9 +179,25 @@ impl SamplingFields {
 
 #[derive(Debug, Deserialize)]
 struct CompletionsBody {
-    prompt: String,
+    prompt: PromptField,
+    /// Return the prompt's own tokens and their logprobs. Loglikelihood
+    /// benchmarks run on this with `max_tokens: 0`.
+    #[serde(default)]
+    echo: Option<bool>,
+    /// How many alternatives to report per position (OpenAI caps this at 5).
+    #[serde(default)]
+    logprobs: Option<usize>,
     #[serde(flatten)]
     sampling: SamplingFields,
+}
+
+/// `/v1/completions` accepts a string or an array of token ids; harnesses use
+/// the token form to keep their own tokenization authoritative.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PromptField {
+    Text(String),
+    Tokens(Vec<u32>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,8 +298,19 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 Ok(b) => b,
                 Err(e) => return write_error(w, 400, &format!("invalid request body: {e}")),
             };
+            let (prompt, prompt_ids) = match body.prompt {
+                PromptField::Text(s) => (s, None),
+                PromptField::Tokens(ids) => (ctx.tokenizer.decode(&ids, true), Some(ids)),
+            };
+            // Scoring needs both flags: `echo` alone just repeats the prompt.
+            let echo = body.echo.unwrap_or(false);
+            let echo_logprobs = match (echo, body.logprobs) {
+                (true, Some(n)) => Some(n.min(20)),
+                _ => None,
+            };
             let gen = GenRequest {
-                prompt: body.prompt,
+                prompt,
+                prompt_ids,
                 images: Vec::new(),
                 params: body.sampling.params(),
                 max_tokens: body.sampling.max_tokens(ctx.default_max_tokens),
@@ -291,6 +318,7 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 ignore_eos: body.sampling.ignore_eos.unwrap_or(false),
                 think_budget: 0,
                 think_close: Vec::new(),
+                echo_logprobs,
             };
             serve_with(
                 ctx,
@@ -358,6 +386,7 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
             };
             let gen = GenRequest {
                 prompt,
+                prompt_ids: None,
                 images,
                 params: body.sampling.params(),
                 max_tokens: body.sampling.max_tokens(ctx.default_max_tokens),
@@ -365,6 +394,7 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 ignore_eos: body.sampling.ignore_eos.unwrap_or(false),
                 think_budget: if thinking { ctx.think_budget } else { 0 },
                 think_close: ctx.think_close.clone(),
+                echo_logprobs: None,
             };
             serve_with(
                 ctx,
@@ -496,6 +526,16 @@ fn serve_with(
         while let Ok(ev) = rx.recv() {
             match ev {
                 Event::Prefilled { n_prompt: n } => n_prompt = n,
+                // scoring is a non-streaming shape; a client that asks for
+                // both gets the echoed text and no logprobs
+                Event::Scored(s) => {
+                    let chunk = json!({
+                        "id": id, "object": "text_completion", "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "text": s.text, "finish_reason": null}],
+                    });
+                    sse_data(w, &chunk.to_string())?;
+                }
                 Event::Token(text) => {
                     let (reasoning, mut content) = rsplit.push(&text);
                     if let Some(t) = tsplit.as_mut() {
@@ -614,10 +654,25 @@ fn serve_with(
     }
 
     let mut text = String::new();
+    let mut scored: Option<serde_json::Value> = None;
     while let Ok(ev) = rx.recv() {
         match ev {
             Event::Prefilled { .. } => {}
             Event::Token(t) => text.push_str(&t),
+            Event::Scored(s) => {
+                text = s.text.clone();
+                scored = Some(json!({
+                    "tokens": s.tokens,
+                    "token_logprobs": s.logprobs,
+                    "top_logprobs": s.top.iter().map(|t| match t {
+                        Some(v) => serde_json::Value::Object(
+                            v.iter().map(|(k, lp)| (k.clone(), json!(lp))).collect(),
+                        ),
+                        None => serde_json::Value::Null,
+                    }).collect::<Vec<_>>(),
+                    "text_offset": s.text_offset,
+                }));
+            }
             Event::Done(f) => {
                 let usage = json!({
                     "prompt_tokens": f.n_prompt,
@@ -656,10 +711,14 @@ fn serve_with(
                         }],
                     })
                 } else {
+                    let mut choice = json!({
+                        "index": 0, "text": text, "finish_reason": f.reason,
+                    });
+                    choice["logprobs"] = scored.take().unwrap_or(serde_json::Value::Null);
                     json!({
                         "id": id, "object": "text_completion", "created": created,
                         "model": model, "usage": usage, "timings": timings(&f),
-                        "choices": [{"index": 0, "text": text, "finish_reason": f.reason}],
+                        "choices": [choice],
                     })
                 };
                 return write_json(w, 200, &body.to_string());

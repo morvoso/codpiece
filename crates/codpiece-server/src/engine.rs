@@ -119,6 +119,10 @@ impl SessionStore {
 
 pub struct GenRequest {
     pub prompt: String,
+    /// Pre-tokenized prompt, when the client sent token ids rather than text.
+    /// Re-tokenizing text a harness already tokenized can shift token
+    /// boundaries, which silently changes what a loglikelihood score means.
+    pub prompt_ids: Option<Vec<u32>>,
     /// Preprocessed images, in the order their markers appear in the prompt.
     /// Each `<|image_pad|>` token in the prompt consumes the next entry.
     pub images: Vec<PreparedImage>,
@@ -133,6 +137,11 @@ pub struct GenRequest {
     /// sequence that ends the block, provided by the caller who has the tokenizer.
     pub think_budget: usize,
     pub think_close: Vec<u32>,
+    /// OpenAI `echo` + `logprobs`: score the prompt itself and return a
+    /// logprob per token, plus this many alternatives per position. This is
+    /// what loglikelihood benchmarks (MMLU, HellaSwag, ARC) run on — they
+    /// never generate. Scoring runs instead of generation, not before it.
+    pub echo_logprobs: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -140,8 +149,23 @@ pub enum Event {
     /// prompt token count, once, before any text
     Prefilled { n_prompt: usize },
     Token(String),
+    /// the scored prompt, when `echo_logprobs` was set
+    Scored(Scored),
     Done(Finish),
     Failed(String),
+}
+
+/// Per-token scores for an echoed prompt, in OpenAI's `logprobs` shape. The
+/// first token has no score — nothing precedes it to predict it.
+#[derive(Debug, Default)]
+pub struct Scored {
+    /// the echoed prompt, decoded as a whole so it is byte-exact
+    pub text: String,
+    pub tokens: Vec<String>,
+    pub logprobs: Vec<Option<f32>>,
+    pub top: Vec<Option<Vec<(String, f32)>>>,
+    /// byte offset of each token in the echoed text
+    pub text_offset: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -480,6 +504,7 @@ fn worker(
         }
     }
     eprintln!("serve: {} session slot(s)", pool.len());
+    report_vram("after weights, sessions, drafter, vision");
     let mut dcaches: Vec<Option<DflashCache>> = (0..pool.len())
         .map(|_| match &dflash {
             Some(d) => d.new_cache().ok(),
@@ -516,7 +541,10 @@ fn worker(
         if !pending.is_empty() && batch_slots > 1 && job.req.images.is_empty() {
             if bsession.is_none() {
                 match Session::new_spec(&model, batch_slots * batch_seq_ctx, batch_slots - 1) {
-                    Ok(s) => bsession = Some(s),
+                    Ok(s) => {
+                        bsession = Some(s);
+                        report_vram("after batch session");
+                    }
                     Err(e) => {
                         eprintln!("serve: batch session unavailable ({e}); serving serially");
                     }
@@ -536,7 +564,10 @@ fn worker(
         // Longest full-prefix match wins the slot; with no match, evict the least
         // recently used conversation.
         let prompt_ids = {
-            let raw = tok.encode(&job.req.prompt, true);
+            let raw = match &job.req.prompt_ids {
+                Some(ids) => ids.clone(),
+                None => tok.encode(&job.req.prompt, true),
+            };
             match (&vision, job.req.images.is_empty()) {
                 (Some(v), false) => {
                     expand_prompt(&raw, v.pad_id, v.align, &job.req.images)
@@ -585,6 +616,43 @@ fn worker(
             });
         let (session, history, used) = &mut pool[slot];
         *used = clock;
+        // Scoring replaces generation rather than preceding it: it needs
+        // logits at every position, so it runs from a reset state.
+        if let Some(top_k) = job.req.echo_logprobs {
+            let t0 = std::time::Instant::now();
+            let n = prompt_ids.len();
+            let outcome = if n == 0 {
+                Err("cannot score an empty prompt".to_string())
+            } else if n > cfg.n_ctx {
+                Err(format!("prompt of {n} tokens exceeds the {} token context", cfg.n_ctx))
+            } else {
+                run_score(&model, &tok, &cfg, session, history, &prompt_ids, top_k)
+            };
+            stats.processing.fetch_sub(1, Ordering::Relaxed);
+            stats.served.fetch_add(1, Ordering::Relaxed);
+            match outcome {
+                Ok(s) => {
+                    let _ = out.send(Event::Scored(s));
+                    let _ = out.send(Event::Done(Finish {
+                        reason: "length",
+                        n_prompt: n,
+                        n_generated: 0,
+                        prefill_s: t0.elapsed().as_secs_f64(),
+                        decode_s: 0.0,
+                        acceptance: None,
+                        draft_n: 0,
+                        draft_n_accepted: 0,
+                        n_draft_calls: 0,
+                    }));
+                }
+                Err(e) => {
+                    // the session state is now unknown to the history bookkeeping
+                    history.clear();
+                    let _ = out.send(Event::Failed(e));
+                }
+            }
+            continue 'serve;
+        }
         let dcache = &mut dcaches[slot];
         let outcome = run_job(
             &model, &tok, &cfg, vision.as_ref(), dflash.as_ref(), dcache, session, history,
@@ -931,6 +999,126 @@ fn run_batch(
     }
 }
 
+/// Score a prompt: the logprob the model assigns to each of its own tokens.
+///
+/// Position j's logits predict token j+1, so a chunk's last row scores the
+/// first token of the next chunk — `carry` is that row. Chunks stay small
+/// because each scored position reads back a full vocabulary of logits
+/// (~608 KiB), and a 2K prompt scored in one shot would move 1.2 GiB.
+fn run_score(
+    model: &Qwen35,
+    tok: &codpiece_tok::Tokenizer,
+    cfg: &EngineConfig,
+    session: &mut Session,
+    history: &mut Vec<u32>,
+    ids: &[u32],
+    top_k: usize,
+) -> Result<Scored, String> {
+    const SCORE_CHUNK: usize = 64;
+    let n_vocab = model.hp.n_vocab as usize;
+    let mut out = Scored::default();
+    // Offsets come from each token's raw bytes, not from decoding it alone:
+    // byte-level BPE splits multi-byte characters across tokens, so a
+    // per-token decode can yield replacement characters and offsets that no
+    // longer index the echoed text.
+    let mut bytes = Vec::new();
+    for &id in ids {
+        let start = bytes.len();
+        tok.token_bytes_into(id, true, &mut bytes);
+        out.text_offset.push(start);
+        out.tokens.push(String::from_utf8_lossy(&bytes[start..]).into_owned());
+    }
+    out.text = String::from_utf8_lossy(&bytes).into_owned();
+    out.logprobs.push(None);
+    out.top.push(None);
+
+    // Scoring needs logits at every position, which the reuse path does not
+    // keep, so this always starts from a clean state.
+    session.reset();
+    history.clear();
+
+    let mut carry: Option<Vec<f32>> = None;
+    let mut base = 0usize;
+    for chunk in ids.chunks(SCORE_CHUNK) {
+        let positions: Vec<i32> = (0..chunk.len() as i32).collect();
+        let logits = model
+            .step(session, chunk, &positions, cfg.threads)
+            .map_err(|e| format!("score: {e}"))?;
+        let mut push = |row: &[f32], target: u32| {
+            let (lp, top) = score_row(row, target, top_k, tok);
+            out.logprobs.push(Some(lp));
+            out.top.push(top);
+        };
+        // the previous chunk's last row predicted this chunk's first token
+        if let Some(prev) = carry.take() {
+            push(&prev, ids[base]);
+        }
+        // row j predicts token base + j + 1; the last row reaches past this
+        // chunk and becomes the next carry
+        for j in 0..chunk.len().saturating_sub(1) {
+            push(&logits[j * n_vocab..(j + 1) * n_vocab], ids[base + j + 1]);
+        }
+        if base + chunk.len() < ids.len() {
+            carry = Some(logits[(chunk.len() - 1) * n_vocab..chunk.len() * n_vocab].to_vec());
+        }
+        base += chunk.len();
+    }
+    history.extend_from_slice(ids);
+    Ok(out)
+}
+
+/// Log partition function of one logit row, in f64 with the max subtracted —
+/// the same shape the perplexity path uses, so scores agree between them.
+fn log_z(row: &[f32]) -> f64 {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f64 = row.iter().map(|&x| ((x - max) as f64).exp()).sum();
+    max as f64 + sum.ln()
+}
+
+/// Indices of the `k` largest logits, largest first.
+fn top_indices(row: &[f32], k: usize) -> Vec<u32> {
+    let k = k.min(row.len());
+    let mut idx: Vec<u32> = (0..row.len() as u32).collect();
+    if k < row.len() {
+        idx.select_nth_unstable_by(k - 1, |&a, &b| row[b as usize].total_cmp(&row[a as usize]));
+        idx.truncate(k);
+    }
+    idx.sort_unstable_by(|&a, &b| row[b as usize].total_cmp(&row[a as usize]));
+    idx
+}
+
+/// The target's logprob, and the top alternatives when asked for.
+fn score_row(
+    row: &[f32],
+    target: u32,
+    top_k: usize,
+    tok: &codpiece_tok::Tokenizer,
+) -> (f32, Option<Vec<(String, f32)>>) {
+    let ln_z = log_z(row);
+    let lp = |x: f32| (x as f64 - ln_z) as f32;
+    let top = (top_k > 0).then(|| {
+        top_indices(row, top_k)
+            .into_iter()
+            .map(|i| (tok.decode(&[i], true), lp(row[i as usize])))
+            .collect()
+    });
+    (lp(row[target as usize]), top)
+}
+
+/// One line per GPU, so a failed context bump is diagnosable from the log
+/// rather than from a second run with nvidia-smi alongside it.
+fn report_vram(when: &str) {
+    let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    for (name, used, total) in codpiece_model::device_memory() {
+        eprintln!(
+            "serve: vram {name} {:.2}/{:.2} GiB used, {:.2} GiB free ({when})",
+            gib(used),
+            gib(total),
+            gib(total.saturating_sub(used)),
+        );
+    }
+}
+
 fn finish_slot(slot: &mut Option<BatchReq>, stats: &Stats, f: Option<Finish>) {
     if let Some(r) = slot.take() {
         stats.processing.fetch_sub(1, Ordering::Relaxed);
@@ -958,7 +1146,10 @@ fn run_job(
 ) -> Result<Option<Finish>, String> {
     let Job { req, out } = job;
 
-    let raw_ids = tok.encode(&req.prompt, true);
+    let raw_ids = match &req.prompt_ids {
+        Some(ids) => ids.clone(),
+        None => tok.encode(&req.prompt, true),
+    };
     let (prompt_ids, segs) = match vision {
         Some(v) if !req.images.is_empty() => {
             expand_prompt(&raw_ids, v.pad_id, v.align, &req.images)
@@ -1726,4 +1917,40 @@ fn run_job(
         draft_n_accepted: accepted,
         n_draft_calls: rounds,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Logprobs must be a proper log-distribution: exponentials sum to 1.
+    #[test]
+    fn log_softmax_normalizes() {
+        let row = [0.5f32, -1.0, 3.25, 2.0, -7.5];
+        let ln_z = log_z(&row);
+        let total: f64 = row.iter().map(|&x| (x as f64 - ln_z).exp()).sum();
+        assert!((total - 1.0).abs() < 1e-9, "sums to {total}");
+        // and every score is negative, as a probability's log must be
+        assert!(row.iter().all(|&x| (x as f64 - ln_z) < 0.0));
+    }
+
+    /// A large shared offset must not change the result — that is the point of
+    /// subtracting the max, and without it exp() overflows to infinity.
+    #[test]
+    fn log_softmax_is_shift_invariant_and_overflow_safe() {
+        let row = [1.0f32, 2.0, 3.0];
+        let hot: Vec<f32> = row.iter().map(|x| x + 90.0).collect();
+        let a = row[2] as f64 - log_z(&row);
+        let b = hot[2] as f64 - log_z(&hot);
+        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        assert!(b.is_finite());
+    }
+
+    #[test]
+    fn top_indices_are_ordered_by_logit() {
+        let row = [0.1f32, 5.0, -2.0, 4.0, 4.5];
+        assert_eq!(top_indices(&row, 3), vec![1, 4, 3]);
+        // asking for more than exists returns everything, still ordered
+        assert_eq!(top_indices(&row, 99), vec![1, 4, 3, 0, 2]);
+    }
 }
