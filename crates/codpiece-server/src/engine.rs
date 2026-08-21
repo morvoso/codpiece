@@ -562,7 +562,38 @@ fn worker(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4096);
     let mut scratch_idx: Option<usize> = None;
-    if scratch_ctx > 0 && fits_in_vram(&model, scratch_ctx, 1, "scratch session") {
+    // The scratch is gated on an ABSOLUTE reserve, not the percentage margin
+    // fits_in_vram uses. Measured at ctx 98304: the box settles at ~0.22 GiB
+    // free under sustained long-context load, so "fits at startup" is not
+    // "fits at the high-water mark" — the first deployment of this feature
+    // passed the startup check and then aborted the process inside CUDA
+    // graph capture during a 33K-token prefill. 600 MiB is the observed
+    // working-set swing plus headroom; below it the scratch declines loudly
+    // and eviction behavior stays as it was.
+    let scratch_ok = scratch_ctx > 0 && {
+        let devs = codpiece_model::device_memory();
+        let free = devs
+            .iter()
+            .map(|(_, used, total)| total.saturating_sub(*used))
+            .min()
+            .unwrap_or(0);
+        let need = codpiece_model::qwen35::session_bytes(&model, scratch_ctx, 1)
+            / devs.len().max(1);
+        const RESERVE: usize = 600 * 1024 * 1024;
+        if free >= need + RESERVE {
+            true
+        } else {
+            eprintln!(
+                "serve: scratch session declined: needs {} MiB plus a {} MiB \
+                 working reserve, {} MiB free (lower CODPIECE_CTX to fund it)",
+                need / (1024 * 1024),
+                RESERVE / (1024 * 1024),
+                free / (1024 * 1024),
+            );
+            false
+        }
+    };
+    if scratch_ok {
         match Session::new_spec(&model, scratch_ctx, 1) {
             Ok(s) => {
                 pool.push((s, Vec::new(), 0));
