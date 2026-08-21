@@ -452,11 +452,16 @@ coding session is one long conversation, not thirty short ones.
       design, so the image cap now reserves what the batch session will take
       (and reserves nothing when it provably cannot fit).
 
-      The context is not free: decode costs ~13% against the 16K scoreboard
-      — prose 61.7 vs 71.2, code 70.4 vs 82.2, arithmetic 101.0 vs 117.4 —
-      and the VRAM-derived prefill chunk costs ~20% on long prompts
-      (849 vs ~1050 tok/s at 88K). Both are worth paying for coding work,
-      and both are recorded rather than smoothed over.
+      **Configured context is nearly free; occupied context is what costs.**
+      On the live server at 98304 with short prompts: prose 69.9, code 79.2,
+      arithmetic 113.7 — within 2-4% of the 16K scoreboard (71.2 / 82.2 /
+      117.4). The ~13% seen in the bench window (61.7 / 70.4 / 101.0) was
+      measured after four ~90K-token requests had filled the cache, so it is
+      the price of attending over a long conversation, not of allowing one.
+      Raising the ceiling costs almost nothing until you use it.
+
+      The real cost is prefill on long prompts: the VRAM-derived chunk gives
+      849 tok/s at 88K against ~1050 before, ~20% (#20 aims to recover it).
 
 **Gate:** met. Remaining: prefill chunk tuning (#20) to recover part of
 that 20%.

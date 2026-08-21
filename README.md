@@ -145,8 +145,18 @@ sampling field — including `"temperature": 0` — and your choice stands.
 | `CODPIECE_MMPROJ` | unset | vision tower path (alternative to `--mmproj`) |
 | `--dflash PATH` / `CODPIECE_DFLASH` | unset | DFlash2 block drafter: +22-37% greedy decode (needs ~1.9 GB VRAM for the Q8 draft) |
 | `CODPIECE_IMAGE_MIN_TOKENS` | 1024 | image detail floor; Qwen-VL reads text poorly below this |
+| `CODPIECE_IMAGE_MAX_TOKENS` | from free VRAM | image detail ceiling; see below |
 | `CODPIECE_GRAPH_CACHE_MIB` | 1024 | VRAM the per-session cache of compiled graph shapes may hold |
 | `CODPIECE_BATCH_GREEDY` | on | all-greedy batch rounds argmax in the graph instead of reading back full logits |
+
+The image ceiling is derived from measured headroom rather than fixed,
+because the vision tower runs on its own backend with its own CUDA pool —
+and a pool never returns memory to the driver, so whatever the encoder
+peaks at is taken from the trunk for the life of the process. One
+oversized image can leave a card with nothing left and every later request
+failing to allocate. The server prints the range it chose (`serve: image
+tokens 1024..1024`) and says so when the ceiling lands below Qwen-VL's
+1024-token grounding floor.
 
 Diagnostics, all off by default: `CODPIECE_BATCH_TRACE=1` (per-round
 fill/compute/readback at width N), `CODPIECE_DECODE_TRACE=1` (single-stream
