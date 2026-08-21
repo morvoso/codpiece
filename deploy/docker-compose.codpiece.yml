@@ -51,6 +51,10 @@ services:
       # (~0.9 GiB weights + compute buffer on CODPIECE_MMPROJ_GPU).
       CODPIECE_MMPROJ: ${CODPIECE_MMPROJ:-}
       CODPIECE_MMPROJ_GPU: ${CODPIECE_MMPROJ_GPU:-0}
+      # DFlash2 block drafter: +22-37% greedy decode. The Q4_K_M draft
+      # measures the same acceptance as Q8 at half the VRAM (drafts are
+      # verified, so draft quant cannot affect output).
+      CODPIECE_DFLASH: ${CODPIECE_DFLASH:-}
     entrypoint: /src/target/release/codpiece
     command: >-
       serve /models/qwen38/${MODEL_FILE:-Qwen3.8-27B-UD-Q8_K_XL.gguf}
