@@ -495,7 +495,15 @@ fn worker(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4)
         .max(1);
-    let batch_seq_ctx = cfg.n_ctx.min(8192);
+    // Per-slot KV region. 8192 suits long jobs; concurrent short-request
+    // fleets (the vLLM-style workload) fit far more slots at 2-4K, and slots
+    // are what aggregate throughput scales with while rounds stay
+    // memory-bound (measured 16.5 -> 16.3 tok/s/seq from 8-way to 12-way).
+    let batch_seq_ctx = std::env::var("CODPIECE_BATCH_CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8192)
+        .min(cfg.n_ctx);
     let mut bsession: Option<Session> = None;
     let mut pending: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     'serve: while let Ok(job) = pending.pop_front().map(Ok).unwrap_or_else(|| rx.recv()) {
