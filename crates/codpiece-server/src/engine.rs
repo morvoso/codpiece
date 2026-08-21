@@ -911,25 +911,12 @@ fn run_batch(
                 // just because something else happened to be running would
                 // make large requests fail intermittently. Both stay queued
                 // for the serve loop to pick up once this batch drains.
-                let mut found = None;
-                for i in 0..pending.len() {
-                    if !pending[i].req.images.is_empty() {
-                        continue;
-                    }
-                    // Tokenize once per job, not once per scan: this loop runs
-                    // for every free slot on every round, and a long prompt
-                    // costs real milliseconds to encode.
-                    let j = &mut pending[i];
-                    let n = j
-                        .req
-                        .prompt_ids
-                        .get_or_insert_with(|| tok.encode(&j.req.prompt, true))
-                        .len();
-                    if n > 0 && n + j.req.max_tokens <= seq_ctx {
-                        found = Some(i);
-                        break;
-                    }
-                }
+                // Tokenize once per job, not once per scan: this runs for
+                // every free slot on every round, and a long prompt costs
+                // real milliseconds to encode.
+                let found = pending.iter_mut().position(|j| {
+                    j.req.images.is_empty() && fits_a_slot(tok, &mut j.req, seq_ctx)
+                });
                 if let Some(at) = found {
                     let j = pending.remove(at).unwrap();
                     admit(slot, j, &mut slots, bsession, stats);

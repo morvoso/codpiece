@@ -167,6 +167,12 @@ pub struct ToolStream {
     call_text: String,
 }
 
+impl Default for ToolStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolStream {
     pub fn new() -> Self {
         Self { in_call: false, held: String::new(), call_text: String::new() }
