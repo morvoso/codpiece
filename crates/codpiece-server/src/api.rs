@@ -361,7 +361,21 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
             };
             let (prompt, prompt_ids) = match body.prompt {
                 PromptField::Text(s) => (s, None),
-                PromptField::Tokens(ids) => (ctx.tokenizer.decode(&ids, true), Some(ids)),
+                PromptField::Tokens(ids) => {
+                    // These are used unvalidated all the way down: scoring
+                    // indexes a logits row by token id, and the model gathers
+                    // embedding rows by it. An id past the vocabulary is a
+                    // crash, not a bad answer, so it is refused here.
+                    let n_vocab = ctx.tokenizer.n_vocab();
+                    if let Some(bad) = ids.iter().find(|&&t| t as usize >= n_vocab) {
+                        return write_error(
+                            w,
+                            400,
+                            &format!("token id {bad} is outside the {n_vocab}-token vocabulary"),
+                        );
+                    }
+                    (ctx.tokenizer.decode(&ids, true), Some(ids))
+                }
             };
             // Scoring needs both flags: `echo` alone just repeats the prompt.
             let echo = body.echo.unwrap_or(false);

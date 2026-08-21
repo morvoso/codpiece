@@ -118,6 +118,12 @@ curl http://localhost:8020/v1/completions -H 'Content-Type: application/json' \
        "max_tokens": 0, "echo": true, "logprobs": 3}'
 ```
 
+Scoring replaces generation rather than preceding it: a request with both
+`echo` and `logprobs` returns the scored prompt and generates nothing,
+whatever `max_tokens` says. That matches what loglikelihood harnesses
+actually want — they read the prompt's scores and discard the completion —
+and it avoids paying for tokens no one reads.
+
 Endpoints: `/v1/completions`, `/v1/chat/completions` (both stream with
 `"stream": true`), `/tokenize`, `/detokenize`, `/v1/models`, `/health`,
 `/slots`. Responses include a `timings` object with prefill/decode speed and
