@@ -272,6 +272,29 @@ mod tests {
         assert!(calls.is_empty());
     }
 
+    /// Zero-argument tools are common (get_current_time, list_files) and the
+    /// template emits no <parameter> block at all for them.
+    #[test]
+    fn a_call_with_no_parameters_yields_an_empty_object() {
+        let text = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
+        let (_, calls) = parse(text, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_time");
+        assert_eq!(calls[0].arguments, json!({}));
+        // and it survives the wire shape as "{}" rather than null
+        assert_eq!(to_openai(&calls, "x")[0]["function"]["arguments"], json!("{}"));
+    }
+
+    /// A malformed call must not take a well-formed one down with it.
+    #[test]
+    fn a_nameless_call_is_skipped_and_the_next_still_parses() {
+        let text = "<tool_call>\n<function=>\n</function>\n</tool_call>\n\
+                    <tool_call>\n<function=b>\n<parameter=y>\n2\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse(text, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "b");
+    }
+
     #[test]
     fn plain_prose_is_left_alone() {
         let (content, calls) = parse("no calls here", Some(&tools()));

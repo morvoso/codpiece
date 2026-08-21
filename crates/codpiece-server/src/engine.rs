@@ -1150,6 +1150,8 @@ fn run_score(
 fn decode_trace(
     verify: f64,
     draft: std::time::Duration,
+    inject: std::time::Duration,
+    block: std::time::Duration,
     committed: usize,
     proposed: usize,
 ) {
@@ -1161,22 +1163,30 @@ fn decode_trace(
     }
     static VERIFY: AtomicU64 = AtomicU64::new(0);
     static DRAFT: AtomicU64 = AtomicU64::new(0);
+    static INJECT: AtomicU64 = AtomicU64::new(0);
+    static BLOCK: AtomicU64 = AtomicU64::new(0);
     static TOK: AtomicU64 = AtomicU64::new(0);
     static PROP: AtomicU64 = AtomicU64::new(0);
     static N: AtomicU64 = AtomicU64::new(0);
     VERIFY.fetch_add((verify * 1e6) as u64, Relaxed);
     DRAFT.fetch_add(draft.as_micros() as u64, Relaxed);
+    INJECT.fetch_add(inject.as_micros() as u64, Relaxed);
+    BLOCK.fetch_add(block.as_micros() as u64, Relaxed);
     TOK.fetch_add(committed as u64, Relaxed);
     PROP.fetch_add(proposed as u64, Relaxed);
     let n = N.fetch_add(1, Relaxed) + 1;
     if n % 64 == 0 {
         let (v, d) = (VERIFY.swap(0, Relaxed), DRAFT.swap(0, Relaxed));
+        let (i, b) = (INJECT.swap(0, Relaxed), BLOCK.swap(0, Relaxed));
         let (t, p) = (TOK.swap(0, Relaxed), PROP.swap(0, Relaxed));
         eprintln!(
-            "[decode-trace] 64 rounds: verify {:.2}ms  draft {:.2}ms  {:.2} tok/round \
-             ({p} proposed, {t} committed) => {:.1} tok/s",
+            "[decode-trace] 64 rounds: verify {:.2}ms  draft {:.2}ms (inject {:.2} + block \
+             {:.2} + host {:.2})  {:.2} tok/round ({p} proposed, {t} committed) => {:.1} tok/s",
             v as f64 / 64_000.0,
             d as f64 / 64_000.0,
+            i as f64 / 64_000.0,
+            b as f64 / 64_000.0,
+            d.saturating_sub(i + b) as f64 / 64_000.0,
             t as f64 / 64.0,
             t as f64 * 1e6 / (v + d) as f64,
         );
@@ -1998,11 +2008,14 @@ fn run_job(
         // exactly the tokens that stayed in the caches this round
         history.extend_from_slice(&batch[..n_keep + 1]);
 
+        let mut t_inject = std::time::Duration::ZERO;
+        let mut t_block = std::time::Duration::ZERO;
         let t_draft = std::time::Instant::now();
         if df_mode && !forcing {
             let (dm, c) = (dflash.unwrap(), dcache.as_mut().unwrap());
             let committed = n_keep + 1;
             let n_feat = dm.hp.n_feat() as usize;
+            let t_i = std::time::Instant::now();
             dm.inject(
                 c,
                 &session.last_taps[..committed * n_feat],
@@ -2010,9 +2023,12 @@ fn run_job(
                 cfg.threads,
             )
             .map_err(|e| format!("dflash inject: {e}"))?;
+            t_inject = t_i.elapsed();
+            let t_b = std::time::Instant::now();
             let lat = dm
                 .draft_block(c, next, session.n_past, cfg.threads)
                 .map_err(|e| format!("dflash draft: {e}"))?;
+            t_block = t_b.elapsed();
             // ALWAYS the greedy walk, even at temperature: coupled
             // verification accepts draft x with probability p_trunk(x), so
             // the optimal draft is the mode — a temperature walk only
@@ -2023,7 +2039,14 @@ fn run_job(
                 drafts.clear();
             }
         }
-        decode_trace(round_secs, t_draft.elapsed(), n_keep + 1, round_drafts.len());
+        decode_trace(
+            round_secs,
+            t_draft.elapsed(),
+            t_inject,
+            t_block,
+            n_keep + 1,
+            round_drafts.len(),
+        );
 
         // Post-commit re-draft: when the sampled token diverged from the argmax the
         // in-graph chain assumed, the chain's drafts were dropped — and without this,
