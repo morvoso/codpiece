@@ -18,6 +18,13 @@
 //! unless every one of its bytes is legal — so a constrained generation
 //! cannot emit invalid JSON.
 
+/// JSON's whitespace is exactly space, tab, newline and carriage return
+/// (RFC 8259 §2). Rust's `is_ascii_whitespace` also admits form feed, which
+/// a constrained run promptly emitted and no parser accepts.
+fn ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
 /// Where a number is, byte by byte. Split out because JSON's number grammar
 /// is the part with the most ways to be subtly wrong.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -164,7 +171,7 @@ impl Json {
                     self.pos = Pos::Str { esc: false, u: 0, key: true };
                     true
                 }
-                _ => b.is_ascii_whitespace(),
+                _ => ws(b),
             },
 
             Pos::Colon => {
@@ -172,7 +179,7 @@ impl Json {
                     self.pos = Pos::Value;
                     true
                 } else {
-                    b.is_ascii_whitespace()
+                    ws(b)
                 }
             }
 
@@ -192,10 +199,10 @@ impl Json {
                 },
                 b'}' => self.close(Nest::Object),
                 b']' => self.close(Nest::Array),
-                _ => b.is_ascii_whitespace(),
+                _ => ws(b),
             },
 
-            Pos::Done => b.is_ascii_whitespace(),
+            Pos::Done => ws(b),
         }
     }
 
@@ -277,7 +284,7 @@ impl Json {
                 self.pos = Pos::Lit { word: b"null", n: 1 };
                 true
             }
-            _ => b.is_ascii_whitespace(),
+            _ => ws(b),
         }
     }
 
@@ -295,7 +302,7 @@ impl Json {
     /// a complete document but more digits may still arrive, so generation
     /// must not be cut short there.
     pub fn finished(&self) -> bool {
-        matches!(self.pos, Pos::Done)
+        matches!(self.pos, Pos::Done) || (matches!(self.pos, Pos::After) && self.nest.is_empty())
     }
 
     /// Feed a whole token. Returns the resulting state, or None if any byte
@@ -320,6 +327,30 @@ mod tests {
     }
 
     /// Anything serde_json accepts, this must accept and call complete.
+    /// Form feed is whitespace to Rust and not to JSON. A constrained run
+    /// emitted runs of it, and every parser rejected the result.
+    #[test]
+    fn form_feed_is_not_json_whitespace() {
+        assert!(Json::new().accept(b"{} ").is_some());
+        assert!(Json::new().accept(b"{}\t").is_some());
+        assert!(Json::new().accept(b"{}\x0c").is_none());
+        assert!(Json::new().accept(b"\x0c{}").is_none());
+    }
+
+    /// Generation must stop when the root value closes, including a bare
+    /// number, or the model is forced to emit whitespace until max_tokens.
+    #[test]
+    fn finished_covers_a_root_number() {
+        assert!(Json::new().accept(b"{}").unwrap().finished());
+        assert!(Json::new().accept(b"[1]").unwrap().finished());
+        assert!(Json::new().accept(b"\"hi\"").unwrap().finished());
+        assert!(Json::new().accept(b"true").unwrap().finished());
+        // still mid-number: more digits may follow, so not finished
+        assert!(!Json::new().accept(b"12").unwrap().finished());
+        // the space ended it
+        assert!(Json::new().accept(b"12 ").unwrap().finished());
+    }
+
     #[test]
     fn accepts_valid_documents() {
         for doc in [

@@ -2260,6 +2260,9 @@ fn run_job(
                     }
                     next = chosen;
                     *st = advanced;
+                    // the match arms above may have re-armed the depth picker;
+                    // a constrained round drafts nothing
+                    round_depth = 0;
                     // A closed object, array, string or literal at the root is
                     // the whole answer; continuing could only append
                     // whitespace, so the request is done.
@@ -2279,7 +2282,11 @@ fn run_job(
             }
         }
         sampler.accept(next);
-        drafts = if forcing {
+        drafts = if forcing || req.json_mode {
+            // A constrained request must not speculate. Accepted drafts are
+            // committed straight to the output without passing through the
+            // automaton, so any draft that slipped through would be an
+            // unconstrained token in a response promised to be valid JSON.
             Vec::new()
         } else {
             // Carry a link only while the draft head believed in it: production's
@@ -2367,7 +2374,13 @@ fn run_job(
         // from the token actually committed keeps speculation alive on sampled
         // requests; it is exactly what the standalone spec path always did, priced at
         // one draft-head pass (~6 ms) per chain link, and only on divergent rounds.
-        if !greedy && drafts.is_empty() && !forcing && redraft_depth > 0 && !df_mode {
+        if !greedy
+            && drafts.is_empty()
+            && !forcing
+            && redraft_depth > 0
+            && !df_mode
+            && !req.json_mode
+        {
             let base = n_keep * n_embd;
             let mut h = hidden[base..base + n_embd].to_vec();
             let mut tok_in = next;
