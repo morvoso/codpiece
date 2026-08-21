@@ -4,19 +4,29 @@
 # plane + vendored ggml b10423). This compose runs the release binary that
 # already lives inside the codpiece-builder image's bind mount.
 #
-# Priority order (owner, standing 2026-08-20): ACCURACY > SPEED > CONTEXT.
+# Priority order (owner, standing 2026-08-21): ACCURACY > CONTEXT ~ SPEED.
+# Context was promoted for coding work: a coding session is one long
+# conversation, not thirty short ones.
 #
-# WHAT THIS ENGINE DOES AND DOES NOT DO vs the llama.cpp default:
-#   + faster on text/code (greedy code ~68 vs 53 tok/s; short-prompt decode +38%)
+# WHAT THIS ENGINE DOES vs the llama.cpp default:
+#   + faster on text/code (greedy code ~82 vs 53 tok/s; arithmetic ~117)
 #   + warm multi-turn: turn 2 of a 32K conversation ~0.9s (prefix reuse + pool)
-#   + continuous batching: ~153 tok/s aggregate at 8-way concurrency
+#   + continuous batching: ~286 tok/s aggregate at 32-way concurrency
 #   + speculation at temperature, distribution-preserving (verified on the 27B)
-#   - NO VISION yet. An image request will not work. switch.sh llamacpp
-#     restores vision; that is why this engine is on-demand.
+#   + vision, tool calling, and echo+logprobs for evaluation harnesses
 #   All tunables are CODPIECE_-prefixed so llama.cpp's shared .env (CTX_SIZE=196608
 #   etc.) cannot bleed into this engine's config.
-#   - context 65536 here; raise CODPIECE_CTX for more, but speculation stops
-#     fitting past ~145K and decode falls toward 28 tok/s.
+#
+# ON CONTEXT — this is a memory decision, measured, with the full stack
+# resident (Q8 weights + DFlash drafter + vision tower), one session:
+#   98304  fits, 2.00/1.15 GiB free after warmup  <- shipped
+#   114688 borderline: peak 24.09 of 24.58 GiB on card 1
+#   131072 500s on the first request; fits only with vision off
+# Retrieval is verified at the shipping context, not merely allocation of it:
+# needles found at 97,298 tokens across depths. KV stays f16 — quantizing it
+# would buy context at the cost of accuracy, which is the wrong trade here.
+# The server reports per-GPU VRAM and its prefill chunk at startup; raise
+# CODPIECE_CTX only alongside those numbers.
 #
 # Rollback is always: ./switch.sh llamacpp  (byte-exact, this file never edited)
 
@@ -55,6 +65,11 @@ services:
       # measures the same acceptance as Q8 at half the VRAM (drafts are
       # verified, so draft quant cannot affect output).
       CODPIECE_DFLASH: ${CODPIECE_DFLASH:-}
+      # VRAM the per-session cache of compiled graph shapes may hold. Unset
+      # means "40% of what the tightest card has free at startup", which is
+      # what keeps a long-context server from accumulating shapes until an
+      # allocation fails. Only set this to override that.
+      CODPIECE_GRAPH_CACHE_MIB: ${CODPIECE_GRAPH_CACHE_MIB:-}
     entrypoint: /src/target/release/codpiece
     command: >-
       serve /models/qwen38/${MODEL_FILE:-Qwen3.8-27B-UD-Q8_K_XL.gguf}

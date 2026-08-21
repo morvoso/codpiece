@@ -183,8 +183,9 @@ windows. llama.cpp is b10423 in its production configuration.
 | sampled (temp 1.0), short | **51.2** | 32.4 | — |
 | sampled, 32K context | **53.7** | 52.7 | — |
 | prefill, 32K prompt | 1,337 | 1,353 | — |
-| aggregate throughput (32 streams) | **268.5** | ~101 (8-way) | 251–260 |
+| aggregate throughput (32 streams) | **285.7** | ~101 (8-way) | 251–260 |
 | return to a 32K conversation | **0.9 s** | 1.3 s | — |
+| needle retrieval at 97K tokens | **9/9 across depths** | — | — |
 | speculation acceptance | 0.64–0.73 (0.91–0.93 opt-in) | ~0.78 | — |
 | vision (same page, same question) | same answer, 847 tok/s prefill | same, 837 | n/a |
 | greedy output parity | byte-identical | reference | not comparable (FP8) |
@@ -198,13 +199,20 @@ there.
 
 Honest caveats: sampled decode at 32K now runs 53.7 vs llama.cpp's 52.7
 (gumbel-coupled chains closed its last speed win); its one remaining edge
-is 196K context, where codpiece's speculation stops near 145K. Its higher
-acceptance ratio is denominator filtering (`--spec-draft-p-min 0.75`
-declines low-confidence drafts), not better text. The aggregate row uses
-32 batch slots (`CODPIECE_BATCH=32 CODPIECE_BATCH_CTX=1536`) — batch
-rounds stay memory-bound to large widths, so slots are cheap; vLLM needs
-FP8 weight precision for its 251-260, which codpiece passes at Q8 with
-the sensitive tensors in BF16.
+is context reach — llama.cpp will serve 196K by quantizing KV to fp8,
+which is an accuracy trade this engine declines, so codpiece ships 98K
+with f16 KV and the full stack resident. Its higher acceptance ratio is
+denominator filtering (`--spec-draft-p-min 0.75` declines low-confidence
+drafts), not better text. The aggregate row uses 32 batch slots
+(`CODPIECE_BATCH=32 CODPIECE_BATCH_CTX=1536`); vLLM needs FP8 weight
+precision for its 251-260, which codpiece passes at Q8 with the
+sensitive tensors in BF16.
+
+At 32-way the round is compute bound — 64.3 ms against a 15.6 ms
+weight-read floor — so wider batching is near its knee on this hardware,
+and speculation (which pays only while a round is memory bound) does not
+help there. The remaining aggregate headroom is quantized-matmul kernel
+efficiency, not scheduling: per-round host work measures 0.02 ms.
 
 ## Technical details
 

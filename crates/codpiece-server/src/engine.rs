@@ -41,6 +41,13 @@ static FREE_GIB: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 /// GiB) — at 98K context that estimate claimed 4 GiB free where the driver
 /// reported 1.15, and picked the largest chunk on the strength of it.
 pub fn prefill_chunk_for(n_ctx: usize) -> usize {
+    if let Some(n) = std::env::var("CODPIECE_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        return n;
+    }
     let free = FREE_GIB.get().copied().unwrap_or_else(|| {
         const WEIGHTS_GIB: f64 = 16.46; // per card, incl. mirrored head and embeddings
         const CARD_GIB: f64 = 23.5;
