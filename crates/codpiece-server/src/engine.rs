@@ -190,6 +190,12 @@ pub struct GenRequest {
     /// what loglikelihood benchmarks (MMLU, HellaSwag, ARC) run on — they
     /// never generate. Scoring runs instead of generation, not before it.
     pub echo_logprobs: Option<usize>,
+    /// OpenAI `response_format: {"type": "json_object"}`: every token is
+    /// checked against a JSON automaton before it is committed, so the
+    /// response cannot be unparseable. Speculation is disabled for these
+    /// requests — drafts come from the unconstrained distribution and would
+    /// almost all be rejected, so drafting them is wasted work.
+    pub json_mode: bool,
 }
 
 #[derive(Debug)]
@@ -1290,6 +1296,75 @@ fn decode_trace(
     }
 }
 
+/// Choose the highest-scoring token that keeps the document valid JSON.
+///
+/// Rather than masking all 151,936 logits, this walks the candidates in
+/// descending order and takes the first the automaton accepts — the result
+/// is the same token masking would have produced, for a fraction of the
+/// work, because the mask is only evaluated where the probability is. The
+/// widening fallback keeps that equivalence exact when the top candidates
+/// are all illegal.
+///
+/// For sampled requests the accepted candidates are renormalized among
+/// themselves and drawn from, which is what constraining a distribution
+/// means: the invalid mass is removed and the rest keeps its shape.
+fn pick_json(
+    row: &[f32],
+    st: &crate::json::Json,
+    tok: &codpiece_tok::Tokenizer,
+    sampler: &mut Sampler,
+    greedy: bool,
+    eos: Option<u32>,
+) -> Option<(u32, crate::json::Json)> {
+    let mut bytes = Vec::new();
+    let mut ok: Vec<(u32, crate::json::Json)> = Vec::new();
+    for width in [256usize, 4096, row.len()] {
+        ok.clear();
+        for id in top_indices(row, width) {
+            // EOS may only be taken once the document is a complete value;
+            // otherwise the response would be truncated JSON.
+            if Some(id) == eos {
+                if st.complete() {
+                    ok.push((id, st.clone()));
+                }
+                continue;
+            }
+            bytes.clear();
+            tok.token_bytes_into(id, false, &mut bytes);
+            if bytes.is_empty() {
+                continue; // control tokens carry no text
+            }
+            if let Some(next) = st.accept(&bytes) {
+                ok.push((id, next));
+                if greedy {
+                    return ok.pop(); // descending order: the first is the best
+                }
+            }
+        }
+        if !ok.is_empty() {
+            break;
+        }
+        if width == row.len() {
+            return None;
+        }
+    }
+    if greedy {
+        return ok.into_iter().next();
+    }
+    // renormalize over exactly the legal candidates
+    let logits: Vec<f32> = ok.iter().map(|(id, _)| row[*id as usize]).collect();
+    let ln_z = log_z(&logits);
+    let mut acc = 0.0f64;
+    let r = sampler.rng().next_f32() as f64;
+    for (i, l) in logits.iter().enumerate() {
+        acc += (*l as f64 - ln_z).exp();
+        if r <= acc {
+            return Some(ok.swap_remove(i));
+        }
+    }
+    ok.pop()
+}
+
 /// Log partition function of one logit row, in f64 with the max subtracted —
 /// the same shape the perplexity path uses, so scores agree between them.
 fn log_z(row: &[f32]) -> f64 {
@@ -1539,7 +1614,9 @@ fn run_job(
     // past ~3 compound to nothing on flat text while still paying vocab
     // noise and a wide verify. Sampled requests keep the chain path, which
     // also keeps the MTP cache warm exactly where it is used.
-    let df_mode = dflash.is_some() && dcache.is_some() && greedy;
+    // json_mode disables speculation (see below), so fold it in here rather
+    // than mutating df_mode later.
+    let df_mode = dflash.is_some() && dcache.is_some() && greedy && !req.json_mode;
     let df_nmax: usize = std::env::var("CODPIECE_DFLASH_NMAX")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1618,6 +1695,9 @@ fn run_job(
     };
     let mut drafts: Vec<u32> = Vec::new();
     let mut next = 0u32;
+    // the automaton state after the first constrained token, handed to the
+    // decode loop so it continues from the right place
+    let mut json_seed: Option<crate::json::Json> = None;
 
     for seg in &segs {
         match seg {
@@ -1649,12 +1729,21 @@ fn run_job(
                     continue;
                 }
                 for chunk in prompt_ids[lo..hi].chunks(bulk_chunk) {
-                    let r = if greedy {
+                    let r = if greedy && !req.json_mode {
                         model.step_greedy(session, chunk, cfg.threads)
                     } else {
+                        // json mode constrains the FIRST token too, and the
+                        // constraint reads logits, so the in-graph argmax
+                        // shortcut is not available here
                         model
                             .step(session, chunk, &[(chunk.len() - 1) as i32], cfg.threads)
-                            .map(|l| sampler.sample(&l))
+                            .map(|l| {
+                                if greedy {
+                                    codpiece_model::qwen35::argmax(&l)
+                                } else {
+                                    sampler.sample(&l)
+                                }
+                            })
                     };
                     match r {
                         // without a draft head this is the only source of the first
@@ -1684,19 +1773,51 @@ fn run_job(
         } else {
             cfg.depth
         };
-        match model.step_fused_cached(session, tail, d0, None, false, !greedy, None, cfg.threads)
-        {
+        match model.step_fused_cached(
+            session,
+            tail,
+            d0,
+            None,
+            false,
+            !greedy || req.json_mode,
+            None,
+            cfg.threads,
+        ) {
             Ok(o) => {
                 let (preds, chain, logits) = (o.preds, o.chain, o.logits);
                 session.mtp_past += preds.len();
                 let at = preds.len() - 1;
-                next = if greedy {
+                next = if greedy && !req.json_mode {
                     preds[at]
+                } else if greedy {
+                    let v = model.hp.n_vocab as usize;
+                    codpiece_model::qwen35::argmax(&logits[at * v..(at + 1) * v])
                 } else {
                     let v = model.hp.n_vocab as usize;
                     let d = sampler.distribution(&logits[at * v..(at + 1) * v]);
                     sampler.draw_from(&d)
                 };
+                // the opening token of a constrained document must satisfy the
+                // automaton like every other one
+                if req.json_mode {
+                    let v = model.hp.n_vocab as usize;
+                    let mut st = crate::json::Json::new();
+                    match pick_json(
+                        &logits[at * v..(at + 1) * v],
+                        &st,
+                        tok,
+                        &mut sampler,
+                        greedy,
+                        tok.eos,
+                    ) {
+                        Some((chosen, advanced)) => {
+                            next = chosen;
+                            st = advanced;
+                            json_seed = Some(st);
+                        }
+                        None => return Err("no legal JSON continuation exists".into()),
+                    }
+                }
                 drafts = chain.iter().map(|c| c[at]).collect();
             }
             Err(e) => {
@@ -1871,6 +1992,19 @@ fn run_job(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.75);
+    // Constrained decoding: every committed token is checked against a JSON
+    // automaton. Speculation is off for these requests -- drafts come from
+    // the unconstrained distribution, so they would be rejected nearly every
+    // time and drafting them is wasted work.
+    let mut json = if req.json_mode {
+        Some(json_seed.take().unwrap_or_else(crate::json::Json::new))
+    } else {
+        None
+    };
+    if json.is_some() {
+        drafts.clear();
+        round_depth = 0;
+    }
     let mut forced: Vec<u32> = Vec::new();
     'outer: loop {
         // Decide whether to inject the forced close this round.
@@ -1953,7 +2087,10 @@ fn run_job(
             round_chain,
             None,
             false,
-            !greedy,
+            // the constraint is applied to logits, so they are needed even
+            // when the request is greedy and would normally take the
+            // in-graph argmax
+            !greedy || json.is_some(),
             if use_gumbel { Some(&noise_t) } else { None },
             cfg.threads,
         ) {
@@ -2109,6 +2246,38 @@ fn run_job(
                 }
             }
         };
+
+        // Constrained decoding overrides the choice with the best token that
+        // keeps the document valid. Placed after the unconstrained pick so it
+        // sees the same logits every other path does.
+        if let Some(st) = json.as_mut() {
+            let row = &logits[n_keep * n_vocab..(n_keep + 1) * n_vocab];
+            match pick_json(row, st, tok, &mut sampler, greedy, tok.eos) {
+                Some((chosen, advanced)) => {
+                    if Some(chosen) == tok.eos {
+                        reason = "stop";
+                        break;
+                    }
+                    next = chosen;
+                    *st = advanced;
+                    // A closed object, array, string or literal at the root is
+                    // the whole answer; continuing could only append
+                    // whitespace, so the request is done.
+                    if st.finished() {
+                        generated.push(next);
+                        push(&generated, &mut text);
+                        let _ = flush(&text, &mut emitted);
+                        reason = "stop";
+                        break;
+                    }
+                }
+                None => {
+                    // no legal continuation exists anywhere in the vocabulary
+                    reason = "stop";
+                    break;
+                }
+            }
+        }
         sampler.accept(next);
         drafts = if forcing {
             Vec::new()

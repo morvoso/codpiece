@@ -245,9 +245,20 @@ impl PromptField {
     }
 }
 
+/// OpenAI's `response_format`. Only `json_object` is implemented; a
+/// `json_schema` request is refused rather than silently downgraded to
+/// "valid JSON of some other shape", which would be worse than saying no.
+#[derive(Debug, Deserialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatBody {
     messages: Vec<ChatMessage>,
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
     #[serde(default)]
     tools: Option<serde_json::Value>,
     /// Qwen's template opens a `<think>` block when this is on, which changes where
@@ -424,6 +435,7 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 think_budget: 0,
                 think_close: Vec::new(),
                 echo_logprobs,
+                json_mode: false,
             };
             serve_with(
                 ctx,
@@ -489,6 +501,20 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 Ok(p) => p,
                 Err(e) => return write_error(w, 400, &e),
             };
+            let json_mode = match body.response_format.as_ref().map(|r| r.kind.as_str()) {
+                None | Some("text") => false,
+                Some("json_object") => true,
+                Some(other) => {
+                    return write_error(
+                        w,
+                        400,
+                        &format!(
+                            "response_format {other:?} is not supported; this server \
+                             implements json_object (structural validity), not schemas"
+                        ),
+                    )
+                }
+            };
             let gen = GenRequest {
                 prompt,
                 prompt_ids: None,
@@ -504,6 +530,7 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 think_budget: if thinking { ctx.think_budget } else { 0 },
                 think_close: ctx.think_close.clone(),
                 echo_logprobs: None,
+                json_mode,
             };
             serve_with(
                 ctx,
