@@ -1698,13 +1698,48 @@ fn run_job(
         true
     };
 
+    // Incremental detokenization, identical to the batch path's. The old
+    // version re-decoded ALL generated tokens each round, which both did
+    // O(n^2) work and was WRONG for a multi-byte character split across
+    // tokens: the half-character decoded as replacement chars one round and
+    // as the real character the next, so the text's PREFIX changed after
+    // `emitted` had already been advanced past it — streamed clients got
+    // U+FFFD garbage, and when the byte lengths differed, `&text[emitted..]`
+    // landed mid-character and the panic took the whole engine thread down.
+    // Appending raw bytes and converting only complete UTF-8 makes the text
+    // append-only, which is the property `emitted` was always assuming.
+    let mut acc_bytes: Vec<u8> = Vec::new();
+    let mut acc_valid = 0usize; // bytes converted into text so far
+    let mut acc_pushed = 0usize; // generated ids already appended
     let mut push = |ids: &[u32], text: &mut String| {
-        // render_special = false: strip control tokens like <|im_end|> from the
-        // user-visible text. The <think>/</think> tags are ordinary tokens and are
-        // kept, so the reasoning split is unaffected.
-        let piece = tok.decode(ids, false);
-        text.clear();
-        text.push_str(&piece);
+        for &id in &ids[acc_pushed.min(ids.len())..] {
+            // render_special = false: strip control tokens like <|im_end|>
+            // from user-visible text; <think> tags are ordinary tokens.
+            tok.token_bytes_into(id, false, &mut acc_bytes);
+        }
+        acc_pushed = ids.len();
+        while acc_valid < acc_bytes.len() {
+            match std::str::from_utf8(&acc_bytes[acc_valid..]) {
+                Ok(s) => {
+                    text.push_str(s);
+                    acc_valid = acc_bytes.len();
+                }
+                Err(e) => {
+                    let good = e.valid_up_to();
+                    text.push_str(unsafe {
+                        std::str::from_utf8_unchecked(&acc_bytes[acc_valid..acc_valid + good])
+                    });
+                    acc_valid += good;
+                    match e.error_len() {
+                        Some(bad) => {
+                            text.push('\u{FFFD}');
+                            acc_valid += bad;
+                        }
+                        None => break, // incomplete tail: wait for the next token
+                    }
+                }
+            }
+        }
     };
 
     // ---- prefill ----
@@ -2047,12 +2082,24 @@ fn run_job(
         round_depth = 0;
     }
     let mut forced: Vec<u32> = Vec::new();
+    // Window for the per-round scans. Text is append-only now, so a new stop
+    // or think-close occurrence must END in bytes added this round; scanning
+    // a tail window is equivalent to the old full scan without being O(n^2)
+    // over the generation.
+    let max_scan = req
+        .stop
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("</think>".len());
+    let mut saw_think_close = false;
     'outer: loop {
         // Decide whether to inject the forced close this round.
         if forced.is_empty()
             && budget_on
             && generated.len() >= req.think_budget
-            && !text.contains("</think>")
+            && !saw_think_close
         {
             forced = req.think_close.clone();
         }
@@ -2061,8 +2108,18 @@ fn run_job(
             break;
         }
         generated.push(next);
+        let prev_len = text.len();
         push(&generated, &mut text);
-        if let Some(hit) = req.stop.iter().find_map(|s| text.find(s.as_str())) {
+        let mut w = prev_len.saturating_sub(max_scan.saturating_sub(1));
+        while !text.is_char_boundary(w) {
+            w -= 1;
+        }
+        if !saw_think_close && text[w..].contains("</think>") {
+            saw_think_close = true;
+        }
+        if let Some(hit) =
+            req.stop.iter().find_map(|s| text[w..].find(s.as_str()).map(|p| w + p))
+        {
             text.truncate(hit);
             reason = "stop";
             let _ = flush(&text, &mut emitted);
