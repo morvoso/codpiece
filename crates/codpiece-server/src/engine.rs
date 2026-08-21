@@ -248,6 +248,10 @@ pub struct Stats {
     pub processing: AtomicUsize,
     pub served: AtomicU64,
     pub tokens_generated: AtomicU64,
+    /// Resident conversation slots, published by the engine thread once the
+    /// pool is built — the count depends on how much VRAM was left, so it is
+    /// not knowable when the Engine handle is created.
+    pub session_slots: AtomicUsize,
 }
 
 pub struct EngineConfig {
@@ -546,6 +550,7 @@ fn worker(
         }
     }
     eprintln!("serve: {} session slot(s)", pool.len());
+    stats.session_slots.store(pool.len(), Ordering::Relaxed);
     report_vram("after weights, sessions, drafter, vision");
     record_free_vram();
     eprintln!("serve: prefill chunk {} tokens", prefill_chunk_for(cfg.n_ctx));

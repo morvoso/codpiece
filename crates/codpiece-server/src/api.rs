@@ -293,7 +293,25 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                     "object": "model",
                     "owned_by": "codpiece",
                     "meta": { "n_ctx_train": ctx.engine.n_ctx },
+                    // clients that size their own window look for this name
+                    "context_length": ctx.engine.n_ctx,
                 }]
+            });
+            write_json(w, 200, &body.to_string())
+        }
+        // llama.cpp's shape. Coding clients probe this to discover the
+        // context window rather than being told it; without it they assume a
+        // default and truncate prompts the server would have accepted.
+        ("GET", "/props") => {
+            let body = json!({
+                "default_generation_settings": {
+                    "n_ctx": ctx.engine.n_ctx,
+                    "model": ctx.engine.model_name,
+                },
+                "total_slots": ctx.engine.stats.session_slots.load(Ordering::Relaxed).max(1),
+                "model_path": ctx.engine.model_name,
+                "chat_template": ctx.template.as_ref().map(|_| "").unwrap_or(""),
+                "build_info": concat!("codpiece ", env!("CARGO_PKG_VERSION")),
             });
             write_json(w, 200, &body.to_string())
         }
