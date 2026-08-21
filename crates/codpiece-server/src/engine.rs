@@ -861,17 +861,21 @@ fn run_batch(
         // The fit check already tokenized this prompt and stored the result;
         // re-tokenizing a 90K-token prompt here would repeat real work.
         let prompt_ids = req.prompt_ids.take().unwrap_or_else(|| tok.encode(&req.prompt, true));
-        if prompt_ids.is_empty() || prompt_ids.len() + req.max_tokens > seq_ctx {
+        // Same clamp as the single path: max_tokens is a ceiling, not a
+        // reservation. A prompt that does not fit the slot never reaches here
+        // -- fits_a_slot leaves it queued for the single path.
+        let room = seq_ctx.saturating_sub(prompt_ids.len());
+        if prompt_ids.is_empty() || room == 0 {
             let _ = out.send(Event::Failed(format!(
-                "prompt of {} tokens plus {} to generate exceeds this batch slot's {} token region",
+                "prompt of {} tokens does not fit this batch slot's {} token region",
                 prompt_ids.len(),
-                req.max_tokens,
                 seq_ctx
             )));
             stats.processing.fetch_sub(1, Ordering::Relaxed);
             stats.served.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        req.max_tokens = req.max_tokens.min(room);
         if let Err(e) = model.zero_seq_slot(bsession, slot, cfg.threads) {
             let _ = out.send(Event::Failed(format!("slot reset: {e}")));
             stats.processing.fetch_sub(1, Ordering::Relaxed);
@@ -1458,8 +1462,17 @@ fn vision_token_cap(reserved_bytes: usize) -> u32 {
 /// alternative is admitting a request that cannot be served.
 fn fits_a_slot(tok: &codpiece_tok::Tokenizer, req: &mut GenRequest, seq_ctx: usize) -> bool {
     let n = req.prompt_ids.get_or_insert_with(|| tok.encode(&req.prompt, true)).len();
-    n > 0 && n + req.max_tokens <= seq_ctx
+    // Only the PROMPT has to fit; generation is clamped to what is left. A
+    // slot with room for the prompt and a few hundred tokens is worth using —
+    // requiring room for the client's full max_tokens ceiling would push
+    // almost every real request onto the single path.
+    n > 0 && n + MIN_SLOT_ROOM <= seq_ctx
 }
+
+/// How much generation room makes a batch slot worth taking. Below this the
+/// request is better served on the single path, where it has the whole
+/// context.
+const MIN_SLOT_ROOM: usize = 512;
 
 /// Would a session of this shape fit on the tightest card right now?
 ///
@@ -1557,13 +1570,24 @@ fn run_job(
     if !matches!(segs.last(), Some(Seg::Text(_))) {
         return Err("prompt must contain text after the last image".into());
     }
-    if prompt_ids.len() + req.max_tokens > cfg.n_ctx {
+    // Clamp the generation length to the room that is left rather than
+    // refusing the request. Clients send a generous max_tokens as a CEILING,
+    // not a reservation -- the qwen CLI defaults to 65536 -- so treating it as
+    // a reservation rejects every long prompt with an error that reads like
+    // the prompt was too big when it was not. llama.cpp and the OpenAI API
+    // both clamp. Only a prompt that does not itself fit is an error, and it
+    // says so specifically.
+    let mut req = req;
+    let room = cfg.n_ctx.saturating_sub(prompt_ids.len());
+    if room == 0 {
         return Err(format!(
-            "prompt of {} tokens plus {} to generate exceeds the {} token context",
+            "prompt of {} tokens does not fit the {} token context",
             prompt_ids.len(),
-            req.max_tokens,
             cfg.n_ctx
         ));
+    }
+    if req.max_tokens > room {
+        req.max_tokens = room;
     }
     // Reuse the session when this prompt extends what the caches already hold; the
     // suffix left to prefill must be non-empty so there is a position to predict from.
