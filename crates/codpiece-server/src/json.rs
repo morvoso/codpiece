@@ -351,6 +351,24 @@ mod tests {
         assert!(Json::new().accept(b"12 ").unwrap().finished());
     }
 
+    /// A run cut short by max_tokens leaves a valid PREFIX, not garbage:
+    /// the constraint held for every token that was emitted. This is the
+    /// observed shape of the sampled failures at max_tokens=300.
+    #[test]
+    fn a_truncated_document_is_still_a_valid_prefix() {
+        for s in [
+            r#"{"city_name": "Aetheria", "population": 245000, "coordinates": {"latitude": 40.7128"#,
+            r#"{"name": "Aetheria", "geography": {"timezone": "UTC-05:00", "land_area_km2": 780.5"#,
+            r#"{"a": [1, 2, {"b": "unterminated"#,
+        ] {
+            let st = Json::new().accept(s.as_bytes());
+            assert!(st.is_some(), "constraint should have allowed this prefix: {s}");
+            assert!(!st.unwrap().finished(), "should not be finished: {s}");
+            // and it is indeed not parseable yet, which is the point
+            assert!(serde_json::from_str::<serde_json::Value>(s).is_err());
+        }
+    }
+
     #[test]
     fn accepts_valid_documents() {
         for doc in [

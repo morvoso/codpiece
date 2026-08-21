@@ -105,6 +105,29 @@ Argument types follow the schema you sent — a parameter declared `string`
 stays a string even when it looks numeric, everything else is parsed as
 JSON.
 
+`response_format: {"type": "json_object"}` guarantees the response
+parses. Every token is checked against a JSON automaton before it is
+committed, so invalid output is not possible — rather than masking all
+151,936 logits each step, candidates are walked in probability order and
+the first that keeps the document valid wins, which costs almost nothing.
+
+```sh
+curl http://localhost:8020/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "Describe a book as JSON."}],
+       "response_format": {"type": "json_object"}, "max_tokens": 300}'
+```
+
+Two things to know, both shared with OpenAI's implementation. **Ask for
+JSON in the prompt**: the constraint enforces syntax, not intent, so a
+model that wanted to write prose gets forced into the first legal token
+and you may get a valid but useless `1.1`. And **check `finish_reason`**:
+stopping at `max_tokens` leaves a valid *prefix*, not a complete
+document, so a long object can be cut mid-string. Nothing is fabricated
+to close it. Speculation is disabled for constrained requests — drafts
+come from the unconstrained distribution and would nearly all be
+rejected. `json_schema` is refused rather than silently downgraded to
+"valid JSON of some other shape".
+
 For evaluation harnesses, `/v1/completions` implements `echo` +
 `logprobs`: the prompt is scored token by token and returned with
 per-token logprobs, top-k alternatives and text offsets, which is what
