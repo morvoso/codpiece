@@ -1280,14 +1280,22 @@ fn vision_token_cap(reserved_bytes: usize) -> u32 {
     // 1024-token image then failed and left the card at zero for good.
     let reserved = reserved_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let free_gib = (FREE_GIB.get().copied().unwrap_or(0.0) - reserved).max(0.0);
-    // Calibrated, not guessed: a 1024-token image measured a ~0.41 GiB peak
-    // (card 1 went 0.68 -> 0.27 GiB free across the encode, settling at
-    // 0.39). The thresholds below leave roughly that much again for the
-    // trunk, since the encoder's peak is claimed permanently.
+    // Calibrated against two measurements, because they disagree and the
+    // larger one is the one that matters.
+    //
+    // The encoder's own compute buffer is linear in image tokens and small:
+    // 30.0 / 62.0 / 120.1 / 237.4 MiB at 256 / 529 / 1024 / 2025 tokens, or
+    // ~0.12 MiB per token. But end to end a 1024-token image consumed
+    // ~0.41 GiB of card 1 (0.68 -> 0.27 GiB free, settling at 0.39) — about
+    // 3x the encoder's buffer, because an image also introduces trunk graph
+    // shapes at new t_len values, and those are cached too.
+    //
+    // So the budget below is ~0.4 MiB per token, the observed system cost,
+    // with roughly one image's worth left over for the trunk.
     let cap = match free_gib {
-        f if f > 3.5 => 4096,
-        f if f > 2.0 => 2048,
-        f if f > 1.0 => 1024,
+        f if f > 2.1 => 4096,
+        f if f > 1.25 => 2048,
+        f if f > 0.85 => 1024,
         f if f > 0.6 => 512,
         _ => 256,
     };
