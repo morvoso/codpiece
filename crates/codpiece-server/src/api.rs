@@ -211,13 +211,38 @@ struct CompletionsBody {
     sampling: SamplingFields,
 }
 
-/// `/v1/completions` accepts a string or an array of token ids; harnesses use
-/// the token form to keep their own tokenization authoritative.
+/// Every shape OpenAI's `prompt` field allows: a string, an array of token
+/// ids, or either of those wrapped in an array (the batch form). Harnesses
+/// use the token form to keep their own tokenization authoritative, and
+/// lm-evaluation-harness sends the batch form even for a single prompt —
+/// which a token-array-only reader rejects with a 400 that looks, from the
+/// harness side, like the server not supporting logprobs at all.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum PromptField {
     Text(String),
     Tokens(Vec<u32>),
+    TextBatch(Vec<String>),
+    TokenBatch(Vec<Vec<u32>>),
+}
+
+impl PromptField {
+    /// Collapse to one prompt. Multi-prompt batches would need one `choices`
+    /// entry each, which this server does not do — better to say so than to
+    /// silently answer only the first.
+    fn single(self) -> Result<(Option<String>, Option<Vec<u32>>), String> {
+        let many = |n: usize| {
+            format!("this server serves one prompt per request; got a batch of {n}")
+        };
+        match self {
+            PromptField::Text(s) => Ok((Some(s), None)),
+            PromptField::Tokens(t) => Ok((None, Some(t))),
+            PromptField::TextBatch(mut v) if v.len() == 1 => Ok((Some(v.remove(0)), None)),
+            PromptField::TokenBatch(mut v) if v.len() == 1 => Ok((None, Some(v.remove(0)))),
+            PromptField::TextBatch(v) => Err(many(v.len())),
+            PromptField::TokenBatch(v) => Err(many(v.len())),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,9 +384,13 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 Ok(b) => b,
                 Err(e) => return write_error(w, 400, &format!("invalid request body: {e}")),
             };
-            let (prompt, prompt_ids) = match body.prompt {
-                PromptField::Text(s) => (s, None),
-                PromptField::Tokens(ids) => {
+            let (text, ids) = match body.prompt.single() {
+                Ok(v) => v,
+                Err(e) => return write_error(w, 400, &e),
+            };
+            let (prompt, prompt_ids) = match (text, ids) {
+                (Some(s), _) => (s, None),
+                (None, Some(ids)) => {
                     // These are used unvalidated all the way down: scoring
                     // indexes a logits row by token id, and the model gathers
                     // embedding rows by it. An id past the vocabulary is a
@@ -376,6 +405,7 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                     }
                     (ctx.tokenizer.decode(&ids, true), Some(ids))
                 }
+                (None, None) => return write_error(w, 400, "empty prompt"),
             };
             // Scoring needs both flags: `echo` alone just repeats the prompt.
             let echo = body.echo.unwrap_or(false);
@@ -916,5 +946,41 @@ mod sampling_tests {
         let p = fields(r#"{}"#).params_for_thinking(None);
         assert_eq!(p.temp, 0.0);
         assert_eq!(p.top_k, 0);
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    fn parse(json: &str) -> CompletionsBody {
+        serde_json::from_str(json).expect("parse")
+    }
+
+    /// The four shapes OpenAI allows, all reaching the same place.
+    #[test]
+    fn every_prompt_shape_collapses_to_one_prompt() {
+        let (t, i) = parse(r#"{"prompt": "hi"}"#).prompt.single().unwrap();
+        assert_eq!((t, i), (Some("hi".into()), None));
+
+        let (t, i) = parse(r#"{"prompt": [1, 2, 3]}"#).prompt.single().unwrap();
+        assert_eq!((t, i), (None, Some(vec![1, 2, 3])));
+
+        // the batch form lm-evaluation-harness sends even for one prompt
+        let (t, i) = parse(r#"{"prompt": [[1, 2, 3]]}"#).prompt.single().unwrap();
+        assert_eq!((t, i), (None, Some(vec![1, 2, 3])));
+
+        let (t, i) = parse(r#"{"prompt": ["hi"]}"#).prompt.single().unwrap();
+        assert_eq!((t, i), (Some("hi".into()), None));
+    }
+
+    /// A real multi-prompt batch is refused rather than silently answered
+    /// with only its first entry.
+    #[test]
+    fn a_multi_prompt_batch_is_an_explicit_error() {
+        let err = parse(r#"{"prompt": [[1], [2]]}"#).prompt.single().unwrap_err();
+        assert!(err.contains("one prompt per request"), "{err}");
+        let err = parse(r#"{"prompt": ["a", "b"]}"#).prompt.single().unwrap_err();
+        assert!(err.contains("batch of 2"), "{err}");
     }
 }

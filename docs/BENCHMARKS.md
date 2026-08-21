@@ -36,6 +36,26 @@ protocols (the repo's historic 20.44 figure scores all positions).
    codpiece's API; loglikelihood-based suites (MMLU, HellaSwag) need a
    logprobs field `/v1/completions` does not expose yet.
 
+## Code
+
+The use case is coding, and until now nothing here measured code: GSM8K
+measures arithmetic reasoning and wikitext measures next-token loss.
+
+| benchmark | Qwen3.8-27B UD-Q8_K_XL |
+|---|---|
+| HumanEval pass@1 (all 164) | **79.3% ± 3.2** |
+
+Run through codpiece's own API via lm-evaluation-harness (`local-completions`,
+greedy, 0-shot, the harness's standard stop sequences).
+
+**Sandboxing.** HumanEval and MBPP score by *executing model-generated
+code*; the harness gates this behind both `--confirm_run_unsafe_code` and
+`HF_ALLOW_CODE_EVAL=1`. Neither was granted on the host. The harness runs
+inside a throwaway container with no host filesystem mounts, reaching the
+server over the API only, so generated code cannot touch the box — that
+isolation is the reason the gate is opened at all, not a formality worked
+around.
+
 ## Long-context retrieval
 
 Needle-in-a-haystack through `/v1/chat/completions`, unique filler lines
