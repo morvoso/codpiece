@@ -28,16 +28,41 @@ use codpiece_vision::VisionModel;
 ///
 /// A two-point fit, and honest about it: the two measurements above are what set the
 /// threshold.
+/// Headroom on the tightest card once everything resident is allocated,
+/// in GiB. Recorded after startup; `None` until then.
+static FREE_GIB: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// How many prompt tokens to push through the model at once.
+///
+/// A prefill graph's compute buffer scales with `n_kv * chunk`, so the chunk
+/// is bounded by real headroom rather than a guess. It used to be derived
+/// from a static estimate of weights and KV, which knew nothing about the
+/// drafter (~1.2 GiB, mirrored on both cards) or the vision tower (~0.87
+/// GiB) — at 98K context that estimate claimed 4 GiB free where the driver
+/// reported 1.15, and picked the largest chunk on the strength of it.
 pub fn prefill_chunk_for(n_ctx: usize) -> usize {
-    const WEIGHTS_GIB: f64 = 16.46; // per card, including the mirrored head and embeddings
-    const CARD_GIB: f64 = 23.5;
-    let kv_gib = n_ctx as f64 * 65536.0 / 2.0 / (1u64 << 30) as f64;
-    let free = CARD_GIB - WEIGHTS_GIB - kv_gib;
-    if free > 2.0 {
-        512
-    } else {
-        64
+    let free = FREE_GIB.get().copied().unwrap_or_else(|| {
+        const WEIGHTS_GIB: f64 = 16.46; // per card, incl. mirrored head and embeddings
+        const CARD_GIB: f64 = 23.5;
+        CARD_GIB - WEIGHTS_GIB - n_ctx as f64 * 65536.0 / 2.0 / (1u64 << 30) as f64
+    });
+    match free {
+        f if f > 2.5 => 512,
+        f if f > 1.5 => 256,
+        f if f > 0.9 => 128,
+        _ => 64,
     }
+}
+
+/// Record real headroom once everything resident is allocated.
+fn record_free_vram() {
+    let min_free = codpiece_model::device_memory()
+        .iter()
+        .map(|(_, used, total)| total.saturating_sub(*used))
+        .min()
+        .unwrap_or(0) as f64
+        / (1024.0 * 1024.0 * 1024.0);
+    let _ = FREE_GIB.set(min_free);
 }
 
 /// How deep to draft next, given how confident the model just was.
@@ -505,6 +530,11 @@ fn worker(
     }
     eprintln!("serve: {} session slot(s)", pool.len());
     report_vram("after weights, sessions, drafter, vision");
+    record_free_vram();
+    eprintln!("serve: prefill chunk {} tokens", prefill_chunk_for(cfg.n_ctx));
+    // CODPIECE_TRACE_VRAM=1: a line per request, which is how cached-graph
+    // growth becomes visible instead of showing up as a dead process.
+    let trace_vram = std::env::var("CODPIECE_TRACE_VRAM").is_ok_and(|v| v == "1");
     let mut dcaches: Vec<Option<DflashCache>> = (0..pool.len())
         .map(|_| match &dflash {
             Some(d) => d.new_cache().ok(),
@@ -658,6 +688,9 @@ fn worker(
             &model, &tok, &cfg, vision.as_ref(), dflash.as_ref(), dcache, session, history,
             &mut store, can_speculate, job, &stats,
         );
+        if trace_vram {
+            report_vram("after request");
+        }
         // Drop the busy flag *before* the client is told the request finished. A client
         // that polls /slots the instant it has its answer — which is exactly what the
         // box's own benchmark does — would otherwise see the slot still working.

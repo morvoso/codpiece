@@ -85,6 +85,39 @@ accepted — the server never fetches remote URLs:
 ]}]}
 ```
 
+Tool calling works as it does against OpenAI. Pass `tools`, get
+`tool_calls` back with `finish_reason: "tool_calls"`, send the assistant
+turn and the tool result back for the next turn:
+
+```json
+{"messages": [{"role": "user", "content": "Weather in Berlin?"}],
+ "tools": [{"type": "function", "function": {
+     "name": "get_weather",
+     "parameters": {"type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]}}}]}
+```
+
+Qwen3.8 emits calls in an XML-ish framing of its own
+(`<tool_call><function=name><parameter=key>`), not the JSON blob earlier
+Qwen generations used; the server parses that back into the OpenAI shape.
+Argument types follow the schema you sent — a parameter declared `string`
+stays a string even when it looks numeric, everything else is parsed as
+JSON.
+
+For evaluation harnesses, `/v1/completions` implements `echo` +
+`logprobs`: the prompt is scored token by token and returned with
+per-token logprobs, top-k alternatives and text offsets, which is what
+loglikelihood benchmarks (MMLU, HellaSwag, ARC) run on. The prompt may
+also be sent as an array of token ids so a harness keeps its own
+tokenization authoritative.
+
+```sh
+curl http://localhost:8020/v1/completions -H 'Content-Type: application/json' \
+  -d '{"prompt": "The capital of France is Paris.",
+       "max_tokens": 0, "echo": true, "logprobs": 3}'
+```
+
 Endpoints: `/v1/completions`, `/v1/chat/completions` (both stream with
 `"stream": true`), `/tokenize`, `/detokenize`, `/v1/models`, `/health`,
 `/slots`. Responses include a `timings` object with prefill/decode speed and
@@ -92,7 +125,11 @@ speculation acceptance.
 
 Thinking models are handled the way the Qwen API does it: the `<think>`
 block comes back in `reasoning_content`, the answer in `content`, in both
-streaming and non-streaming responses.
+streaming and non-streaming responses. Qwen warns that greedy decoding
+with thinking on degenerates into repetition, so a thinking request that
+sets *no* sampling fields adopts the sampling the model itself recommends
+(`general.sampling.*` in the GGUF: temp 1, top_k 20, top_p 0.95). Set any
+sampling field — including `"temperature": 0` — and your choice stands.
 
 ### Settings that matter
 
@@ -108,6 +145,16 @@ streaming and non-streaming responses.
 | `CODPIECE_MMPROJ` | unset | vision tower path (alternative to `--mmproj`) |
 | `--dflash PATH` / `CODPIECE_DFLASH` | unset | DFlash2 block drafter: +22-37% greedy decode (needs ~1.9 GB VRAM for the Q8 draft) |
 | `CODPIECE_IMAGE_MIN_TOKENS` | 1024 | image detail floor; Qwen-VL reads text poorly below this |
+| `CODPIECE_GRAPH_CACHE_MIB` | 1024 | VRAM the per-session cache of compiled graph shapes may hold |
+| `CODPIECE_BATCH_GREEDY` | on | all-greedy batch rounds argmax in the graph instead of reading back full logits |
+
+Diagnostics, all off by default: `CODPIECE_BATCH_TRACE=1` (per-round
+fill/compute/readback at width N), `CODPIECE_DECODE_TRACE=1` (single-stream
+verify vs draft time and tokens committed per round), `CODPIECE_TRACE_VRAM=1`
+(a VRAM line per request), `CODPIECE_TRACE_MEM=1` (compute buffer size per
+compiled graph shape), `CODPIECE_TRACE_REUSE=1` (why a prefix-cache lookup
+missed). The server also reports per-GPU VRAM and its chosen prefill chunk
+at startup — on a 48 GiB box, every context decision is a memory decision.
 
 The defaults maximize throughput. Acceptance ratio is a conversion
 statistic, not a quality metric — the output is identical at any setting —

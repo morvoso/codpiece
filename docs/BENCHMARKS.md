@@ -36,6 +36,68 @@ protocols (the repo's historic 20.44 figure scores all positions).
    codpiece's API; loglikelihood-based suites (MMLU, HellaSwag) need a
    logprobs field `/v1/completions` does not expose yet.
 
+## Long-context retrieval
+
+Needle-in-a-haystack through `/v1/chat/completions`, unique filler lines
+(a maintenance log, one fact buried in it), greedy, thinking off:
+
+| prompt tokens | depth 10% | depth 50% | depth 90% |
+|---|---|---|---|
+| 6,122 | found | found | found |
+| 24,347 | found | found | found |
+| **97,298** | **found** | **found** | **found** |
+
+9/9, including at 97K tokens — retrieval at the full shipping context,
+not merely allocation of it.
+
+**This test replaced one that lied.** The first version buried the fact
+in ~66K repetitions of a *single sentence* and asked through
+`/v1/completions` with no chat template. It missed at 66K, 80K and 93K,
+which looked exactly like a long-context defect and was not: a
+degenerate haystack gives the model nothing to distinguish position by,
+and the raw endpoint gives it no instruction framing. Two hypotheses
+were checked and killed before the harness was suspected — the model is
+natively 262K with `rope.freq_base = 10M` and no scaling keys (so no
+YaRN is owed), and cached graphs always round `n_kv` *up* to a bucket
+capped at `n_ctx`, so the causal mask never truncates. A benchmark that
+fails should be suspected as hard as the code it accuses.
+
+## Where a decode round's time actually goes
+
+Measured with `CODPIECE_BATCH_TRACE=1` / `CODPIECE_DECODE_TRACE=1`.
+
+At 32-way concurrency, per round:
+
+| phase | before | after |
+|---|---|---|
+| admission / prefill stalls | 0.00 ms | 0.00 ms |
+| input fill (mask, positions) | 0.64 ms | 0.61 ms |
+| compute | 61.9 ms | 64.3 ms |
+| logits readback | 9.96 ms | **0.01 ms** |
+| host work (detok, stops, sends) | 0.02 ms | 0.01 ms |
+| **round** | **72.5 ms** | **64.9 ms** |
+| aggregate | 268.5 tok/s | **285.7 tok/s** |
+
+Two findings, one of which cost a planned task:
+
+1. **There was no scheduler overhead to reclaim.** The batch scheduler
+   was assumed to be burning 25%+ in admission serialization and
+   per-round host work, on the strength of a ~119 ms round measured at
+   the HTTP layer. Instrumented, the round is 72.5 ms and host work is
+   0.02 ms of it. The gap was client-side measurement, not server-side
+   waste.
+2. **At width 32 the round is compute bound, not memory bound** — 64.3 ms
+   of compute against a 15.6 ms weight-read floor (4.1x). That kills
+   batched speculation as an aggregate lever: speculation pays only while
+   a round is memory bound and extra tokens ride along free, and at this
+   width every drafted token costs proportional compute while only about
+   half are accepted. It would still pay at low concurrency, which is
+   where a single user actually lives.
+
+The one real win was removing the readback: greedy rounds now argmax in
+the graph and return one token id per lane instead of a full vocabulary
+of logits per lane (~32 MB at width 32).
+
 Found and fixed along the way: the stateless forward path had never run
 under tensor parallelism — its zero-state inputs live in compute buffers
 the meta backend cannot classify (`handle_gated_delta_net` asserts).

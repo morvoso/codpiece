@@ -403,6 +403,46 @@ interface. Prize: mean accepted length 4.80 vs MTP's 4.28 (+10–15% decode).
 
 **Gate:** lossless (parity) + ≥ +8% decode over M4 on prose.
 
+## M8 — Coding-first: context, tools, evaluation surface ◕ 2026-08-21
+
+Owner's brief: "perfect speed and accuracy, while maintaining a good
+context size for coding" — which reorders the standing priority to
+**ACCURACY > CONTEXT ≈ SPEED** for the shipping configuration, since a
+coding session is one long conversation, not thirty short ones.
+
+- [x] **Tool calling, end to end.** Qwen3.8 emits an XML-ish framing
+      (`<tool_call><function=name><parameter=key>`), not the JSON blob
+      earlier Qwen generations used. Parsed into OpenAI `tool_calls`
+      with `finish_reason: "tool_calls"`, streaming included. Writing the
+      round-trip test found two blockers: the `tojson` filter was never
+      registered (so *any* assistant turn carrying tool_calls failed to
+      render — every agentic second turn would have 400'd), and the
+      template refuses arguments passed as a JSON string, which is
+      exactly the wire format clients send back.
+- [x] **`echo` + `logprobs`.** Closes the harness gap: loglikelihood
+      suites (MMLU, HellaSwag, ARC) can now run. Prompts may be sent as
+      token ids so a harness keeps its own tokenization authoritative.
+- [x] **Model-recommended sampling for thinking requests.** The GGUF
+      carries `general.sampling.*` and it was ignored; greedy + thinking
+      is a documented Qwen failure mode.
+- [x] **VRAM reporting at startup**, which is what made the context
+      sweep legible rather than guesswork.
+- [x] **Long-context retrieval verified** — 9/9 needles to 97K tokens
+      (see BENCHMARKS.md, including the harness that lied first).
+- [ ] **Ship the larger context.** Measured, full stack resident
+      (drafter + vision), 1 session:
+
+      | ctx | card0 free | card1 free | verdict |
+      |---|---|---|---|
+      | 98304 | 2.00 GiB | 1.15 GiB | fits |
+      | 114688 | 1.50 GiB | 0.65 GiB | borderline (peak 24.09/24.58 GiB) |
+      | 131072 | — | — | 500s on first request |
+      | 131072 (no vision) | 1.00 GiB | 1.01 GiB | fits; vision costs ~0.87 GiB |
+
+**Gate:** 98304 shipped with drafter + vision + batch path, retrieval
+verified at ~90K, vision working, greedy code decode within 10% of the
+40960 figure.
+
 ## M3 design brief (from b10423 source reading, 2026-08-19)
 
 llama.cpp's `-sm tensor` (prod's mode) = `ggml_backend_meta_device(devs, n,

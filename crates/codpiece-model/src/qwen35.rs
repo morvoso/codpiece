@@ -372,6 +372,18 @@ fn mtp_ctx_cap() -> usize {
         .unwrap_or(16384)
 }
 
+/// Total VRAM the per-session graph cache may hold, in bytes.
+/// `CODPIECE_GRAPH_CACHE_MIB` overrides; 1 GiB is enough for the handful of
+/// shapes a steady-state conversation reuses.
+fn fused_cache_budget() -> usize {
+    std::env::var("CODPIECE_GRAPH_CACHE_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024)
+        * 1024
+        * 1024
+}
+
 pub(crate) unsafe fn trace_mem(what: &str, galloc: ffi::ggml_gallocr_t, n_kv: i64, t_len: i64) {
     use std::sync::atomic::{AtomicI8, Ordering};
     static ON: AtomicI8 = AtomicI8::new(-1);
@@ -623,6 +635,47 @@ impl Session {
         }
     }
 
+    /// Evict least-recently-used cached graph shapes until the cache fits its
+    /// byte budget, never dropping the shape just inserted.
+    ///
+    /// Eviction frees the device buffer immediately; the graph's `ggml_context`
+    /// goes to the graveyard and is freed with the session, because the meta
+    /// backend keys per-device maps by graph uid and may still hold references.
+    /// That is host metadata only — a few MiB per evicted shape — but it does
+    /// mean a very long-lived session accumulates host memory in proportion to
+    /// how many distinct shapes it has seen.
+    ///
+    /// Counting shapes is not enough at long context: a prefill graph's
+    /// compute buffer scales with `n_kv * t_len`, so at 98K context a handful
+    /// of shapes can hold gigabytes. Two consecutive ~88K-token requests
+    /// landing in different `n_kv` buckets is all it took to exhaust a card
+    /// that had 1.15 GiB free after warmup.
+    fn trim_fused_cache(&mut self) {
+        let budget = fused_cache_budget();
+        loop {
+            let total: usize = self.fused.iter().map(|c| c.bytes).sum();
+            if total <= budget || self.fused.len() <= 1 {
+                return;
+            }
+            let newest = self.fused_clock;
+            let Some(victim) = self
+                .fused
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.used != newest)
+                .min_by_key(|(_, c)| c.used)
+                .map(|(i, _)| i)
+            else {
+                return;
+            };
+            let c = self.fused.remove(victim);
+            unsafe {
+                ffi::ggml_gallocr_free(c.galloc);
+            }
+            self.graveyard.push(c.built.ctx);
+        }
+    }
+
     pub fn reset(&mut self) {
         unsafe {
             ffi::ggml_backend_buffer_clear(self.buffer, 0);
@@ -691,6 +744,10 @@ struct FusedStep {
     /// however many drafts the PREVIOUS round produced, while this is how many the
     /// current one will produce — so it has to be part of the key in its own right.
     depth: usize,
+    /// This shape's compute buffer, in bytes. A cached graph is not free: at
+    /// 98K context one prefill shape holds hundreds of MiB, so the cache is
+    /// bounded by total size and not only by count.
+    bytes: usize,
     used: u64,
 }
 
@@ -1697,9 +1754,11 @@ impl Qwen35 {
                         n_out,
                         n_cand,
                         depth,
+                        bytes: ffi::ggml_gallocr_get_buffer_size(ga, 0),
                         used: session.fused_clock,
                     });
-                    session.fused.len() - 1
+                    session.trim_fused_cache();
+                    session.fused.iter().position(|c| c.used == session.fused_clock).unwrap()
                 }
             };
             let c = &session.fused[idx];
