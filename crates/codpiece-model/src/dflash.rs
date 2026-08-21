@@ -18,7 +18,7 @@
 use codpiece_ggml_sys as ffi;
 use codpiece_gguf::Value;
 
-use crate::{Device, ModelError, Weights};
+use crate::ModelError;
 
 #[derive(Debug, Clone)]
 pub struct DflashHparams {
@@ -94,15 +94,19 @@ impl DflashHparams {
     }
 }
 
-/// The drafter's weights plus borrowed pointers into the trunk it drafts
-/// for: DFlash2 ships no token embedding and no lm head of its own.
+/// The drafter, resident IN the trunk's backend: its tensors load through
+/// `Weights::load_more` under a "dflash." prefix (mirrored under TP), so a
+/// draft graph can mix them with the trunk's token embedding and lm head —
+/// DFlash2 ships neither of its own.
 pub struct Dflash {
-    pub weights: Weights,
     pub hp: DflashHparams,
-    /// trunk token_embd.weight (same backend as `weights`)
+    tensors: std::collections::HashMap<String, *mut ffi::ggml_tensor>,
+    /// trunk token_embd.weight
     tok_embd: *mut ffi::ggml_tensor,
     /// trunk output.weight
     output: *mut ffi::ggml_tensor,
+    backend: ffi::ggml_backend_t,
+    is_cpu: bool,
 }
 
 unsafe impl Send for Dflash {}
@@ -189,47 +193,75 @@ impl Lattice {
 }
 
 impl Dflash {
-    /// `trunk` supplies the shared token embedding and lm head; it must live
-    /// on the same device as `path` is loaded to.
-    pub fn load(
+    /// Load the drafter INTO the trunk's backend (see Weights::load_more).
+    pub fn load_into(
+        trunk: &mut crate::qwen35::Qwen35,
         path: &std::path::Path,
-        device: Device,
-        trunk: &crate::qwen35::Qwen35,
     ) -> Result<Dflash, ModelError> {
-        let weights = Weights::load(path, device)?;
-        let hp = DflashHparams::from_gguf(&weights.gguf)?;
+        let gguf = trunk.weights.load_more(path, "dflash.")?;
+        let hp = DflashHparams::from_gguf(&gguf)?;
         if hp.n_embd != trunk.hp.n_embd {
             return Err(ModelError::Load(format!(
                 "dflash n_embd {} != trunk {}",
                 hp.n_embd, trunk.hp.n_embd
             )));
         }
-        for name in [
-            "fc.weight",
-            "enc.output_norm.weight",
-            "output_norm.weight",
-            "selector_hidden.weight",
-            "selector_predecessor.weight",
-            "selector_successor.weight",
-        ] {
-            if weights.tensor(name).is_none() {
-                return Err(ModelError::Load(format!("dflash missing {name}")));
+        let mut tensors = std::collections::HashMap::new();
+        let mut need: Vec<String> = vec![
+            "fc.weight".into(),
+            "enc.output_norm.weight".into(),
+            "output_norm.weight".into(),
+            "selector_hidden.weight".into(),
+            "selector_predecessor.weight".into(),
+            "selector_successor.weight".into(),
+        ];
+        for il in 0..hp.n_layer {
+            for part in [
+                "attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "attn_q_norm.weight",
+                "attn_k_norm.weight",
+                "attn_conv_base",
+                "attn_conv_proj.weight",
+                "ffn_norm.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+                "ffn_conv_base",
+                "ffn_conv_proj.weight",
+            ] {
+                need.push(format!("blk.{il}.{part}"));
             }
+        }
+        for n in need {
+            let t = trunk
+                .weights
+                .tensor(&format!("dflash.{n}"))
+                .ok_or_else(|| ModelError::Load(format!("dflash missing {n}")))?;
+            tensors.insert(n, t);
         }
         let tok_embd = trunk
             .weights
             .tensor("token_embd.weight")
             .ok_or_else(|| ModelError::Load("trunk has no token_embd".into()))?;
-        let output = trunk
-            .weights
-            .tensor("output.weight")
-            .unwrap_or(tok_embd);
-        Ok(Dflash { weights, hp, tok_embd, output })
+        let output = trunk.weights.tensor("output.weight").unwrap_or(tok_embd);
+        Ok(Dflash {
+            hp,
+            tensors,
+            tok_embd,
+            output,
+            backend: trunk.weights.backend(),
+            is_cpu: trunk.weights.is_cpu(),
+        })
     }
 
     fn t(&self, name: &str) -> Result<*mut ffi::ggml_tensor, ModelError> {
-        self.weights
-            .tensor(name)
+        self.tensors
+            .get(name)
+            .copied()
             .ok_or_else(|| ModelError::Load(format!("dflash missing tensor {name}")))
     }
 
@@ -268,14 +300,14 @@ impl Dflash {
                 k.push(kt);
                 v.push(vt);
             }
-            let buffer = ffi::ggml_backend_alloc_ctx_tensors(ctx, self.weights.backend());
+            let buffer = ffi::ggml_backend_alloc_ctx_tensors(ctx, self.backend);
             if buffer.is_null() {
                 ffi::ggml_free(ctx);
                 return Err(ModelError::Load("dflash cache alloc".into()));
             }
             ffi::ggml_backend_buffer_clear(buffer, 0);
             let galloc = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
-                self.weights.backend(),
+                self.backend,
             ));
             if galloc.is_null() {
                 ffi::ggml_backend_buffer_free(buffer);
@@ -775,8 +807,8 @@ impl Dflash {
     }
 
     unsafe fn compute(&self, gf: *mut ffi::ggml_cgraph, n_threads: i32) -> Result<(), ModelError> {
-        let backend = self.weights.backend();
-        if self.weights.is_cpu() && n_threads > 0 {
+        let backend = self.backend;
+        if self.is_cpu && n_threads > 0 {
             ffi::ggml_backend_cpu_set_n_threads(backend, n_threads);
         }
         if ffi::ggml_backend_graph_compute(backend, gf) != ffi::ggml_status_GGML_STATUS_SUCCESS {

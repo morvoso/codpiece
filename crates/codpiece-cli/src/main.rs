@@ -54,7 +54,7 @@ fn cmd_dflash_test(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let t0 = std::time::Instant::now();
-    let trunk = match codpiece_model::qwen35::Qwen35::load_on(
+    let mut trunk = match codpiece_model::qwen35::Qwen35::load_on(
         Path::new(trunk_path),
         codpiece_model::Device::Cpu,
     ) {
@@ -65,11 +65,7 @@ fn cmd_dflash_test(args: &[String]) -> ExitCode {
         }
     };
     eprintln!("trunk loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    let dfl = match codpiece_model::dflash::Dflash::load(
-        Path::new(draft_path),
-        codpiece_model::Device::Cpu,
-        &trunk,
-    ) {
+    let dfl = match codpiece_model::dflash::Dflash::load_into(&mut trunk, Path::new(draft_path)) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("dflash load: {e:?}");

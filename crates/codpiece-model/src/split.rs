@@ -71,6 +71,15 @@ fn layer_of(name: &str) -> Option<(usize, &str)> {
 /// `cache_gdn_l<N>`), classified the same way llama.cpp classifies its
 /// `cache_[kvrs]_l*`.
 pub fn classify(name: &str, hp: &Hparams) -> Split {
+    // Secondary-model tensors (the DFlash2 drafter) are MIRRORED wholesale:
+    // a ~1 GiB drafter computed redundantly on both cards costs the same
+    // wall time as a split one — the reads run in parallel and no
+    // all-reduce is needed — and mirroring keeps every op (get_rows on
+    // selector tables, grouped conv, per-row top_k) trivially legal.
+    if name.starts_with("dflash.") {
+        return Split::mirrored();
+    }
+
     // GDN head broadcast for qwen35 is [k0_v0, k1_v1, k0_v2, k1_v3] — V must
     // be segmented at K's granularity or head pairing scrambles silently.
     // (Qwen3-Next uses the contiguous pattern; do not copy its rules.)

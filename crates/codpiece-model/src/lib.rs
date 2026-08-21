@@ -288,6 +288,71 @@ impl Weights {
         self.tensors.get(name).copied()
     }
 
+    /// Load a SECOND model's tensors into this Weights' backend, each name
+    /// prefixed with `prefix` (the split callback keys on it — "dflash."
+    /// tensors mirror). This is how a drafter shares the trunk's device so
+    /// one graph can mix both models' tensors. Returns the loaded GGUF for
+    /// metadata access.
+    pub fn load_more(
+        &mut self,
+        path: &Path,
+        prefix: &str,
+    ) -> Result<GgufFile, ModelError> {
+        let gguf = GgufFile::open(path)?;
+        let mut file = File::open(path)?;
+        unsafe {
+            let params = ffi::ggml_init_params {
+                mem_size: (gguf.tensors.len() + 8) * ffi::ggml_tensor_overhead(),
+                mem_buffer: std::ptr::null_mut(),
+                no_alloc: true,
+            };
+            let ctx = ffi::ggml_init(params);
+            if ctx.is_null() {
+                return Err(ModelError::Load("ggml_init (secondary)".into()));
+            }
+            let mut created: Vec<(String, *mut ffi::ggml_tensor)> = Vec::new();
+            for info in &gguf.tensors {
+                let ne: Vec<i64> = info.dims.iter().map(|&d| d as i64).collect();
+                let t = ffi::ggml_new_tensor(
+                    ctx,
+                    info.ty.0 as ffi::ggml_type,
+                    ne.len() as std::os::raw::c_int,
+                    ne.as_ptr(),
+                );
+                if t.is_null() {
+                    return Err(ModelError::Load(format!("tensor create: {}", info.name)));
+                }
+                let full = format!("{prefix}{}", info.name);
+                let cname = CString::new(full.as_str())
+                    .map_err(|_| ModelError::Load("NUL in tensor name".into()))?;
+                ffi::ggml_set_name(t, cname.as_ptr());
+                created.push((full, t));
+            }
+            let buf = ffi::ggml_backend_alloc_ctx_tensors(ctx, self.backends[0]);
+            if buf.is_null() {
+                ffi::ggml_free(ctx);
+                return Err(ModelError::Load("secondary buffer alloc".into()));
+            }
+            let mut scratch: Vec<u8> = Vec::new();
+            for (info, (_, t)) in gguf.tensors.iter().zip(&created) {
+                let size = ffi::ggml_nbytes(*t);
+                if scratch.len() < size {
+                    scratch.resize(size, 0);
+                }
+                file.seek(SeekFrom::Start(gguf.data_start + info.offset))?;
+                file.read_exact(&mut scratch[..size])?;
+                ffi::ggml_backend_tensor_set(*t, scratch.as_ptr().cast(), 0, size);
+                self.bytes_loaded += size as u64;
+            }
+            self.ctxs.push(ctx);
+            self.buffers.push(buf);
+            for (n, t) in created {
+                self.tensors.insert(n, t);
+            }
+        }
+        Ok(gguf)
+    }
+
     /// Primary backend (device 0). Single-device models compute on it
     /// directly; multi-device models use `sched()` instead.
     pub fn backend(&self) -> ffi::ggml_backend_t {

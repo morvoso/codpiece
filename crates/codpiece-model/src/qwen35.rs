@@ -150,6 +150,9 @@ impl Hparams {
 pub struct Qwen35 {
     pub weights: Weights,
     pub hp: Hparams,
+    /// Layers whose INPUT hidden states every graph exports (the DFlash2
+    /// drafter consumes them). Empty = no taps. Set once before serving.
+    pub tap_layers: Vec<usize>,
 }
 
 /// Layer tensor handles, resolved per graph build.
@@ -283,6 +286,8 @@ struct Built {
     /// sample the chain can condition on (null unless the round samples)
     inp_gumbel: *mut ffi::ggml_tensor,
     inp_pos: *mut ffi::ggml_tensor,
+    /// layer-input hiddens at tap_layers, [n_embd, t_len] each
+    taps: Vec<*mut ffi::ggml_tensor>,
     kq_mask: *mut ffi::ggml_tensor,
     /// set_rows write positions (cached decode graphs only)
     row_ids: *mut ffi::ggml_tensor,
@@ -387,6 +392,9 @@ pub(crate) unsafe fn trace_mem(what: &str, galloc: ffi::ggml_gallocr_t, n_kv: i6
 pub struct Session {
     pub n_ctx_max: usize,
     pub n_past: usize,
+    /// Tap features of the most recent graph run, `[n_taps * n_embd]` per
+    /// token in batch order — filled only when the model has tap_layers.
+    pub last_taps: Vec<f32>,
     /// RoPE position minus physical row position. Zero for text-only
     /// conversations. An image chunk of nx x ny merged patches occupies
     /// nx*ny physical rows but advances the RoPE clock by only max(nx, ny)
@@ -562,6 +570,7 @@ impl Session {
             Ok(Session {
                 n_ctx_max,
                 n_past: 0,
+                last_taps: Vec::new(),
                 rope_off: 0,
                 k_slots,
                 fa,
@@ -891,7 +900,8 @@ impl Qwen35 {
     pub fn load_on(path: &std::path::Path, device: crate::Device) -> Result<Qwen35, ModelError> {
         let weights = Weights::load(path, device)?;
         let hp = Hparams::from_gguf(&weights.gguf)?;
-        Ok(Qwen35 { weights, hp })
+        Ok(Qwen35 {
+            tap_layers: Vec::new(), weights, hp })
     }
 
     fn t(&self, name: &str) -> Result<*mut ffi::ggml_tensor, ModelError> {
@@ -960,6 +970,7 @@ impl Qwen35 {
             out_positions,
             n_threads,
             false,
+            None,
         )? {
             StepOut::Logits(l) => Ok(l),
             _ => unreachable!("stateless forward returns logits"),
@@ -1022,7 +1033,11 @@ impl Qwen35 {
         let wants_all = out_positions.len() == tokens.len()
             && out_positions.iter().enumerate().all(|(i, p)| *p == i as i32);
         let out = if cacheable && session.fa && (out_positions == [0] || wants_all) {
-            self.step_cached(session, tokens, n_threads, greedy)?.0
+            let (o, _h, tv) = self.step_cached(session, tokens, n_threads, greedy)?;
+            if !tv.is_empty() {
+                session.last_taps = tv;
+            }
+            o
         } else {
             let view = session.view();
             let galloc = session.galloc;
@@ -1037,6 +1052,7 @@ impl Qwen35 {
                 out_positions,
                 n_threads,
                 greedy,
+                Some(&mut session.last_taps),
             )?
         };
         session.n_past += tokens.len();
@@ -1145,6 +1161,10 @@ impl Qwen35 {
             let out_ids = [(t - 1) as i32];
             ffi::ggml_backend_tensor_set(built.out_ids, out_ids.as_ptr().cast(), 0, 4);
             self.compute(built.gf, n_threads)?;
+            let tv = self.read_taps(&built, t);
+            if !tv.is_empty() {
+                session.last_taps = tv;
+            }
         }
         session.n_past += t;
         session.rope_off += nx.max(ny) as i64 - t as i64;
@@ -1163,6 +1183,7 @@ impl Qwen35 {
         out_positions: &[i32],
         n_threads: i32,
         greedy: bool,
+        taps_out: Option<&mut Vec<f32>>,
     ) -> Result<StepOut, ModelError> {
         assert!(!tokens.is_empty());
         assert!(!out_positions.is_empty());
@@ -1212,6 +1233,9 @@ impl Qwen35 {
             }
             self.fill_inputs(&built, tokens, n_past, rope_base, out_positions);
             self.compute(built.gf, n_threads)?;
+            if let Some(o) = taps_out {
+                *o = self.read_taps(&built, tokens.len());
+            }
             Ok(self.read_out(&built, out_positions.len()))
         }
     }
@@ -1442,7 +1466,10 @@ impl Qwen35 {
         // turns it on for both the verify and the draft.
         let both_cached = std::env::var("CODPIECE_BOTH_CACHED").is_ok();
         if session.fa && (!self.weights.is_tensor_parallel() || both_cached) {
-            let (out, hidden) = self.step_cached(session, tokens, n_threads, greedy)?;
+            let (out, hidden, tv) = self.step_cached(session, tokens, n_threads, greedy)?;
+            if !tv.is_empty() {
+                session.last_taps = tv;
+            }
             session.n_past += tokens.len();
             let preds = match out {
                 StepOut::Tokens(ids) => ids,
@@ -1706,6 +1733,7 @@ impl Qwen35 {
 
             let mut preds = vec![0i32; no];
             ffi::ggml_backend_tensor_get(b.out, preds.as_mut_ptr().cast(), 0, no * 4);
+            let taps_v = self.read_taps(b, t);
             let mut conf: Vec<Vec<f32>> = Vec::new();
             for tnsr in &b.draft_conf {
                 let mut c = vec![0f32; no];
@@ -1750,6 +1778,9 @@ impl Qwen35 {
             }
 
             session.n_past += t;
+            if !taps_v.is_empty() {
+                session.last_taps = taps_v;
+            }
             Ok(FusedOut {
                 preds: preds.into_iter().map(|v| v as u32).collect(),
                 chain,
@@ -2082,7 +2113,7 @@ impl Qwen35 {
         tokens: &[u32],
         n_threads: i32,
         greedy: bool,
-    ) -> Result<(StepOut, Vec<f32>), ModelError> {
+    ) -> Result<(StepOut, Vec<f32>, Vec<f32>), ModelError> {
         let t_len = tokens.len() as i64;
         let n_kv_exact = (session.n_past + tokens.len()) as i64;
         let kvb = kv_bucket();
@@ -2209,7 +2240,8 @@ impl Qwen35 {
             ffi::ggml_backend_tensor_get(
                 b.h_out, hidden.as_mut_ptr().cast(), 0, hidden.len() * 4,
             );
-            Ok((self.read_out(b, t), hidden))
+            let tv = self.read_taps(b, t);
+            Ok((self.read_out(b, t), hidden, tv))
         }
     }
 
@@ -2346,7 +2378,14 @@ impl Qwen35 {
         let elt = ffi::ggml_type_size(f32t);
         let row = |n: i64| ffi::ggml_row_size(f32t, n);
 
+        let mut taps: Vec<*mut ffi::ggml_tensor> = Vec::new();
+        let collect_taps =
+            !self.tap_layers.is_empty() && !matches!(seq, SeqMode::Batched);
         for il in 0..hp.n_layer {
+            if collect_taps && self.tap_layers.contains(&il) {
+                ffi::ggml_set_output(inp_l);
+                taps.push(inp_l);
+            }
             let l = self.layer(il)?;
             let inp_sa = inp_l;
 
@@ -2759,6 +2798,7 @@ impl Qwen35 {
             inp_embd,
             inp_gumbel,
             inp_pos,
+            taps,
             kq_mask,
             row_ids,
             conv_zero,
@@ -3335,6 +3375,26 @@ pub(crate) unsafe fn build_attn_block(
             0,
             out_positions.len() * 4,
         );
+    }
+
+    /// Assemble the tap features of a just-computed graph: per token, the
+    /// tapped layers' input hiddens concatenated in tap-layer order.
+    unsafe fn read_taps(&self, b: &Built, t: usize) -> Vec<f32> {
+        if b.taps.is_empty() || t == 0 {
+            return Vec::new();
+        }
+        let ne = self.hp.n_embd as usize;
+        let nl = b.taps.len();
+        let mut out = vec![0f32; t * nl * ne];
+        let mut tmp = vec![0f32; t * ne];
+        for (li, tap) in b.taps.iter().enumerate() {
+            ffi::ggml_backend_tensor_get(*tap, tmp.as_mut_ptr().cast(), 0, t * ne * 4);
+            for tok in 0..t {
+                out[tok * nl * ne + li * ne..tok * nl * ne + (li + 1) * ne]
+                    .copy_from_slice(&tmp[tok * ne..(tok + 1) * ne]);
+            }
+        }
+        out
     }
 
     unsafe fn compute(&self, gf: *mut ffi::ggml_cgraph, n_threads: i32) -> Result<(), ModelError> {
