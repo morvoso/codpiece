@@ -70,6 +70,12 @@ services:
       # what keeps a long-context server from accumulating shapes until an
       # allocation fails. Only set this to override that.
       CODPIECE_GRAPH_CACHE_MIB: ${CODPIECE_GRAPH_CACHE_MIB:-}
+      # Diagnostics passthrough (all off unless set in .env). TRACE_REUSE
+      # logs why a prefix-cache lookup missed — the difference between a
+      # 0.9s and a 70s time-to-first-token on a long conversation.
+      CODPIECE_TRACE_REUSE: ${CODPIECE_TRACE_REUSE:-}
+      CODPIECE_TRACE_VRAM: ${CODPIECE_TRACE_VRAM:-}
+      CODPIECE_DECODE_TRACE: ${CODPIECE_DECODE_TRACE:-}
     entrypoint: /src/target/release/codpiece
     command: >-
       serve /models/qwen38/${MODEL_FILE:-Qwen3.8-27B-UD-Q8_K_XL.gguf}

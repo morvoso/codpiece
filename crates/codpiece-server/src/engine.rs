@@ -689,19 +689,25 @@ fn worker(
             }
         };
         clock += 1;
-        let slot = pool
-            .iter()
-            .position(|(_, h, _)| {
-                !h.is_empty() && h.len() < prompt_ids.len() && prompt_ids[..h.len()] == h[..]
-            })
-            .unwrap_or_else(|| {
-                // A miss with a plausible-looking pool is worth explaining: prefix
-                // reuse lives or dies on token-exact matches, and the usual killer is
-                // a BPE merge across the boundary between a cached prompt and text
-                // appended to it.
-                if std::env::var("CODPIECE_TRACE_REUSE").as_deref() == Ok("1") {
+        let trace_reuse = std::env::var("CODPIECE_TRACE_REUSE").as_deref() == Ok("1");
+        let hit = pool.iter().position(|(_, h, _)| {
+            !h.is_empty() && h.len() < prompt_ids.len() && prompt_ids[..h.len()] == h[..]
+        });
+        if trace_reuse {
+            match hit {
+                Some(i) => eprintln!(
+                    "[reuse] HIT slot {i}: {} of {} prompt tokens already cached",
+                    pool[i].1.len(),
+                    prompt_ids.len()
+                ),
+                None => {
+                    // A miss with a plausible-looking pool is worth explaining:
+                    // prefix reuse lives or dies on token-exact matches, and the
+                    // usual killers are a BPE merge across the append boundary or
+                    // the client re-rendering earlier turns differently.
                     for (i, (_, h, _)) in pool.iter().enumerate() {
                         if h.is_empty() {
+                            eprintln!("[reuse] miss slot {i}: history empty (cold)");
                             continue;
                         }
                         let div = h
@@ -709,21 +715,32 @@ fn worker(
                             .zip(&prompt_ids)
                             .position(|(a, b)| a != b)
                             .unwrap_or(h.len().min(prompt_ids.len()));
+                        // decoded text around the divergence is what makes the
+                        // cause legible; token ids alone are not
+                        let ctx = |ids: &[u32]| {
+                            let lo = div.saturating_sub(12);
+                            let hi = (div + 12).min(ids.len());
+                            tok.decode(&ids[lo..hi], true)
+                        };
                         eprintln!(
-                            "[reuse] miss slot {i}: history {} tok, prompt {} tok, diverge at {div}                              (history {:?} vs prompt {:?})",
+                            "[reuse] MISS slot {i}: history {} tok, prompt {} tok, diverge at {div}\n\
+                             [reuse]   history: ...{:?}\n[reuse]   prompt:  ...{:?}",
                             h.len(),
                             prompt_ids.len(),
-                            &h[div.saturating_sub(3)..(div + 3).min(h.len())],
-                            &prompt_ids[div.saturating_sub(3)..(div + 3).min(prompt_ids.len())]
+                            ctx(h),
+                            ctx(&prompt_ids),
                         );
                     }
                 }
-                pool.iter()
-                    .enumerate()
-                    .min_by_key(|(_, (_, _, used))| *used)
-                    .map(|(i, _)| i)
-                    .expect("pool is never empty")
-            });
+            }
+        }
+        let slot = hit.unwrap_or_else(|| {
+            pool.iter()
+                .enumerate()
+                .min_by_key(|(_, (_, _, used))| *used)
+                .map(|(i, _)| i)
+                .expect("pool is never empty")
+        });
         let (session, history, used) = &mut pool[slot];
         *used = clock;
         // Scoring replaces generation rather than preceding it: it needs
