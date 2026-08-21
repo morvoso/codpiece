@@ -246,6 +246,31 @@ speculation, 85.8 vs 53.3 with it.** The forward is at parity; speculation
 is the whole advantage, and raising *acceptance* is therefore the only
 lever left that matters.
 
+### Why tree verification does not rescue this
+
+Acceptance is the only lever left — 4.58 of 7 drafts, and a drafted token
+costs 2.1 ms at the margin — so verifying a *tree* of candidates rather
+than one chain is the textbook next move, and the DFlash lattice already
+emits top-16 candidates per position to build one from.
+
+It does not transfer to this model. A tree is free for attention, which is
+stateless given a mask, but 48 of Qwen3.8's 65 layers are gated-delta-net
+recurrent, and recurrent state is sequential: two siblings sharing a parent
+both need the parent's state, so a graph that walks `[P, A, B]` as one
+sequence computes B's state from A's and is simply wrong. Correct tree
+verification needs per-branch recurrent state — and this engine's own
+rollback shows the price, since `rollback_recurrent` restores a per-step
+snapshot and each slot is ~160 MB of conv + GDN state. Four leaves is
+~480 MB, eight is ~1.3 GB, competing directly with the shipped context.
+
+Because the lattice's branches diverge immediately after the root, a tree
+here degenerates into verifying N independent chains, forfeiting the
+shared-prefix saving that makes the technique worthwhile elsewhere. Two
+chains would take the round from ~56 ms to ~73 ms to raise acceptance from
+4.58 to perhaps 6: about +17%, for an extra 160 MB and a rewrite of the
+verify batch and its rollback. The hybrid architecture that makes long
+context cheap here is the same thing that makes tree speculation dear.
+
 ### Three hypotheses that measurement killed
 
 1. **"Merge the inject and draft graphs."** Estimated at 5–8 ms. The split
