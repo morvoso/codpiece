@@ -53,10 +53,16 @@ pub fn prefill_chunk_for(n_ctx: usize) -> usize {
         const CARD_GIB: f64 = 23.5;
         CARD_GIB - WEIGHTS_GIB - n_ctx as f64 * 65536.0 / 2.0 / (1u64 << 30) as f64
     });
+    // Calibrated on an 88K prompt at ctx 98304 (1.15 GiB free after warmup):
+    // chunk 128 gave 865 tok/s, 256 gave 963 (+11%), 384 gave 950 and cost
+    // more VRAM -- so 256 is the knee, and it settles at 0.71 GiB free
+    // against 128's 0.73, i.e. the extra headroom 128 bought was worth
+    // nothing. Larger chunks eventually lose to graph-cache pressure, which
+    // is what 384 is already showing.
     match free {
-        f if f > 2.5 => 512,
-        f if f > 1.5 => 256,
-        f if f > 0.9 => 128,
+        f if f > 2.0 => 512,
+        f if f > 0.9 => 256,
+        f if f > 0.5 => 128,
         _ => 64,
     }
 }

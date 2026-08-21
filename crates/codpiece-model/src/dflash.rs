@@ -131,7 +131,15 @@ pub struct DflashCache {
     injects: Vec<CachedInjectGraph>,
 }
 
+/// Diagnostic: when false the graph stops at the logits and the whole
+/// top-k + selector-lattice tail is left unexpanded, so ggml never executes
+/// it. Set by CODPIECE_DFLASH_NOLATTICE=1 to price that tail against the
+/// drafter's own weight reads — the block graph measures 13.9ms against a
+/// ~3ms bandwidth floor and this says how much of the gap is the lattice.
+/// Drafting produces nothing in this mode, so decode falls back to one
+/// token per round: it is a measurement setting, not a serving one.
 struct CachedDraftGraph {
+    lattice: bool,
     ctx: *mut ffi::ggml_context,
     gf: *mut ffi::ggml_cgraph,
     galloc: ffi::ggml_gallocr_t,
@@ -545,6 +553,16 @@ impl Dflash {
 
             self.compute(g.gf, n_threads)?;
 
+            if !g.lattice {
+                // the lattice was never expanded, so its outputs hold nothing
+                // to read; an empty lattice walks to zero drafts
+                return Ok(Lattice {
+                    cand: Vec::new(),
+                    scores: Vec::new(),
+                    top_k: hp.selector_top_k,
+                });
+            }
+
             let mut cand_ids = vec![0i32; hp.block_size * hp.selector_top_k];
             ffi::ggml_backend_tensor_get(
                 g.cand,
@@ -766,9 +784,18 @@ impl Dflash {
             let h_out = rms(ctx, inp_l, self.t("output_norm.weight")?);
             let logits = ffi::ggml_mul_mat(ctx, self.output, h_out);
 
+            let no_lattice =
+                std::env::var("CODPIECE_DFLASH_NOLATTICE").as_deref() == Ok("1");
+            if no_lattice {
+                ffi::ggml_set_output(logits);
+                ffi::ggml_build_forward_expand(gf, logits);
+            }
+
             let cand = ffi::ggml_top_k(ctx, logits, top_k as i32);
             ffi::ggml_set_output(cand);
-            ffi::ggml_build_forward_expand(gf, cand);
+            if !no_lattice {
+                ffi::ggml_build_forward_expand(gf, cand);
+            }
             let vocab_rows = (*logits).ne[0];
             let unary = ffi::ggml_get_rows(
                 ctx,
@@ -840,7 +867,9 @@ impl Dflash {
                 );
                 let flat = ffi::ggml_reshape_1d(ctx, ffi::ggml_cont(ctx, scores), top_k * top_k);
                 ffi::ggml_set_output(flat);
-                ffi::ggml_build_forward_expand(gf, flat);
+                if !no_lattice {
+                    ffi::ggml_build_forward_expand(gf, flat);
+                }
                 packed.push(flat);
             }
 
@@ -855,7 +884,17 @@ impl Dflash {
                 return Err(ModelError::Load("dflash draft alloc".into()));
             }
             ffi::ggml_graph_set_new_uid(gf);
-            Ok(CachedDraftGraph { ctx, gf, galloc, inp_tokens, inp_pos, kq_mask, cand, packed })
+            Ok(CachedDraftGraph {
+                lattice: !no_lattice,
+                ctx,
+                gf,
+                galloc,
+                inp_tokens,
+                inp_pos,
+                kq_mask,
+                cand,
+                packed,
+            })
         }
     }
 
