@@ -62,6 +62,50 @@ YaRN is owed), and cached graphs always round `n_kv` *up* to a bucket
 capped at `n_ctx`, so the causal mask never truncates. A benchmark that
 fails should be suspected as hard as the code it accuses.
 
+## What context costs, on 48 GiB
+
+Every context decision on this box is a memory decision, so the server
+reports per-GPU VRAM at startup and (with `CODPIECE_TRACE_VRAM=1`) per
+request. Measured with the full production stack resident — Q8 weights,
+DFlash Q4 drafter, vision tower — and one session:
+
+| context | card 0 free | card 1 free | verdict |
+|---|---|---|---|
+| 98304 | 2.00 GiB | 1.15 GiB | fits; settles near 0.2 GiB under load |
+| 114688 | 1.50 GiB | 0.65 GiB | peak 24.09 of 24.58 GiB — too close |
+| 131072 | — | — | 500s on the first request |
+| 131072, no vision | 1.00 GiB | 1.01 GiB | fits; the vision tower costs ~0.87 GiB |
+
+Card 1 is always the tight one: it carries the vision tower. The drafter
+is mirrored, so it costs its ~1.2 GiB on *both* cards.
+
+Three defects surfaced here, all of them memory accounting that was blind
+to what was actually resident:
+
+1. **Compiled graph shapes were cached by count, not size.** A prefill
+   graph's compute buffer scales with `n_kv * chunk` — ~78 MiB each at
+   98K — and twelve of those do not fit in 1.15 GiB. Consecutive long
+   requests land in different `n_kv` buckets (prefix reuse guarantees
+   it), so the cache grew per request until an allocation failed. Now
+   bounded by bytes, defaulting to 40% of measured free VRAM.
+2. **The prefill chunk was sized from a static formula** that knew
+   nothing about the drafter or the vision tower. At 98K it computed
+   4 GiB free where the driver reported 1.15, and chose the largest
+   chunk accordingly. It now reads real headroom — at a measured cost of
+   ~20% long-prompt prefill throughput, which is the price of not dying.
+3. **Failed allocations are not always recoverable.** `Session::new_spec`
+   checks its buffer for null, yet creating the batch session still took
+   the process down: the failure aborts deeper in the backend than any
+   error path reaches. Sessions are now *priced before they are created*
+   and declined with a log line if they will not fit:
+
+   ```
+   serve: batch session needs ~960 MiB per card (+25% margin) but only
+          484 MiB is free; declining it rather than risking the process
+   ```
+
+   Serving serially is slower; taking the process down is worse.
+
 ## Where a decode round's time actually goes
 
 Measured with `CODPIECE_BATCH_TRACE=1` / `CODPIECE_DECODE_TRACE=1`.
