@@ -69,6 +69,48 @@ server over the API only, so generated code cannot touch the box — that
 isolation is the reason the gate is opened at all, not a formality worked
 around.
 
+## MMLU — and the off-by-one that made it look like chance
+
+Loglikelihood-scored, so it runs entirely on the `echo` + `logprobs` path
+and could not run at all before that existed. 0-shot, 60 questions per
+subject, scored by token ids the harness tokenizes itself.
+
+| subject | before the fix | after |
+|---|---|---|
+| college computer science | 25.0% | **81.7% ± 5.0** |
+| high school mathematics | 21.7% | **60.0% ± 6.4** |
+| professional law | 26.7% | **68.3% ± 6.1** |
+
+The first column is chance (four choices). The scoring was never wrong —
+each of these was checked directly:
+
+- hand-scoring an MMLU question's four continuations gives the correct
+  answer −0.658 against −8.8, −9.2 and −11.7;
+- a 60-token prefix scored alone and inside a 131-token prompt agrees on
+  **0 of 59** positions differing, so chunked scoring is exact;
+- the tokenizer lm-eval downloads produces byte-identical ids to the
+  GGUF's own, both directions.
+
+The bug was the response *shape*. OpenAI, given `echo` with
+`max_tokens: 1`, returns the prompt tokens **plus the generated one**, and
+the harness reads `token_logprobs[ctxlen:-1]` — dropping that trailing
+entry. Returning only the prompt made that slice drop the last *prompt*
+token instead, which for MMLU is the answer letter. A one-token
+continuation then leaves an empty list, `sum([]) == 0.0` for all four
+candidates, they tie, argmax takes the first, and the result is chance by
+construction — on any harness that slices this way.
+
+Found by pointing the harness at a logging HTTP stub, reading the request
+it actually sends, then reading its parser. Worth the detour: a
+chance-level score reads as a model or engine property, and this was
+neither.
+
+Two other integration defects surfaced the same way and are fixed: the
+harness sends prompts in OpenAI's batch form `[[ids]]` (rejected with a
+400 that, from its side, looked like no logprobs support at all), and
+scoring requests could be swept into the batch path, which would have
+answered them as ordinary generation with no logprobs field.
+
 ## Long-context retrieval
 
 Needle-in-a-haystack through `/v1/chat/completions`, unique filler lines
