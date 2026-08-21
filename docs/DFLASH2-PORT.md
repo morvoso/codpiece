@@ -103,3 +103,21 @@ Draft weights: Q8_0 1.9 GB split across cards (~0.95/card) or Q4_K_M
 40 MB. Feature path adds no persistent buffers (fused injection). Prod
 headroom after vision is ~1.1 GB/card: Q4_K_M fits today; Q8 needs either
 CODPIECE_SESSIONS=1 or the smaller quant — A/B both, quality first.
+
+
+## Status — SHIPPED 2026-08-20 (opt-in via --dflash)
+
+Engine-integrated and gated. Greedy requests draft by block diffusion;
+sampled requests keep the gumbel-coupled chain (measured better: block
+positions past ~3 compound to nothing at temperature while paying vocab
+noise and wide verifies). The selector lattice is ALWAYS walked greedily —
+coupled verification accepts draft x with probability p_target(x), so the
+mode is optimal and the reference's temperature walk only decorrelates
+(0.119 vs ~0.5 measured). Draft and inject graphs build once, replay
+uid-stamped; meta graph pool 32.
+
+Headline (192 tok, 2 reps, same window): prose 71.2 vs MTP 58.4, code
+82.2 vs 62.5, arithmetic 117.4 vs 86.1 tok/s; accepted/call 2.84-5.57 vs
+1.58-2.76. Text identity 2/3 IDENTICAL, 1/3 the known batched-argmax tie
+class. Prod enablement pending a VRAM fit (Q8 needs 1.9 GB/card beside
+vision + 2 sessions; Q4_K_M or CODPIECE_SESSIONS=1 are the candidates).

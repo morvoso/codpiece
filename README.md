@@ -106,6 +106,7 @@ streaming and non-streaming responses.
 | `CODPIECE_SESSIONS` | 2 (≤70K ctx) | conversations kept resident in VRAM |
 | `CODPIECE_BATCH` | 4 | slots for concurrent requests |
 | `CODPIECE_MMPROJ` | unset | vision tower path (alternative to `--mmproj`) |
+| `--dflash PATH` / `CODPIECE_DFLASH` | unset | DFlash2 block drafter: +22-37% greedy decode (needs ~1.9 GB VRAM for the Q8 draft) |
 | `CODPIECE_IMAGE_MIN_TOKENS` | 1024 | image detail floor; Qwen-VL reads text poorly below this |
 
 The defaults maximize throughput. Acceptance ratio is a conversion
@@ -129,8 +130,9 @@ windows. llama.cpp is b10423 in its production configuration.
 
 | measurement | codpiece | llama.cpp | vLLM (FP8) |
 |---|---|---|---|
-| greedy decode, prose | **69.9 tok/s** | 64.5 | 76–95 |
-| greedy decode, code | **67.6** | 53.3 | — |
+| greedy decode, prose | **71.2 tok/s** | 64.5 | 76–95 |
+| greedy decode, code | **82.2** | 53.3 | — |
+| greedy decode, arithmetic | **117.4** | — | — |
 | sampled (temp 1.0), short | **45.2** | 32.4 | — |
 | sampled, 32K context | 47.4 | **52.7** | — |
 | prefill, 32K prompt | 1,337 | 1,353 | — |
@@ -139,6 +141,13 @@ windows. llama.cpp is b10423 in its production configuration.
 | speculation acceptance | 0.64–0.73 (0.91–0.93 opt-in) | ~0.78 | — |
 | vision (same page, same question) | same answer, 847 tok/s prefill | same, 837 | n/a |
 | greedy output parity | byte-identical | reference | not comparable (FP8) |
+
+The greedy rows are measured with the DFlash2 block drafter
+(`--dflash`), which drafts up to 7 tokens per call through a 1.9B
+block-diffusion model and wins every greedy prompt class by 22-37%;
+without it the MTP-head numbers are 58-86 by class. Sampled decode
+routes to the gumbel-coupled chain automatically — measured better
+there.
 
 Honest caveats: llama.cpp still wins sampled decode at 32K by ~10% and can
 run 196K context where codpiece's speculation stops near 145K. Its higher
