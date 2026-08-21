@@ -670,7 +670,7 @@ fn cmd_fused(args: &[String]) -> ExitCode {
                 })
         } else {
             model
-                .step_fused_cached(session, batch, d, cands, last_only, false, threads)
+                .step_fused_cached(session, batch, d, cands, last_only, false, None, threads)
                 .map(|o| (o.preds, o.chain))
         }
     };

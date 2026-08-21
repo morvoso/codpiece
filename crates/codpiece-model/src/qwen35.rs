@@ -278,6 +278,10 @@ struct Built {
     /// raw [n_embd, t_len] input in place of the token lookup: image chunks
     /// feed the vision tower's output here (null on token graphs)
     inp_embd: *mut ffi::ggml_tensor,
+    /// T-scaled gumbel noise [n_vocab, n_out] added to the trunk logits
+    /// before the in-graph argmax, turning it into an exact temperature
+    /// sample the chain can condition on (null unless the round samples)
+    inp_gumbel: *mut ffi::ggml_tensor,
     inp_pos: *mut ffi::ggml_tensor,
     kq_mask: *mut ffi::ggml_tensor,
     /// set_rows write positions (cached decode graphs only)
@@ -657,6 +661,8 @@ struct BatchStep {
 }
 
 struct FusedStep {
+    /// whether this shape carries the gumbel-noise input
+    gumbel: bool,
     built: Built,
     galloc: ffi::ggml_gallocr_t,
     bucket: i64,
@@ -1082,6 +1088,7 @@ impl Qwen35 {
                 None,
                 SeqMode::Single,
                 /* embd_input */ true,
+                false,
             )?;
             // odd-shaped step: the frozen decode allocation no longer holds
             session.cached = None;
@@ -1538,9 +1545,23 @@ impl Qwen35 {
         cands: Option<&[i32]>,
         last_only: bool,
         want_logits: bool,
+        // T-scaled gumbel noise, [n_vocab * n_out] row-major per position:
+        // turns the in-graph argmax into an exact temperature sample the
+        // chain conditions on. None keeps plain argmax (greedy / prefill).
+        noise_t: Option<&[f32]>,
         n_threads: i32,
     ) -> Result<FusedOut, ModelError> {
         let n_cand = cands.map(|c| c.len() as i64).unwrap_or(0);
+        let gumbel = noise_t.is_some();
+        if let Some(nz) = noise_t {
+            let want = self.hp.n_vocab as usize * if last_only { 1 } else { tokens.len() };
+            if nz.len() != want {
+                return Err(ModelError::Load(format!(
+                    "gumbel noise: {} floats, expected {want}",
+                    nz.len()
+                )));
+            }
+        }
         if session.n_past + tokens.len() > session.n_ctx_max {
             return Err(ModelError::Load("context overflow".into()));
         }
@@ -1570,6 +1591,7 @@ impl Qwen35 {
                     && c.n_out == n_out
                     && c.n_cand == n_cand
                     && c.depth == depth
+                    && c.gumbel == gumbel
             });
             let idx = match hit {
                 Some(i) => {
@@ -1609,6 +1631,7 @@ impl Qwen35 {
                         Some(tail),
                         SeqMode::Single,
                         false,
+                        gumbel,
                     )?;
                     let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                         self.weights.backend(),
@@ -1625,6 +1648,7 @@ impl Qwen35 {
                     // a replay from a new graph and skip rebuilding its per-device map.
                     ffi::ggml_graph_set_new_uid(built.gf);
                     session.fused.push(FusedStep {
+                        gumbel,
                         built,
                         galloc: ga,
                         bucket,
@@ -1649,6 +1673,9 @@ impl Qwen35 {
 
             let out_positions: Vec<i32> = (first_out..t).map(|i| i as i32).collect();
             self.fill_inputs(b, tokens, session.n_past, session.rope_base(), &out_positions);
+            if let Some(nz) = noise_t {
+                ffi::ggml_backend_tensor_set(b.inp_gumbel, nz.as_ptr().cast(), 0, nz.len() * 4);
+            }
             let rows: Vec<i64> = (0..t).map(|i| (session.n_past + i) as i64).collect();
             ffi::ggml_backend_tensor_set(b.row_ids, rows.as_ptr().cast(), 0, t * 8);
 
@@ -2078,6 +2105,7 @@ impl Qwen35 {
                     None,
                     SeqMode::Single,
                     false,
+                    false,
                 )?;
                 let galloc = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                     self.weights.backend(),
@@ -2205,7 +2233,7 @@ impl Qwen35 {
         };
         self.build_inner(
             t_len, n_kv, state, n_out, use_set_rows, n_past, greedy, mtp_tail, SeqMode::Single,
-            false,
+            false, false,
         )
     }
 
@@ -2224,6 +2252,7 @@ impl Qwen35 {
         mtp_tail: Option<MtpTail>,
         seq: SeqMode,
         embd_input: bool,
+        gumbel: bool,
     ) -> Result<Built, ModelError> {
         let hp = &self.hp;
 
@@ -2560,12 +2589,24 @@ impl Qwen35 {
         let logits_t = cur;
         ffi::ggml_set_output(logits_t);
         ffi::ggml_build_forward_expand(gf, logits_t);
+        let mut inp_gumbel: *mut ffi::ggml_tensor = std::ptr::null_mut();
         if greedy {
             // Sample in the graph: the readback becomes 4 bytes instead of
             // n_vocab floats (993 KB for this model), removing a full
             // device sync + PCIe transfer from every decode step. Exact for
             // temp-0: ggml_argmax selects the same element CPU argmax would.
-            cur = ffi::ggml_argmax(ctx, cur);
+            // With gumbel noise added first, the same argmax becomes an exact
+            // temperature sample — argmax(l + g*T) = argmax(l/T + g), the
+            // gumbel-max draw from softmax(l/T) — so the draft chain below
+            // conditions on the token the host will actually commit.
+            if gumbel {
+                let gz = ffi::ggml_new_tensor_2d(ctx, f32t, hp.n_vocab, n_out);
+                ffi::ggml_set_input(gz);
+                inp_gumbel = gz;
+                cur = ffi::ggml_argmax(ctx, ffi::ggml_add(ctx, logits_t, gz));
+            } else {
+                cur = ffi::ggml_argmax(ctx, cur);
+            }
         }
         ffi::ggml_set_output(cur);
         ffi::ggml_build_forward_expand(gf, cur);
@@ -2716,6 +2757,7 @@ impl Qwen35 {
             gf,
             inp_tokens,
             inp_embd,
+            inp_gumbel,
             inp_pos,
             kq_mask,
             row_ids,
@@ -3052,6 +3094,7 @@ pub(crate) unsafe fn build_attn_block(
                 None,
                 SeqMode::Slot(slot as i64),
                 false,
+                false,
             )?;
             struct G(*mut ffi::ggml_context);
             impl Drop for G {
@@ -3133,6 +3176,7 @@ pub(crate) unsafe fn build_attn_block(
                     /* greedy */ !want_logits,
                     None,
                     SeqMode::Batched,
+                    false,
                     false,
                 )?;
                 let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(

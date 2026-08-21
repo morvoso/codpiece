@@ -996,7 +996,7 @@ fn run_job(
         let tail = &prompt_ids[split..];
         debug_assert!(!tail.is_empty());
         let d0 = if cfg.depth == usize::MAX { cfg.max_depth } else { cfg.depth };
-        match model.step_fused_cached(session, tail, d0, None, false, !greedy, cfg.threads)
+        match model.step_fused_cached(session, tail, d0, None, false, !greedy, None, cfg.threads)
         {
             Ok(o) => {
                 let (preds, chain, logits) = (o.preds, o.chain, o.logits);
@@ -1042,6 +1042,55 @@ fn run_job(
     // time on flat text, dropping that round's drafts — so deep chains are built to be
     // thrown away. Measured at 32K, temperature 1.0: depth 1 = 44.0 tok/s (acceptance
     // 0.78, exactly production's figure), depth 2 = 47.1, depth 3 = 44.3.
+    // Gumbel-coupled sampling: the graph argmaxes (logits + T*g) — an exact
+    // temperature sample by the gumbel-max property — so the draft chain
+    // conditions on the token the host commits instead of the argmax it may
+    // diverge from. That divergence dropped ~half of all sampled drafts and
+    // was the structural cause of the 32K sampled deficit. `plain` means no
+    // filter or penalty is active, in which case the graph's sample IS the
+    // commit; otherwise the host re-argmaxes over the filtered support with
+    // the same noise (Sampler::sample_coupled), still exact.
+    let use_gumbel = !greedy
+        && req.params.temp > 0.0
+        && std::env::var("CODPIECE_GUMBEL").as_deref() != Ok("0");
+    let coupling_plain = req.params.coupling_is_exact();
+    let mut noise_t: Vec<f32> = Vec::new();
+    // ~1M gumbels per round cost 6-12 ms generated inline — a sixth of the
+    // round. A dedicated thread with its own seed-derived stream keeps one
+    // buffer ahead while the GPU computes; same seed still means the same
+    // noise. Buffers cover the widest batch a round can present (chain
+    // depth + 1, or the forced think-close).
+    let noise_rx = if use_gumbel {
+        let t = req.params.temp;
+        let vocab = model.hp.n_vocab as usize;
+        let rows = (cfg.depth.clamp(1, 2) + 1).max(req.think_close.len() + 1);
+        let seed = req.params.seed ^ 0x9E37_79B9_7F4A_7C15;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        std::thread::Builder::new()
+            .name("codpiece-gumbel".into())
+            .spawn(move || {
+                let mut rng = codpiece_sample::Rng::new(seed);
+                loop {
+                    let mut v = Vec::with_capacity(rows * vocab);
+                    for _ in 0..rows * vocab {
+                        let u = rng.next_f32().max(1e-12);
+                        v.push(-(-u.ln()).ln() * t);
+                    }
+                    if tx.send(v).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| format!("noise thread: {e}"))?;
+        Some(rx)
+    } else {
+        None
+    };
+    // Sampled chains stay clamped to 2 EVEN under gumbel coupling: coupling
+    // fixes conditioning, not draft quality — a coupled draft is accepted
+    // with the target's own probability of it, which at temperature 1.0 on
+    // flat text is ~0.4, and depth 3 at 0.4/link measured 39.7 tok/s against
+    // 47.3 for the shallower policy. Compounding wins again.
     let fixed = if greedy { cfg.depth.max(1) } else { cfg.depth.clamp(1, 2) };
     let mut picker = crate::depth::DepthPicker::new(
         adaptive,
@@ -1174,6 +1223,10 @@ fn run_job(
         let round_drafts: Vec<u32> = if forcing { forced.clone() } else { drafts.clone() };
         let mut batch = vec![next];
         batch.extend_from_slice(&round_drafts);
+        if let Some(rx) = &noise_rx {
+            noise_t = rx.recv().map_err(|_| "noise thread died".to_string())?;
+            noise_t.truncate(batch.len() * n_vocab);
+        }
         let t_round = std::time::Instant::now();
         let out_round = match model.step_fused_cached(
             session,
@@ -1182,6 +1235,7 @@ fn run_job(
             None,
             false,
             !greedy,
+            if use_gumbel { Some(&noise_t) } else { None },
             cfg.threads,
         ) {
             Ok(v) => v,
@@ -1207,6 +1261,27 @@ fn run_job(
                 true // committed verbatim to close the think block
             } else if greedy {
                 preds[j] == *draft
+            } else if use_gumbel {
+                // The commit at j is the gumbel-max sample: the graph's own
+                // argmax when nothing filters, else the same noise re-argmaxed
+                // over the filtered support. Accepting the draft exactly when
+                // it equals that sample commits an exact sample either way —
+                // same acceptance probability as rejection sampling, and the
+                // chain conditioned on precisely this token.
+                let commit = if coupling_plain {
+                    preds[j]
+                } else {
+                    sampler.sample_coupled(
+                        &logits[j * n_vocab..(j + 1) * n_vocab],
+                        &noise_t[j * n_vocab..(j + 1) * n_vocab],
+                    )
+                };
+                if *draft == commit {
+                    true
+                } else {
+                    replacement = Some(commit);
+                    false
+                }
             } else {
                 let dist = sampler.distribution(&logits[j * n_vocab..(j + 1) * n_vocab]);
                 let roll = sampler.rng().next_f32();
@@ -1259,6 +1334,15 @@ fn run_job(
                 round_depth = picker.choose();
                 if greedy {
                     preds[n_keep]
+                } else if use_gumbel {
+                    if coupling_plain {
+                        preds[n_keep]
+                    } else {
+                        sampler.sample_coupled(
+                            &logits[n_keep * n_vocab..(n_keep + 1) * n_vocab],
+                            &noise_t[n_keep * n_vocab..(n_keep + 1) * n_vocab],
+                        )
+                    }
                 } else {
                     let dist =
                         sampler.distribution(&logits[n_keep * n_vocab..(n_keep + 1) * n_vocab]);
@@ -1280,9 +1364,28 @@ fn run_job(
                 preds[n_keep]
             }
             None => {
-                let dist = sampler.distribution(&logits[n_keep * n_vocab..(n_keep + 1) * n_vocab]);
-                round_depth = gated_depth(picker.choose(), cfg.draft_gate, dist.peak());
-                sampler.draw_from(&dist)
+                if use_gumbel {
+                    round_depth = if cfg.draft_gate > 0.0 {
+                        let dist = sampler
+                            .distribution(&logits[n_keep * n_vocab..(n_keep + 1) * n_vocab]);
+                        gated_depth(picker.choose(), cfg.draft_gate, dist.peak())
+                    } else {
+                        picker.choose()
+                    };
+                    if coupling_plain {
+                        preds[n_keep]
+                    } else {
+                        sampler.sample_coupled(
+                            &logits[n_keep * n_vocab..(n_keep + 1) * n_vocab],
+                            &noise_t[n_keep * n_vocab..(n_keep + 1) * n_vocab],
+                        )
+                    }
+                } else {
+                    let dist =
+                        sampler.distribution(&logits[n_keep * n_vocab..(n_keep + 1) * n_vocab]);
+                    round_depth = gated_depth(picker.choose(), cfg.draft_gate, dist.peak());
+                    sampler.draw_from(&dist)
+                }
             }
         };
         sampler.accept(next);

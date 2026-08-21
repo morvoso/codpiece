@@ -64,6 +64,19 @@ impl Default for SamplerParams {
 }
 
 impl SamplerParams {
+    /// True when no penalty or filter is active, so the in-graph
+    /// gumbel-argmax IS this sampler's exact sample and the host needs no
+    /// recompute at all.
+    pub fn coupling_is_exact(&self) -> bool {
+        self.temp > 0.0
+            && self.top_k == 0
+            && self.top_p >= 1.0
+            && self.min_p <= 0.0
+            && self.penalty_repeat == 1.0
+            && self.penalty_freq == 0.0
+            && self.penalty_present == 0.0
+    }
+
     /// True when the chain can only ever return the argmax, so the caller can keep using
     /// the in-graph argmax and skip reading a vocabulary of logits back over PCIe.
     pub fn is_greedy(&self) -> bool {
@@ -171,6 +184,35 @@ impl Sampler {
     pub fn distribution(&mut self, logits: &[f32]) -> Dist {
         self.build(logits);
         Dist { cand: self.cand.iter().map(|c| (c.id, c.p)).collect() }
+    }
+
+    /// Gumbel-coupled draw. `noise_t[x]` must be `T * Gumbel(0,1)` i.i.d. —
+    /// the same noise the fused graph added to the raw logits before its
+    /// in-graph argmax. Over the filtered candidate set, argmax of
+    /// (penalised logit + noise_t) is an exact sample from this sampler's
+    /// distribution (gumbel-max, restricted to the support, criterion scaled
+    /// by T which preserves the argmax) — and it EQUALS the graph's argmax
+    /// whenever penalties and filters leave the winner alone, which is what
+    /// lets draft chains condition on the committed token.
+    pub fn sample_coupled(&mut self, logits: &[f32], noise_t: &[f32]) -> u32 {
+        assert_eq!(logits.len(), noise_t.len());
+        self.build(logits);
+        // build() leaves candidate logits already divided by T; scale the
+        // T-carrying noise back so the criterion is argmax(l_pen/T + g),
+        // which is the gumbel-max sample of softmax(l_pen/T) over the
+        // support — and T x that criterion is exactly what the graph
+        // argmaxes over the full vocabulary.
+        let inv_t = 1.0 / self.params.temp.max(f32::MIN_POSITIVE);
+        let mut best = f32::NEG_INFINITY;
+        let mut id = self.cand.first().map(|c| c.id).unwrap_or(0);
+        for c in &self.cand {
+            let v = c.logit + noise_t[c.id as usize] * inv_t;
+            if v > best {
+                best = v;
+                id = c.id;
+            }
+        }
+        id
     }
 
     /// Draw with an explicit uniform, so a caller sequencing several draws controls the
@@ -607,6 +649,62 @@ mod tests {
                 (got - want).abs() < 0.005,
                 "token {t}: emitted {got:.4}, target {want:.4}"
             );
+        }
+    }
+
+    /// The gumbel-coupled draw must emit the sampler's own distribution —
+    /// including with penalties and filters active — and must agree with a
+    /// plain full-vocabulary gumbel argmax whenever nothing is filtered.
+    #[test]
+    fn coupled_sampling_emits_the_target_distribution() {
+        let logits = [1.0f32, 0.3, -0.5, 0.05];
+        for (label, params) in [
+            ("plain", SamplerParams { temp: 0.9, seed: 7, ..Default::default() }),
+            (
+                "filtered",
+                SamplerParams { temp: 1.1, top_k: 3, top_p: 0.95, seed: 7, ..Default::default() },
+            ),
+        ] {
+            let mut smp = Sampler::new(params.clone());
+            let target = smp.distribution(&logits);
+            let n = 200_000;
+            let mut counts = [0u32; 4];
+            let mut agree = 0u32;
+            for _ in 0..n {
+                let noise_t: Vec<f32> = (0..4)
+                    .map(|_| {
+                        let u = smp.rng().next_f32().max(1e-12);
+                        -(-(u as f64).ln()).ln() as f32 * params.temp
+                    })
+                    .collect();
+                let tok = smp.sample_coupled(&logits, &noise_t);
+                counts[tok as usize] += 1;
+                // the in-graph equivalent: unfiltered argmax of logits + noise
+                let graph = (0..4)
+                    .max_by(|&a, &b| {
+                        (logits[a] + noise_t[a]).total_cmp(&(logits[b] + noise_t[b]))
+                    })
+                    .unwrap() as u32;
+                if graph == tok {
+                    agree += 1;
+                }
+            }
+            for t in 0..4u32 {
+                let got = counts[t as usize] as f32 / n as f32;
+                let want = target.prob_of(t);
+                assert!(
+                    (got - want).abs() < 0.005,
+                    "{label} token {t}: emitted {got:.4}, target {want:.4}"
+                );
+            }
+            if params.coupling_is_exact() {
+                assert_eq!(agree, n, "{label}: plain coupling must be exact");
+            } else {
+                // filters move the winner only when it was filtered out; the
+                // toy vocabulary has a fat tail, so the bar sits lower than
+                // the ~0.95 seen with real-model top-p tails
+                assert!(agree as f32 / n as f32 > 0.8, "{label}: agreement {agree}/{n}");
+            }
         }
     }
 
