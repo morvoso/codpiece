@@ -814,12 +814,21 @@ fn worker(
             }
         } else {
             hit.unwrap_or_else(|| {
-                // No conversation matches. A short request goes to the
-                // sacrificial scratch slot; evicting a long conversation for
-                // it would cost its owner a full re-prefill on their next
-                // turn (measured: 35-70s at 33K).
+                // No conversation matches: someone gets evicted, so evict the
+                // history that is CHEAPEST TO RE-PREFILL. A short request next
+                // to a 33K conversation takes the scratch (its owner would pay
+                // 35-70s, measured); but a young conversation warming up in
+                // the scratch is not sacrificed to a drive-by when the main
+                // slot holds something older and smaller — routing on slot
+                // identity alone did exactly that in the first live test.
                 if scratch_fits(256) {
-                    scratch_idx.unwrap()
+                    let si = scratch_idx.unwrap();
+                    let mi = lru_slot(&pool, scratch_idx);
+                    if pool[mi].1.len() < pool[si].1.len() {
+                        mi
+                    } else {
+                        si
+                    }
                 } else {
                     lru_slot(&pool, scratch_idx)
                 }
