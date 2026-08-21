@@ -206,6 +206,46 @@ From which:
   and that — not communication, not attention, not the scheduler — is the
   largest remaining single-stream gap.
 
+### The forward pass itself, isolated
+
+Stripping speculation away entirely (`--depth 0`, no drafter) prices one
+forward pass with nothing else in it:
+
+| configuration | tok/s | ms/token |
+|---|---|---|
+| codpiece, plain forward, no speculation | 38.4–39.1 | **25.6–26.0** |
+| codpiece, same, `GGML_CUDA_DISABLE_FUSION=1` | 37.9 | 26.4 |
+| codpiece, MTP speculation | 64.8 | 15.4 |
+| codpiece, DFlash drafter | 85.8 | 11.7 |
+| **llama.cpp b10423, `-sm tensor`, no draft** | **41.6** | **24.1** |
+| llama.cpp b10423, `-sm layer`, no draft | 26.4 | 37.8 |
+
+All at `-c 16384`, same model file, same box.
+
+The scaffolding is innocent: tap collection for the drafter and the MTP
+tail cost nothing measurable, and a bare forward is still ~25.8 ms.
+Disabling operator fusion costs 1%, so fusion is firing and is not a lever.
+
+**On the bare forward, codpiece is ~6% behind llama.cpp (25.8 vs 24.1 ms)**
+— which is about the size of one known, deliberate difference: llama.cpp
+splits `output.weight` on the vocabulary axis while codpiece mirrors it so
+argmax and gumbel-coupled sampling can stay in the graph. That is 0.78 GB
+more read per card per forward, ~1.2 ms, or ~5%. Keeping argmax in the
+graph is worth ~10 ms per round at width 32 against ~0.06 ms at width 1,
+so the trade favours mirroring overall and stands.
+
+Both engines land at 65–69% of the 3090's 936 GB/s, which is what
+quantized GEMV achieves on this hardware — not a defect in either.
+
+**A correction worth stating**: the scoreboard's llama.cpp figure of 53.3
+tok/s is llama.cpp *with its own draft model* (hence its ~0.78 acceptance
+row). Comparing it against an unspeculated codpiece forward — as an
+earlier version of this analysis did — is apples to oranges and produced a
+phantom "46% slower per forward". Like for like: **39.1 vs 41.6 without
+speculation, 85.8 vs 53.3 with it.** The forward is at parity; speculation
+is the whole advantage, and raising *acceptance* is therefore the only
+lever left that matters.
+
 ### Three hypotheses that measurement killed
 
 1. **"Merge the inject and draft graphs."** Estimated at 5–8 ms. The split
