@@ -667,6 +667,13 @@ struct BatchStep {
     galloc: ffi::ggml_gallocr_t,
     t_len: i64,
     want_logits: bool,
+    /// Host mirror of the [n_kv, n] causal mask living in this graph's own
+    /// gallocr buffer (which persists across rounds). Per round only the
+    /// newly visible cell per lane changes, so uploads are deltas, not the
+    /// full 3 MB rebuild.
+    mask_host: Vec<u16>,
+    /// Per-lane `seq_past` the uploaded mask row reflects; -1 = dirty.
+    mask_state: Vec<i64>,
 }
 
 struct FusedStep {
@@ -3239,11 +3246,21 @@ pub(crate) unsafe fn build_attn_block(
                     return Err(ModelError::Load("batch decode alloc".into()));
                 }
                 ffi::ggml_graph_set_new_uid(built.gf);
-                session.batch_step = Some(BatchStep { built, galloc: ga, t_len, want_logits });
+                let nkv = n_kv as usize;
+                session.batch_step = Some(BatchStep {
+                    built,
+                    galloc: ga,
+                    t_len,
+                    want_logits,
+                    mask_host: vec![0xFC00u16; nkv * n],
+                    mask_state: vec![-1i64; n],
+                });
             }
-            let c = session.batch_step.as_ref().unwrap();
-            let b = &c.built;
+            let BatchStep { built: b, mask_host, mask_state, .. } =
+                session.batch_step.as_mut().unwrap();
+            let b = &*b;
 
+            let t_fill = std::time::Instant::now();
             let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
             ffi::ggml_backend_tensor_set(b.inp_tokens, toks_i32.as_ptr().cast(), 0, n * 4);
             let mut pos = vec![0i32; n * 4];
@@ -3257,19 +3274,44 @@ pub(crate) unsafe fn build_attn_block(
             let rows: Vec<i64> = (0..n).map(|i| (i * seq_ctx + seq_pasts[i]) as i64).collect();
             ffi::ggml_backend_tensor_set(b.row_ids, rows.as_ptr().cast(), 0, n * 8);
             let nkv = n_kv as usize;
-            let mut mask = vec![0xFC00u16; nkv * n];
+            // The host mirror persists across rounds, so rebuilding it is
+            // O(lanes) instead of O(n_kv * lanes): one more cell becomes
+            // visible per lane per round. The device copy cannot persist —
+            // gallocr recycles input memory for intermediates during
+            // compute — so the upload itself stays one full write.
             for (q, past) in seq_pasts.iter().enumerate() {
                 let base = q * seq_ctx;
-                for kv in base..=(base + past).min(nkv - 1) {
-                    mask[q * nkv + kv] = 0;
+                let want = *past as i64;
+                if mask_state[q] == want {
+                    continue;
                 }
+                let row = &mut mask_host[q * nkv..(q + 1) * nkv];
+                if mask_state[q] == want - 1 {
+                    row[(base + *past).min(nkv - 1)] = 0;
+                } else {
+                    // fresh graph, fresh admit, or a prefill jump
+                    row.fill(0xFC00);
+                    for kv in base..=(base + past).min(nkv - 1) {
+                        row[kv] = 0;
+                    }
+                }
+                mask_state[q] = want;
             }
-            ffi::ggml_backend_tensor_set(b.kq_mask, mask.as_ptr().cast(), 0, mask.len() * 2);
+            ffi::ggml_backend_tensor_set(
+                b.kq_mask,
+                mask_host.as_ptr().cast(),
+                0,
+                mask_host.len() * 2,
+            );
             let outs: Vec<i32> = (0..n as i32).collect();
             ffi::ggml_backend_tensor_set(b.out_ids, outs.as_ptr().cast(), 0, n * 4);
+            let t_fill = t_fill.elapsed();
 
+            let t_comp = std::time::Instant::now();
             self.compute(b.gf, n_threads)?;
+            let t_comp = t_comp.elapsed();
 
+            let t_read = std::time::Instant::now();
             let mut logits = Vec::new();
             let preds = if want_logits {
                 logits = vec![0f32; self.hp.n_vocab as usize * n];
@@ -3290,6 +3332,7 @@ pub(crate) unsafe fn build_attn_block(
                 ffi::ggml_backend_tensor_get(b.out, ids.as_mut_ptr().cast(), 0, n * 4);
                 ids.into_iter().map(|v| v as u32).collect()
             };
+            batch_trace(t_fill, t_comp, t_read.elapsed(), n);
             Ok((preds, logits))
         }
     }
@@ -3424,6 +3467,42 @@ pub(crate) unsafe fn build_attn_block(
             return Err(ModelError::Load(format!("graph compute status {st}")));
         }
         Ok(())
+    }
+}
+
+/// `CODPIECE_BATCH_TRACE=1`: accumulate per-phase times for batched decode
+/// rounds and print an average every 64 rounds. Times in microseconds.
+fn batch_trace(
+    fill: std::time::Duration,
+    comp: std::time::Duration,
+    read: std::time::Duration,
+    width: usize,
+) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("CODPIECE_BATCH_TRACE").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    static FILL: AtomicU64 = AtomicU64::new(0);
+    static COMP: AtomicU64 = AtomicU64::new(0);
+    static READ: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    static LOCK: AtomicBool = AtomicBool::new(false);
+    FILL.fetch_add(fill.as_micros() as u64, Relaxed);
+    COMP.fetch_add(comp.as_micros() as u64, Relaxed);
+    READ.fetch_add(read.as_micros() as u64, Relaxed);
+    let n = N.fetch_add(1, Relaxed) + 1;
+    if n % 64 == 0 && !LOCK.swap(true, Relaxed) {
+        eprintln!(
+            "[batch-trace] {} rounds: fill {:.2}ms  compute {:.2}ms  readback {:.2}ms (width {})",
+            n,
+            FILL.swap(0, Relaxed) as f64 / 64_000.0,
+            COMP.swap(0, Relaxed) as f64 / 64_000.0,
+            READ.swap(0, Relaxed) as f64 / 64_000.0,
+            width,
+        );
+        LOCK.store(false, Relaxed);
     }
 }
 

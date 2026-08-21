@@ -5,6 +5,7 @@ pub mod chat;
 pub mod depth;
 pub mod engine;
 pub mod http;
+pub mod tools;
 
 use std::io::BufReader;
 use std::net::TcpListener;

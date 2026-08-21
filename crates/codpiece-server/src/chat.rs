@@ -30,6 +30,49 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
 }
 
+/// OpenAI clients send `tool_calls[].function.arguments` as a JSON *string* —
+/// which is exactly what this template refuses ("Parse them into an object
+/// before calling apply_chat_template"). Every prior assistant turn that made
+/// a tool call would 400 on the next request, so parse those strings back into
+/// objects before rendering. Anything that does not parse is left alone, so
+/// the template's own error still surfaces.
+fn normalize_tool_calls(messages: &[ChatMessage]) -> std::borrow::Cow<'_, [ChatMessage]> {
+    let needs = |m: &ChatMessage| {
+        m.tool_calls.as_ref().and_then(|c| c.as_array()).is_some_and(|calls| {
+            calls.iter().any(|c| {
+                let f = c.get("function").unwrap_or(c);
+                f.get("arguments").is_some_and(serde_json::Value::is_string)
+            })
+        })
+    };
+    if !messages.iter().any(needs) {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+    let mut out = messages.to_vec();
+    for m in out.iter_mut() {
+        let Some(calls) = m.tool_calls.as_mut().and_then(|c| c.as_array_mut()) else { continue };
+        for call in calls.iter_mut() {
+            let f = match call.get_mut("function") {
+                Some(f) => f,
+                None => call,
+            };
+            let Some(args) = f.get("arguments") else { continue };
+            let Some(s) = args.as_str() else { continue };
+            // an empty argument list is idiomatic for zero-parameter tools
+            let parsed = if s.trim().is_empty() {
+                serde_json::Value::Object(serde_json::Map::new())
+            } else {
+                match serde_json::from_str(s) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                }
+            };
+            f["arguments"] = parsed;
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 pub struct ChatTemplate {
     env: Environment<'static>,
 }
@@ -79,7 +122,8 @@ impl ChatTemplate {
                 ctx.insert(k.clone(), Value::from_serialize(v));
             }
         }
-        ctx.insert("messages".into(), Value::from_serialize(messages));
+        let messages = normalize_tool_calls(messages);
+        ctx.insert("messages".into(), Value::from_serialize(&messages));
         ctx.insert("add_generation_prompt".into(), Value::from(add_generation_prompt));
         ctx.insert("tools".into(), tools.map(Value::from_serialize).unwrap_or(Value::from(())));
         ctx.insert("enable_thinking".into(), Value::from(enable_thinking));
@@ -303,6 +347,67 @@ Four.";
             &turn2[..expected_prefix.len().min(turn2.len())]
                 [expected_prefix.len().saturating_sub(70).min(turn2.len())..]
         );
+    }
+
+    /// The agentic round trip: the client sends back the assistant turn exactly
+    /// as this server emitted it — arguments as a JSON string, per the OpenAI
+    /// wire format — followed by the tool's result. The template refuses string
+    /// arguments outright, so without normalization every second turn 400s.
+    #[test]
+    fn a_tool_call_turn_survives_the_round_trip() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"properties": {"city": {"type": "string"}}}
+            }
+        }]);
+        let assistant = ChatMessage {
+            role: "assistant".into(),
+            content: serde_json::Value::String(String::new()),
+            name: None,
+            tool_calls: Some(serde_json::json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Berlin\"}"}
+            }])),
+            reasoning_content: None,
+        };
+        let mut tool_result = msg("tool", "18C and clear");
+        tool_result.name = Some("get_weather".into());
+        let out = template()
+            .render(
+                &[msg("user", "weather in Berlin?"), assistant, tool_result],
+                true,
+                Some(&tools),
+                true,
+                None,
+            )
+            .expect("a tool-call turn must render");
+        // the template's own format, not the JSON blob older Qwens used
+        assert!(out.contains("<tool_call>\n<function=get_weather>"), "{out}");
+        assert!(out.contains("<parameter=city>\nBerlin\n</parameter>"), "{out}");
+        assert!(out.contains("<tool_response>\n18C and clear"), "{out}");
+    }
+
+    /// Arguments that are already an object (the shape the template documents)
+    /// must pass through untouched.
+    #[test]
+    fn object_arguments_are_left_alone() {
+        let assistant = ChatMessage {
+            role: "assistant".into(),
+            content: serde_json::Value::String(String::new()),
+            name: None,
+            tool_calls: Some(serde_json::json!([{
+                "type": "function",
+                "function": {"name": "f", "arguments": {"n": 2}}
+            }])),
+            reasoning_content: None,
+        };
+        let out = template()
+            .render(&[msg("user", "go"), assistant], true, None, true, None)
+            .expect("render");
+        assert!(out.contains("<parameter=n>\n2\n</parameter>"), "{out}");
     }
 
     #[test]

@@ -292,7 +292,15 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 think_budget: 0,
                 think_close: Vec::new(),
             };
-            serve_with(ctx, gen, body.sampling.stream.unwrap_or(false), "text_completion", false, w)
+            serve_with(
+                ctx,
+                gen,
+                body.sampling.stream.unwrap_or(false),
+                "text_completion",
+                false,
+                None,
+                w,
+            )
         }
         ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") => {
             let body: ChatBody = match serde_json::from_slice(&req.body) {
@@ -358,7 +366,15 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 think_budget: if thinking { ctx.think_budget } else { 0 },
                 think_close: ctx.think_close.clone(),
             };
-            serve_with(ctx, gen, body.sampling.stream.unwrap_or(false), "chat.completion", thinking, w)
+            serve_with(
+                ctx,
+                gen,
+                body.sampling.stream.unwrap_or(false),
+                "chat.completion",
+                thinking,
+                body.tools.as_ref(),
+                w,
+            )
         }
         ("GET", _) | ("POST", _) => write_error(w, 404, "no such endpoint"),
         _ => write_error(w, 405, "method not allowed"),
@@ -450,12 +466,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_with(
     ctx: &Ctx,
     gen: GenRequest,
     stream: bool,
     kind: &str,
     thinking: bool,
+    tools: Option<&serde_json::Value>,
     w: &mut TcpStream,
 ) -> std::io::Result<()> {
     let id = format!("cmpl-{}", now_secs());
@@ -471,11 +489,18 @@ fn serve_with(
         // chat generations under thinking begin inside an opened <think> block; the
         // stream labels that span reasoning_content, matching the non-streaming shape
         let mut rsplit = ReasoningStream::new(chat && thinking);
+        // With tools declared, content is streamed until a tool call opens and
+        // then withheld: the call is only well formed once complete, and it
+        // travels in its own delta rather than as prose.
+        let mut tsplit = tools.map(|_| crate::tools::ToolStream::new());
         while let Ok(ev) = rx.recv() {
             match ev {
                 Event::Prefilled { n_prompt: n } => n_prompt = n,
                 Event::Token(text) => {
-                    let (reasoning, content) = rsplit.push(&text);
+                    let (reasoning, mut content) = rsplit.push(&text);
+                    if let Some(t) = tsplit.as_mut() {
+                        content = t.push(&content);
+                    }
                     if reasoning.is_empty() && content.is_empty() {
                         continue; // held back pending the marker decision
                     }
@@ -512,7 +537,14 @@ fn serve_with(
                     sse_data(w, &chunk.to_string())?;
                 }
                 Event::Done(f) => {
-                    let (held_r, held_c) = rsplit.flush();
+                    let (held_r, mut held_c) = rsplit.flush();
+                    let mut calls = Vec::new();
+                    if let Some(t) = tsplit.as_mut() {
+                        let emitted = t.push(&held_c);
+                        let (tail, c) = t.flush(tools);
+                        held_c = emitted + &tail;
+                        calls = c;
+                    }
                     if !held_r.is_empty() || !held_c.is_empty() {
                         let mut d = serde_json::Map::new();
                         if !held_r.is_empty() {
@@ -535,11 +567,26 @@ fn serve_with(
                         "completion_tokens": f.n_generated,
                         "total_tokens": f.n_prompt + f.n_generated,
                     });
+                    let mut reason = f.reason;
+                    if !calls.is_empty() {
+                        // one delta carrying the complete calls, then the close
+                        let chunk = json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"tool_calls": crate::tools::to_openai_delta(&calls, &id)},
+                                "finish_reason": null,
+                            }],
+                        });
+                        sse_data(w, &chunk.to_string())?;
+                        reason = "tool_calls";
+                    }
                     let last = if chat {
                         json!({
                             "id": id, "object": "chat.completion.chunk", "created": created,
                             "model": model, "usage": usage,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": f.reason}],
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
                             "timings": timings(&f),
                         })
                     } else {
@@ -579,9 +626,25 @@ fn serve_with(
                 });
                 let body = if chat {
                     let (reasoning, content) = split_reasoning(&text, thinking);
+                    // Tool calls are only looked for when the request declared
+                    // tools; otherwise the markup is just text the user asked for.
+                    let (content, calls) = match tools {
+                        Some(_) => crate::tools::parse(&content, tools),
+                        None => (content, Vec::new()),
+                    };
                     let mut message = json!({"role": "assistant", "content": content});
                     if let Some(r) = reasoning {
                         message["reasoning_content"] = json!(r);
+                    }
+                    let mut reason = f.reason;
+                    if !calls.is_empty() {
+                        // clients read `content` only when there are no calls; an
+                        // empty string there is noise, so send null
+                        if message["content"].as_str().is_some_and(str::is_empty) {
+                            message["content"] = json!(null);
+                        }
+                        message["tool_calls"] = crate::tools::to_openai(&calls, &id);
+                        reason = "tool_calls";
                     }
                     json!({
                         "id": id, "object": "chat.completion", "created": created,
@@ -589,7 +652,7 @@ fn serve_with(
                         "choices": [{
                             "index": 0,
                             "message": message,
-                            "finish_reason": f.reason,
+                            "finish_reason": reason,
                         }],
                     })
                 } else {

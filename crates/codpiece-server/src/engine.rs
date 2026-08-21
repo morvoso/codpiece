@@ -619,9 +619,15 @@ struct BatchReq {
     seq_past: usize,
     last: u32,
     generated: Vec<u32>,
+    /// raw decoded bytes of `generated`; `text` is its UTF-8-lossy prefix
+    bytes: Vec<u8>,
+    /// bytes[..valid] have been converted into `text`
+    valid: usize,
     text: String,
     emitted: usize,
     stop: Vec<String>,
+    /// longest stop string in bytes; bounds the re-scan window per round
+    max_stop: usize,
     max_tokens: usize,
     ignore_eos: bool,
     t_start: std::time::Instant,
@@ -691,8 +697,11 @@ fn run_batch(
             seq_past: 0,
             last: 0,
             generated: Vec::new(),
+            bytes: Vec::new(),
+            valid: 0,
             text: String::new(),
             emitted: 0,
+            max_stop: req.stop.iter().map(|s| s.len()).max().unwrap_or(0),
             stop: req.stop,
             max_tokens: req.max_tokens,
             ignore_eos: req.ignore_eos,
@@ -704,6 +713,19 @@ fn run_batch(
 
     // seed with the request that triggered batch mode
     admit(0, first, &mut slots, bsession, stats);
+
+    // CODPIECE_BATCH_TRACE=1: decompose the round: prefill stalls, the
+    // decode step (model prints its own fill/compute/readback split), and
+    // per-round host work (detok, stops, channel sends).
+    let trace = std::env::var("CODPIECE_BATCH_TRACE").is_ok_and(|v| v == "1");
+    // Measured at 32 wide: readback 9.96ms -> 0.01ms, round 72.5ms -> 64.9ms,
+    // aggregate 273.7 -> 285.7 tok/s. Set CODPIECE_BATCH_GREEDY=0 to go back
+    // to reading full logits and taking the argmax on the host.
+    let batch_greedy = std::env::var("CODPIECE_BATCH_GREEDY").map_or(true, |v| v != "0");
+    let mut tr_rounds = 0u64;
+    let (mut tr_prefill, mut tr_step, mut tr_post) = (0f64, 0f64, 0f64);
+    let mut tr_tokens = 0u64;
+    let mut tr_wall = std::time::Instant::now();
 
     loop {
         // fill free slots from the queue and any freshly arrived work
@@ -726,6 +748,7 @@ fn run_batch(
         }
 
         // one prefill chunk for each request still feeding its prompt
+        let t_prefill = std::time::Instant::now();
         for slot in 0..n_slots {
             let Some(r) = slots[slot].as_mut() else { continue };
             if r.fed >= r.prompt_ids.len() {
@@ -758,6 +781,8 @@ fn run_batch(
             }
         }
 
+        tr_prefill += t_prefill.elapsed().as_secs_f64();
+
         // one decode round, fixed width, for everyone whose prompt is in
         let ready: Vec<usize> = (0..n_slots)
             .filter(|&i| slots[i].as_ref().is_some_and(|r| r.fed >= r.prompt_ids.len()))
@@ -772,12 +797,20 @@ fn run_batch(
             lasts[i] = r.last;
             pasts[i] = r.seq_past;
         }
+        // CODPIECE_BATCH_GREEDY=1: all-greedy rounds read back one argmax id
+        // per lane (128 bytes) instead of full-vocab logits (~32 MB at width
+        // 32). Opt-in until the batched in-graph argmax is verified; the
+        // graph rebuilds when this flips, so it only costs when the
+        // greedy/sampled composition of the pool changes.
+        let want_logits =
+            !batch_greedy || ready.iter().any(|&i| !slots[i].as_ref().unwrap().greedy);
+        let t_step = std::time::Instant::now();
         let (preds, logits) = match model.step_batch_decode(
             bsession,
             &lasts,
             &pasts,
             seq_ctx,
-            true,
+            want_logits,
             cfg.threads,
         ) {
             Ok(v) => v,
@@ -791,18 +824,53 @@ fn run_batch(
                 return;
             }
         };
+        tr_step += t_step.elapsed().as_secs_f64();
+        let t_post = std::time::Instant::now();
         for &i in &ready {
             let r = slots[i].as_mut().unwrap();
             r.seq_past += 1;
             // commit the token the round consumed, then choose the next one
             r.generated.push(r.last);
-            let piece = tok.decode(&r.generated, false);
-            r.text.clear();
-            r.text.push_str(&piece);
+            tok.token_bytes_into(r.last, false, &mut r.bytes);
+            // convert newly complete UTF-8 into `text` (exactly what
+            // from_utf8_lossy over the whole buffer would have produced)
+            let scan_from = r.text.len().saturating_sub(r.max_stop.saturating_sub(1));
+            while r.valid < r.bytes.len() {
+                match std::str::from_utf8(&r.bytes[r.valid..]) {
+                    Ok(s) => {
+                        r.text.push_str(s);
+                        r.valid = r.bytes.len();
+                    }
+                    Err(e) => {
+                        let good = e.valid_up_to();
+                        r.text.push_str(unsafe {
+                            std::str::from_utf8_unchecked(&r.bytes[r.valid..r.valid + good])
+                        });
+                        r.valid += good;
+                        match e.error_len() {
+                            Some(bad) => {
+                                r.text.push('\u{FFFD}');
+                                r.valid += bad;
+                            }
+                            None => break, // incomplete tail: wait for more bytes
+                        }
+                    }
+                }
+            }
             let mut reason: Option<&'static str> = None;
-            if let Some(hit) = r.stop.iter().find_map(|s| r.text.find(s.as_str())) {
-                r.text.truncate(hit);
-                reason = Some("stop");
+            // a new stop occurrence must end in text added this round, so
+            // only re-scan a window reaching max_stop-1 bytes back
+            if r.max_stop > 0 {
+                let mut w = scan_from;
+                while !r.text.is_char_boundary(w) {
+                    w -= 1;
+                }
+                if let Some(hit) =
+                    r.stop.iter().find_map(|s| r.text[w..].find(s.as_str()).map(|p| w + p))
+                {
+                    r.text.truncate(hit);
+                    reason = Some("stop");
+                }
             }
             if r.text.len() > r.emitted && !r.client_gone {
                 let chunk = r.text[r.emitted..].to_string();
@@ -842,6 +910,23 @@ fn run_batch(
                 };
                 finish_slot(&mut slots[i], stats, Some(f));
             }
+        }
+        tr_post += t_post.elapsed().as_secs_f64();
+        tr_tokens += ready.len() as u64;
+        tr_rounds += 1;
+        if trace && tr_rounds % 64 == 0 {
+            let wall = tr_wall.elapsed().as_secs_f64();
+            eprintln!(
+                "[round-trace] {} rounds: wall {:.2}ms  prefill {:.2}ms  step {:.2}ms  post {:.2}ms  | {:.1} tok/s",
+                tr_rounds,
+                wall * 1000.0 / 64.0,
+                tr_prefill * 1000.0 / 64.0,
+                tr_step * 1000.0 / 64.0,
+                tr_post * 1000.0 / 64.0,
+                tr_tokens as f64 / wall,
+            );
+            (tr_prefill, tr_step, tr_post, tr_tokens) = (0.0, 0.0, 0.0, 0);
+            tr_wall = std::time::Instant::now();
         }
     }
 }

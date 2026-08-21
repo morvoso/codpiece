@@ -12,7 +12,9 @@ codpiece-sample = { path = "../codpiece-sample" }
 codpiece-vision = { path = "../codpiece-vision" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-minijinja = { version = "2", features = ["loader", "builtins"] }
+# `json` supplies the tojson filter, which this template uses to render every
+# non-string tool-call argument; without it any tool-call turn fails to render.
+minijinja = { version = "2", features = ["loader", "builtins", "json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [features]

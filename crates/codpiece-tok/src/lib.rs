@@ -325,28 +325,38 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32], render_special: bool) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
-            let Some(text) = self.tokens.get(id as usize) else {
-                continue;
-            };
-            match self.types[id as usize] {
-                TokenType::Normal | TokenType::Byte => {
-                    for ch in text.chars() {
-                        match self.byte_dec.get(&ch) {
-                            Some(&b) => bytes.push(b),
-                            None => bytes.extend_from_slice(ch.to_string().as_bytes()),
+            self.token_bytes_into(id, render_special, &mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Append one token's raw bytes to `out`. Decoding is per-token
+    /// independent (byte-level BPE), so streaming callers can decode
+    /// incrementally: `decode(ids)` == UTF-8-lossy of the concatenation.
+    pub fn token_bytes_into(&self, id: u32, render_special: bool, out: &mut Vec<u8>) {
+        let Some(text) = self.tokens.get(id as usize) else {
+            return;
+        };
+        match self.types[id as usize] {
+            TokenType::Normal | TokenType::Byte => {
+                for ch in text.chars() {
+                    match self.byte_dec.get(&ch) {
+                        Some(&b) => out.push(b),
+                        None => {
+                            let mut buf = [0u8; 4];
+                            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                         }
                     }
                 }
-                TokenType::Control => {
-                    if render_special {
-                        bytes.extend_from_slice(text.as_bytes());
-                    }
-                }
-                TokenType::UserDefined => bytes.extend_from_slice(text.as_bytes()),
-                TokenType::Unknown | TokenType::Unused => {}
             }
+            TokenType::Control => {
+                if render_special {
+                    out.extend_from_slice(text.as_bytes());
+                }
+            }
+            TokenType::UserDefined => out.extend_from_slice(text.as_bytes()),
+            TokenType::Unknown | TokenType::Unused => {}
         }
-        String::from_utf8_lossy(&bytes).into_owned()
     }
 }
 
