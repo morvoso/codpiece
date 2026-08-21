@@ -486,17 +486,6 @@ fn worker(
         }
         None => None,
     };
-    let vision_prep = vision.as_ref().map(|v| {
-        let min_t = std::env::var("CODPIECE_IMAGE_MIN_TOKENS")
-            .ok()
-            .and_then(|x| x.parse().ok());
-        let max_t = std::env::var("CODPIECE_IMAGE_MAX_TOKENS")
-            .ok()
-            .and_then(|x| x.parse().ok());
-        // prod llama.cpp runs --image-min-tokens 1024 (Qwen-VL grounding
-        // degrades below that), so that is the default here too
-        Preprocessor::new(&v.model.hp, Some(min_t.unwrap_or(1024)), max_t)
-    });
     // One session for the life of the process, reset between requests. Building it per
     // request meant allocating and freeing the KV cache each time — 4+ GiB at a long
     // context — and `cudaFree` synchronises, so the teardown outlived the response and
@@ -524,10 +513,6 @@ fn worker(
             return;
         }
     };
-    if ready.send(Ok((template, vision_prep))).is_err() {
-        return;
-    }
-
     // A pool of sessions, each holding one conversation's state in VRAM, plus the
     // history of tokens that state covers. Switching conversations is a pointer choice,
     // not a copy — which matters doubly under tensor parallelism, where the split GDN
@@ -554,6 +539,30 @@ fn worker(
     report_vram("after weights, sessions, drafter, vision");
     record_free_vram();
     eprintln!("serve: prefill chunk {} tokens", prefill_chunk_for(cfg.n_ctx));
+
+    // The image size cap is decided here, not earlier, because it depends on
+    // headroom that only exists once every session is allocated. Readiness is
+    // published after it for the same reason: the port opening should mean the
+    // server is done taking memory, not that it is about to.
+    let vision_prep = vision.as_ref().map(|v| {
+        let max_t = std::env::var("CODPIECE_IMAGE_MAX_TOKENS")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or_else(vision_token_cap);
+        // prod llama.cpp runs --image-min-tokens 1024 (Qwen-VL grounding
+        // degrades below that), so that is the default here too — but a floor
+        // above the ceiling is nonsense, so the floor yields.
+        let min_t = std::env::var("CODPIECE_IMAGE_MIN_TOKENS")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(1024)
+            .min(max_t);
+        eprintln!("serve: image tokens {min_t}..{max_t}");
+        Preprocessor::new(&v.model.hp, Some(min_t), Some(max_t))
+    });
+    if ready.send(Ok((template, vision_prep))).is_err() {
+        return;
+    }
     // CODPIECE_TRACE_VRAM=1: a line per request, which is how cached-graph
     // growth becomes visible instead of showing up as a dead process.
     let trace_vram = std::env::var("CODPIECE_TRACE_VRAM").is_ok_and(|v| v == "1");
@@ -1229,6 +1238,37 @@ fn score_row(
             .collect()
     });
     (lp(row[target as usize]), top)
+}
+
+/// Largest image, in vision tokens, this box can afford to encode.
+///
+/// The vision tower runs on its own backend with its own CUDA pool, and a
+/// pool never returns memory to the driver — so memory the encoder peaks at
+/// is taken away from the trunk *permanently*, not just for the duration of
+/// the request. One 1024-token image on a card with 1.14 GiB free was enough
+/// to drive it to zero and leave every subsequent request failing to
+/// allocate. The cost grows with the square of the token count (attention is
+/// over image tokens), so halving the cap quarters the peak.
+///
+/// llama.cpp's default ceiling is 4096 tokens; that assumes a card with room
+/// to spare. `CODPIECE_IMAGE_MAX_TOKENS` overrides this.
+fn vision_token_cap() -> u32 {
+    let free_gib = FREE_GIB.get().copied().unwrap_or(0.0);
+    let cap = match free_gib {
+        f if f > 3.0 => 4096,
+        f if f > 2.0 => 2048,
+        f if f > 1.3 => 1024,
+        f if f > 0.8 => 512,
+        _ => 256,
+    };
+    if cap < 1024 {
+        eprintln!(
+            "serve: only {free_gib:.2} GiB free — capping images at {cap} tokens. Qwen-VL \
+             grounding degrades below 1024; lower the context or unload the drafter for \
+             full-detail vision."
+        );
+    }
+    cap
 }
 
 /// Whether a request's prompt plus its generation fits one batch slot's

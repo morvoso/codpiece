@@ -459,7 +459,25 @@ impl VisionModel {
                 return finish(galloc, Err(ModelError::Load("vision gallocr".into())));
             }
             if !ffi::ggml_gallocr_alloc_graph(galloc, gf) {
-                return finish(galloc, Err(ModelError::Load("vision graph alloc".into())));
+                return finish(
+                    galloc,
+                    Err(ModelError::Load(format!(
+                        "vision graph alloc failed for a {}-token image — likely out of device \
+                         memory on the vision GPU; lower CODPIECE_IMAGE_MAX_TOKENS",
+                        n_pos / (hp.merge * hp.merge)
+                    ))),
+                );
+            }
+            // The encoder's peak is what permanently shrinks the trunk's share
+            // of this card: it runs on its own backend, and a CUDA pool never
+            // returns memory to the driver. Report it so the token cap can be
+            // set from measurement.
+            if std::env::var("CODPIECE_TRACE_MEM").as_deref() == Ok("1") {
+                eprintln!(
+                    "[mem] vision: compute buffer {:.1} MiB ({} image tokens)",
+                    ffi::ggml_gallocr_get_buffer_size(galloc, 0) as f64 / (1024.0 * 1024.0),
+                    n_pos / (hp.merge * hp.merge),
+                );
             }
 
             ffi::ggml_backend_tensor_set(
