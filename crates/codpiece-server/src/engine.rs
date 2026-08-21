@@ -625,6 +625,7 @@ fn worker(
         if !pending.is_empty()
             && batch_slots > 1
             && job.req.images.is_empty()
+            && job.req.echo_logprobs.is_none()
             && fits_a_slot(&tok, &mut job.req, batch_seq_ctx)
         {
             if bsession.is_none() && !batch_refused && !fits_in_vram(
@@ -904,18 +905,23 @@ fn run_batch(
         }
         for slot in 0..n_slots {
             if slots[slot].is_none() {
-                // Two kinds of request only run on the single path: images
-                // (the batch graph has no embd input and no vision M-RoPE),
-                // and prompts too long for a slot's region — a batch slot is
-                // a fraction of the full context, and failing a long prompt
-                // just because something else happened to be running would
-                // make large requests fail intermittently. Both stay queued
-                // for the serve loop to pick up once this batch drains.
+                // Three kinds of request only run on the single path:
+                // images (the batch graph has no embd input and no vision
+                // M-RoPE), scoring requests (the batch graph emits one
+                // prediction per lane, not logits at every position — a
+                // scoring request served here would silently come back as
+                // ordinary generation with no logprobs), and prompts too long
+                // for a slot's region, since a slot is a fraction of the full
+                // context and failing a large prompt because something else
+                // happened to be running would make it fail intermittently.
+                // All stay queued for the serve loop once this batch drains.
                 // Tokenize once per job, not once per scan: this runs for
                 // every free slot on every round, and a long prompt costs
                 // real milliseconds to encode.
                 let found = pending.iter_mut().position(|j| {
-                    j.req.images.is_empty() && fits_a_slot(tok, &mut j.req, seq_ctx)
+                    j.req.images.is_empty()
+                        && j.req.echo_logprobs.is_none()
+                        && fits_a_slot(tok, &mut j.req, seq_ctx)
                 });
                 if let Some(at) = found {
                     let j = pending.remove(at).unwrap();
