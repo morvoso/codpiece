@@ -724,7 +724,17 @@ fn worker(
             } else if n > cfg.n_ctx {
                 Err(format!("prompt of {n} tokens exceeds the {} token context", cfg.n_ctx))
             } else {
-                run_score(&model, &tok, &cfg, session, history, &prompt_ids, top_k)
+                run_score(
+                    &model,
+                    &tok,
+                    &cfg,
+                    session,
+                    history,
+                    &prompt_ids,
+                    top_k,
+                    job.req.max_tokens,
+                    &job.req.params,
+                )
             };
             stats.processing.fetch_sub(1, Ordering::Relaxed);
             stats.served.fetch_add(1, Ordering::Relaxed);
@@ -1131,6 +1141,8 @@ fn run_score(
     history: &mut Vec<u32>,
     ids: &[u32],
     top_k: usize,
+    max_tokens: usize,
+    params: &SamplerParams,
 ) -> Result<Scored, String> {
     const SCORE_CHUNK: usize = 64;
     let n_vocab = model.hp.n_vocab as usize;
@@ -1176,12 +1188,50 @@ fn run_score(
         for j in 0..chunk.len().saturating_sub(1) {
             push(&logits[j * n_vocab..(j + 1) * n_vocab], ids[base + j + 1]);
         }
-        if base + chunk.len() < ids.len() {
-            carry = Some(logits[(chunk.len() - 1) * n_vocab..chunk.len() * n_vocab].to_vec());
-        }
+        // the last row always survives: it predicts the token AFTER this
+        // chunk, which is either the next chunk's first token or the first
+        // generated one
+        carry = Some(logits[(chunk.len() - 1) * n_vocab..chunk.len() * n_vocab].to_vec());
         base += chunk.len();
     }
     history.extend_from_slice(ids);
+
+    // OpenAI returns the echoed prompt AND the generated tokens, and clients
+    // slice accordingly: lm-evaluation-harness reads token_logprobs[ctxlen:-1],
+    // dropping a final entry it expects to be the generated token. Returning
+    // only the prompt made that slice drop the last PROMPT token instead --
+    // for a one-token continuation it left an empty list, every candidate
+    // scored 0.0, they all tied, and MMLU came out at exactly chance.
+    let mut sampler = Sampler::new(params.clone());
+    sampler.accept_all(ids);
+    let mut row = carry;
+    for _ in 0..max_tokens {
+        let Some(r) = row.take() else { break };
+        let next = if params.is_greedy() {
+            codpiece_model::qwen35::argmax(&r)
+        } else {
+            sampler.sample(&r)
+        };
+        let (lp, top) = score_row(&r, next, top_k, tok);
+        let start = out.text.len();
+        let mut bytes = Vec::new();
+        tok.token_bytes_into(next, true, &mut bytes);
+        out.text.push_str(&String::from_utf8_lossy(&bytes));
+        out.tokens.push(String::from_utf8_lossy(&bytes).into_owned());
+        out.text_offset.push(start);
+        out.logprobs.push(Some(lp));
+        out.top.push(top);
+        sampler.accept(next);
+        if Some(next) == tok.eos {
+            break;
+        }
+        // only pay for another forward pass if more tokens were asked for
+        row = Some(
+            model
+                .step(session, &[next], &[0], cfg.threads)
+                .map_err(|e| format!("score generate: {e}"))?,
+        );
+    }
     Ok(out)
 }
 

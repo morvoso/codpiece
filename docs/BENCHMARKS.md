@@ -44,9 +44,22 @@ measures arithmetic reasoning and wikitext measures next-token loss.
 | benchmark | Qwen3.8-27B UD-Q8_K_XL |
 |---|---|
 | HumanEval pass@1 (all 164) | **79.3% ± 3.2** |
+| MBPP pass@1 (3-shot, 200) | 0.0 — see below, this is a protocol artifact |
 
 Run through codpiece's own API via lm-evaluation-harness (`local-completions`,
 greedy, 0-shot, the harness's standard stop sequences).
+
+**MBPP's 0.0 measures protocol conformance, not coding ability, and is not
+reported as a capability number.** lm-eval's `mbpp` task is a base-model
+completion protocol: three examples, code between `[BEGIN]` and `[DONE]`,
+nothing else. Probed directly, this instruct model answers that prompt the
+way an instruct model does — a signature with `# Your code here`, the
+marker `[END]` rather than `[DONE]`, then several paragraphs explaining its
+approach. The stop never fires, the extracted "code" is a stub plus prose,
+and every test fails. HumanEval, which hands the model a real signature and
+docstring to continue, suits it and scores 79.3%. This is the same effect
+already noted for GSM8K's raw 5-shot protocol, in a more absolute form:
+a benchmark can measure the harness's conventions rather than the model.
 
 **Sandboxing.** HumanEval and MBPP score by *executing model-generated
 code*; the harness gates this behind both `--confirm_run_unsafe_code` and
