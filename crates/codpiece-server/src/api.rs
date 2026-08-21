@@ -273,6 +273,25 @@ struct ChatBody {
     sampling: SamplingFields,
 }
 
+/// The client's template kwargs, with the server's default reasoning effort
+/// filled in when the client did not name one. A client that says `xhigh`
+/// gets xhigh; a client that says nothing gets the deployment's default
+/// instead of the template's runaway fallback.
+fn merge_default_effort(
+    kwargs: Option<serde_json::Value>,
+    default: Option<&str>,
+) -> Option<serde_json::Value> {
+    let Some(effort) = default else { return kwargs };
+    let mut map = match kwargs {
+        Some(serde_json::Value::Object(m)) => m,
+        Some(other) => return Some(other), // malformed: pass through untouched
+        None => serde_json::Map::new(),
+    };
+    map.entry("reasoning_effort".to_string())
+        .or_insert_with(|| serde_json::Value::String(effort.to_string()));
+    Some(serde_json::Value::Object(map))
+}
+
 /// The sampling the model itself recommends, from `general.sampling.*`.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSampling {
@@ -298,6 +317,13 @@ pub struct Ctx {
     pub engine: Engine,
     /// Applied only to thinking requests that specify no sampling of their own.
     pub model_sampling: Option<ModelSampling>,
+    /// Injected into the chat template's kwargs when the client sends no
+    /// `reasoning_effort` of its own. The template's fallback is `xhigh`,
+    /// which thinks for minutes on trivial requests — the llama.cpp
+    /// deployment pinned `medium` server-side for exactly this reason, and
+    /// that setting was lost in the engine migration. A client that names an
+    /// effort keeps it.
+    pub default_reasoning_effort: Option<String>,
     /// The tokenization of the think-block close, computed once. `<think>` opens the
     /// generation prompt, so the model only has to emit the closer.
     pub think_close: Vec<u32>,
@@ -491,12 +517,16 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                     Vec::new()
                 }
             };
+            let kwargs = merge_default_effort(
+                body.chat_template_kwargs.clone(),
+                ctx.default_reasoning_effort.as_deref(),
+            );
             let prompt = match tmpl.render(
                 &body.messages,
                 true,
                 body.tools.as_ref(),
                 thinking,
-                body.chat_template_kwargs.as_ref(),
+                kwargs.as_ref(),
             ) {
                 Ok(p) => p,
                 Err(e) => return write_error(w, 400, &e),
@@ -1009,5 +1039,41 @@ mod prompt_tests {
         assert!(err.contains("one prompt per request"), "{err}");
         let err = parse(r#"{"prompt": ["a", "b"]}"#).prompt.single().unwrap_err();
         assert!(err.contains("batch of 2"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_client_that_names_an_effort_keeps_it() {
+        let out = merge_default_effort(
+            Some(json!({"reasoning_effort": "xhigh", "enable_thinking": true})),
+            Some("medium"),
+        )
+        .unwrap();
+        assert_eq!(out["reasoning_effort"], json!("xhigh"));
+        assert_eq!(out["enable_thinking"], json!(true));
+    }
+
+    /// The case that thought for eight minutes: no kwargs at all.
+    #[test]
+    fn a_silent_client_gets_the_deployment_default() {
+        let out = merge_default_effort(None, Some("medium")).unwrap();
+        assert_eq!(out["reasoning_effort"], json!("medium"));
+        // kwargs present but effort absent: same treatment
+        let out = merge_default_effort(Some(json!({"enable_thinking": true})), Some("medium"))
+            .unwrap();
+        assert_eq!(out["reasoning_effort"], json!("medium"));
+        assert_eq!(out["enable_thinking"], json!(true));
+    }
+
+    #[test]
+    fn no_default_means_untouched() {
+        assert_eq!(merge_default_effort(None, None), None);
+        let k = json!({"enable_thinking": false});
+        assert_eq!(merge_default_effort(Some(k.clone()), None), Some(k));
     }
 }

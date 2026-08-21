@@ -77,6 +77,12 @@ services:
       # conversation. Without it any drive-by request evicts the long
       # conversation and its owner re-prefills everything next turn.
       CODPIECE_SCRATCH_CTX: ${CODPIECE_SCRATCH_CTX:-}
+      # Default reasoning effort for clients that send none, restoring the
+      # llama.cpp deployment's behavior (it pinned medium server-side). The
+      # template's own fallback is xhigh, which thinks for MINUTES on trivial
+      # requests -- the qwen CLI strips the field, so without this default
+      # every CLI request ran at xhigh. Clients that name an effort keep it.
+      CODPIECE_REASONING_EFFORT: ${CODPIECE_REASONING_EFFORT:-medium}
       CODPIECE_TRACE_REUSE: ${CODPIECE_TRACE_REUSE:-}
       CODPIECE_TRACE_VRAM: ${CODPIECE_TRACE_VRAM:-}
       CODPIECE_DECODE_TRACE: ${CODPIECE_DECODE_TRACE:-}

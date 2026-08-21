@@ -97,8 +97,24 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
         None => eprintln!("serve: model carries no recommended sampling; defaults stay greedy"),
     }
 
+    // Server-side default reasoning effort, restoring llama.cpp-deployment
+    // parity: without it, clients that send no effort (the qwen CLI strips
+    // the field) render at the template's xhigh fallback and think for
+    // minutes on trivial requests.
+    let default_reasoning_effort = std::env::var("CODPIECE_REASONING_EFFORT")
+        .ok()
+        .filter(|v| !v.is_empty());
+    match &default_reasoning_effort {
+        Some(e) => eprintln!("serve: default reasoning effort {e} (clients may override)"),
+        None => eprintln!(
+            "serve: no default reasoning effort; template falls back to xhigh for \
+             clients that send none"
+        ),
+    }
+
     let ctx = Arc::new(api::Ctx {
         engine,
+        default_reasoning_effort,
         tokenizer,
         template,
         default_max_tokens: cfg.default_max_tokens,
