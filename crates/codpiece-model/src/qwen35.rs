@@ -372,16 +372,55 @@ fn mtp_ctx_cap() -> usize {
         .unwrap_or(16384)
 }
 
+/// VRAM a session's caches will occupy, summed across devices, before it is
+/// created. Callers divide by the device count to price one card: every
+/// tensor here is split by head or slot under tensor parallelism.
+///
+/// This exists so an allocation that cannot fit is *declined* rather than
+/// attempted — a failed allocation deep in the backend is not always a
+/// recoverable error, and taking the process down with it costs every other
+/// conversation on the box.
+pub fn session_bytes(model: &Qwen35, n_ctx_max: usize, k_slots: usize) -> usize {
+    let hp = &model.hp;
+    let mut total = 0usize;
+    for il in 0..hp.n_layer {
+        if hp.is_recurrent(il) {
+            // conv window and recurrent state, f32, one per slot
+            total += ((hp.d_conv - 1) * hp.conv_dim()) as usize * k_slots * 4;
+            total += (hp.gdn_head_v() * hp.gdn_head_v() * hp.n_v_heads) as usize * k_slots * 4;
+        } else {
+            // f16 K and V over the whole context
+            total += (hp.head_k * hp.n_head_kv) as usize * n_ctx_max * 2;
+            total += (hp.head_v * hp.n_head_kv) as usize * n_ctx_max * 2;
+        }
+    }
+    let mtp = n_ctx_max.min(mtp_ctx_cap());
+    total += ((hp.head_k + hp.head_v) * hp.n_head_kv) as usize * mtp * 2;
+    total
+}
+
 /// Total VRAM the per-session graph cache may hold, in bytes.
-/// `CODPIECE_GRAPH_CACHE_MIB` overrides; 1 GiB is enough for the handful of
-/// shapes a steady-state conversation reuses.
+static GRAPH_CACHE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Tell the cache how much VRAM it may hold. The caller knows real headroom;
+/// a fixed default cannot, and a budget larger than the card can spare simply
+/// relocates the out-of-memory failure from eviction time to compute time.
+pub fn set_graph_cache_budget(bytes: usize) {
+    GRAPH_CACHE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn fused_cache_budget() -> usize {
-    std::env::var("CODPIECE_GRAPH_CACHE_MIB")
+    if let Some(mib) = std::env::var("CODPIECE_GRAPH_CACHE_MIB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1024)
-        * 1024
-        * 1024
+    {
+        return mib * 1024 * 1024;
+    }
+    match GRAPH_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 1024 * 1024 * 1024, // nothing measured yet (CLI paths)
+        n => n,
+    }
 }
 
 pub(crate) unsafe fn trace_mem(what: &str, galloc: ffi::ggml_gallocr_t, n_kv: i64, t_len: i64) {

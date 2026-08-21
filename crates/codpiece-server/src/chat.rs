@@ -7,7 +7,7 @@
 //! `is mapping` tests and whitespace control, which is why this renders it rather than
 //! reimplementing it.
 
-use minijinja::{context, Environment, Error, ErrorKind, Value};
+use minijinja::{Environment, Error, ErrorKind, Value};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

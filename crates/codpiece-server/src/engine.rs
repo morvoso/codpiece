@@ -54,15 +54,25 @@ pub fn prefill_chunk_for(n_ctx: usize) -> usize {
     }
 }
 
-/// Record real headroom once everything resident is allocated.
+/// Record real headroom once everything resident is allocated, and give the
+/// graph cache a budget scaled to it.
+///
+/// The cache may hold 40% of what the tightest card has free, clamped to
+/// [256 MiB, 1 GiB]. The rest is left for the transient buffers a request
+/// allocates while it runs — a cache budget larger than the card can spare
+/// does not prevent an out-of-memory failure, it only moves it from eviction
+/// time to compute time.
 fn record_free_vram() {
-    let min_free = codpiece_model::device_memory()
+    let free_bytes = codpiece_model::device_memory()
         .iter()
         .map(|(_, used, total)| total.saturating_sub(*used))
         .min()
-        .unwrap_or(0) as f64
-        / (1024.0 * 1024.0 * 1024.0);
-    let _ = FREE_GIB.set(min_free);
+        .unwrap_or(0);
+    let _ = FREE_GIB.set(free_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+    let budget = ((free_bytes as f64 * 0.4) as usize)
+        .clamp(256 * 1024 * 1024, 1024 * 1024 * 1024);
+    codpiece_model::qwen35::set_graph_cache_budget(budget);
+    eprintln!("serve: graph cache budget {} MiB", budget / (1024 * 1024));
 }
 
 /// How deep to draft next, given how confident the model just was.
@@ -560,6 +570,9 @@ fn worker(
         .unwrap_or(8192)
         .min(cfg.n_ctx);
     let mut bsession: Option<Session> = None;
+    // Once the batch session has been declined for want of VRAM, stop
+    // re-pricing it on every overlapping request.
+    let mut batch_refused = false;
     let mut pending: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     'serve: while let Ok(job) = pending.pop_front().map(Ok).unwrap_or_else(|| rx.recv()) {
         // A request that arrives while another is queued means real concurrency:
@@ -568,8 +581,21 @@ fn worker(
         while let Ok(next) = rx.try_recv() {
             pending.push_back(next);
         }
-        if !pending.is_empty() && batch_slots > 1 && job.req.images.is_empty() {
-            if bsession.is_none() {
+        if !pending.is_empty()
+            && batch_slots > 1
+            && job.req.images.is_empty()
+            && fits_a_slot(&tok, &job.req, batch_seq_ctx)
+        {
+            if bsession.is_none() && !batch_refused && !fits_in_vram(
+                &model,
+                batch_slots * batch_seq_ctx,
+                batch_slots - 1,
+                "batch session",
+            ) {
+                // Serving serially is slower; taking the process down is worse.
+                batch_refused = true;
+            }
+            if bsession.is_none() && !batch_refused {
                 match Session::new_spec(&model, batch_slots * batch_seq_ctx, batch_slots - 1) {
                     Ok(s) => {
                         bsession = Some(s);
@@ -835,10 +861,16 @@ fn run_batch(
         }
         for slot in 0..n_slots {
             if slots[slot].is_none() {
-                // Image requests only run on the single path (the batch graph
-                // has no embd input and no vision M-RoPE); leave them queued
-                // for the serve loop to pick up after this batch drains.
-                if let Some(at) = pending.iter().position(|j| j.req.images.is_empty()) {
+                // Two kinds of request only run on the single path: images
+                // (the batch graph has no embd input and no vision M-RoPE),
+                // and prompts too long for a slot's region — a batch slot is
+                // a fraction of the full context, and failing a long prompt
+                // just because something else happened to be running would
+                // make large requests fail intermittently. Both stay queued
+                // for the serve loop to pick up once this batch drains.
+                if let Some(at) = pending.iter().position(|j| {
+                    j.req.images.is_empty() && fits_a_slot(tok, &j.req, seq_ctx)
+                }) {
                     let j = pending.remove(at).unwrap();
                     admit(slot, j, &mut slots, bsession, stats);
                 }
@@ -1175,6 +1207,49 @@ fn score_row(
             .collect()
     });
     (lp(row[target as usize]), top)
+}
+
+/// Whether a request's prompt plus its generation fits one batch slot's
+/// region. Tokenizing here duplicates work `admit` does again, but the
+/// alternative is admitting a request that cannot be served.
+fn fits_a_slot(tok: &codpiece_tok::Tokenizer, req: &GenRequest, seq_ctx: usize) -> bool {
+    let n = match &req.prompt_ids {
+        Some(ids) => ids.len(),
+        None => tok.encode(&req.prompt, true).len(),
+    };
+    n > 0 && n + req.max_tokens <= seq_ctx
+}
+
+/// Would a session of this shape fit on the tightest card right now?
+///
+/// Priced against *current* free VRAM, not startup headroom, because cached
+/// graph shapes accumulate as requests arrive — the batch session is created
+/// on first overlap, which can be long after warmup. A quarter of the
+/// estimate is held back for the transient buffers the session's own graphs
+/// will need on their first run.
+fn fits_in_vram(model: &Qwen35, n_ctx_max: usize, k_slots: usize, what: &str) -> bool {
+    let devs = codpiece_model::device_memory();
+    if devs.is_empty() {
+        return true; // CPU backend: not our call to make
+    }
+    let free = devs
+        .iter()
+        .map(|(_, used, total)| total.saturating_sub(*used))
+        .min()
+        .unwrap_or(0);
+    let need = codpiece_model::qwen35::session_bytes(model, n_ctx_max, k_slots) / devs.len();
+    let need_with_margin = need + need / 4;
+    if need_with_margin > free {
+        let mib = |b: usize| b / (1024 * 1024);
+        eprintln!(
+            "serve: {what} needs ~{} MiB per card (+25% margin) but only {} MiB is free; \
+             declining it rather than risking the process",
+            mib(need_with_margin),
+            mib(free),
+        );
+        return false;
+    }
+    true
 }
 
 /// One line per GPU, so a failed context bump is diagnosable from the log
