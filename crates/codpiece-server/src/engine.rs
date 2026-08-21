@@ -564,11 +564,16 @@ fn worker(
     // because it will be by the time an image and a busy server coincide.
     let batch_reserve = if batch_slots > 1 {
         let devs = codpiece_model::device_memory().len().max(1);
-        codpiece_model::qwen35::session_bytes(
+        let need = codpiece_model::qwen35::session_bytes(
             &model,
             batch_slots * batch_seq_ctx,
             batch_slots - 1,
-        ) / devs
+        ) / devs;
+        // Reserve only if it could ever be created. Headroom only shrinks
+        // from here, so a batch session that does not fit now never will —
+        // and reserving for it would needlessly shrink every image.
+        let free = FREE_GIB.get().copied().unwrap_or(0.0) * (1u64 << 30) as f64;
+        if (need + need / 4) as f64 <= free { need } else { 0 }
     } else {
         0
     };
@@ -1275,11 +1280,15 @@ fn vision_token_cap(reserved_bytes: usize) -> u32 {
     // 1024-token image then failed and left the card at zero for good.
     let reserved = reserved_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let free_gib = (FREE_GIB.get().copied().unwrap_or(0.0) - reserved).max(0.0);
+    // Calibrated, not guessed: a 1024-token image measured a ~0.41 GiB peak
+    // (card 1 went 0.68 -> 0.27 GiB free across the encode, settling at
+    // 0.39). The thresholds below leave roughly that much again for the
+    // trunk, since the encoder's peak is claimed permanently.
     let cap = match free_gib {
-        f if f > 3.0 => 4096,
+        f if f > 3.5 => 4096,
         f if f > 2.0 => 2048,
-        f if f > 1.3 => 1024,
-        f if f > 0.8 => 512,
+        f if f > 1.0 => 1024,
+        f if f > 0.6 => 512,
         _ => 256,
     };
     if cap < 1024 {

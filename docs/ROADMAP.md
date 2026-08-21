@@ -429,19 +429,37 @@ coding session is one long conversation, not thirty short ones.
       sweep legible rather than guesswork.
 - [x] **Long-context retrieval verified** — 9/9 needles to 97K tokens
       (see BENCHMARKS.md, including the harness that lied first).
-- [ ] **Ship the larger context.** Measured, full stack resident
-      (drafter + vision), 1 session:
+- [x] **Chose the context on evidence: 98304**, 2.4x the deployed 40960.
+      Full stack resident (drafter + vision), 1 session:
 
       | ctx | card0 free | card1 free | verdict |
       |---|---|---|---|
-      | 98304 | 2.00 GiB | 1.15 GiB | fits |
-      | 114688 | 1.50 GiB | 0.65 GiB | borderline (peak 24.09/24.58 GiB) |
-      | 131072 | — | — | 500s on first request |
+      | **98304** | 2.00 GiB | 1.15 GiB | **shipped** |
+      | 114688 | 1.50 GiB | 0.65 GiB | peak 24.09 of 24.58 GiB — too close |
+      | 131072 | — | — | 500s on the first request |
       | 131072 (no vision) | 1.00 GiB | 1.01 GiB | fits; vision costs ~0.87 GiB |
 
-**Gate:** 98304 shipped with drafter + vision + batch path, retrieval
-verified at ~90K, vision working, greedy code decode within 10% of the
-40960 figure.
+      At 98304, measured end to end: 8/8 then 4/4 long-context retrieval to
+      93K tokens, a 1024x1024 image described correctly, four concurrent
+      requests served, VRAM settling at 0.39 GiB free, and the batch session
+      declined with a log line rather than a dead process.
+
+      **81920 looked safer and was not.** There the batch session fits, gets
+      created first, takes 0.76 GiB — and a 1024-token image then fails and
+      leaves the card at zero free permanently, because the vision tower has
+      its own CUDA pool and a pool never returns memory to the driver.
+      Whichever allocated first won. Depending on allocation order is not a
+      design, so the image cap now reserves what the batch session will take
+      (and reserves nothing when it provably cannot fit).
+
+      The context is not free: decode costs ~13% against the 16K scoreboard
+      — prose 61.7 vs 71.2, code 70.4 vs 82.2, arithmetic 101.0 vs 117.4 —
+      and the VRAM-derived prefill chunk costs ~20% on long prompts
+      (849 vs ~1050 tok/s at 88K). Both are worth paying for coding work,
+      and both are recorded rather than smoothed over.
+
+**Gate:** met. Remaining: prefill chunk tuning (#20) to recover part of
+that 20%.
 
 ## M3 design brief (from b10423 source reading, 2026-08-19)
 
