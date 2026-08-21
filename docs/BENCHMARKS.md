@@ -41,10 +41,38 @@ protocols (the repo's historic 20.44 figure scores all positions).
 The use case is coding, and until now nothing here measured code: GSM8K
 measures arithmetic reasoning and wikitext measures next-token loss.
 
-| benchmark | Qwen3.8-27B UD-Q8_K_XL |
-|---|---|
-| HumanEval pass@1 (all 164) | **79.3% ± 3.2** |
-| MBPP pass@1 (3-shot, 200) | 0.0 — see below, this is a protocol artifact |
+| benchmark | UD-Q8_K_XL | UD-Q6_K_XL-v3 |
+|---|---|---|
+| HumanEval pass@1 (all 164) | **79.3% ± 3.2** | 77.4% ± 3.3 |
+| MBPP pass@1 (3-shot, 200) | 0.0 — protocol artifact, see below | — |
+
+### Does quantization damage show up in code? Probably, but this cannot prove it
+
+The quant comparison that motivated all of this — GSM8K separating Q8 from
+Q6 by ~3 points while wikitext perplexity was identical to four figures —
+was worth repeating on the workload that actually matters. Both quants ran
+in one window, same build, same harness:
+
+| | Q8 − Q6 | combined σ | significance |
+|---|---|---|---|
+| GSM8K (1319 items) | +2.9 pts | 1.84 | 1.6σ |
+| HumanEval (164 items) | +1.8 pts | 4.56 | 0.4σ |
+| inverse-variance combined | **+2.7 pts** | 1.71 | 1.6σ |
+
+**Neither is significant on its own, and the combination is not either.**
+HumanEval has 164 problems, so its standard error is ±3.3 — far too coarse
+to resolve a two-point difference. What can honestly be said is that both
+benchmarks point the same direction, by a similar margin, on a difference
+perplexity cannot see at all. That is consistent with real quantization
+damage and is not proof of it.
+
+The trade is worth stating plainly, because it is a real choice rather than
+a free lunch: at ctx 32768 with the full stack resident, Q6 leaves 8.96 GiB
+free against Q8's 5.36 — **5.7 GiB**, which at f16 KV is roughly 90K more
+context, or the headroom to run vision at full fidelity beside a large one.
+Q8 ships because the standing priority is accuracy over context and both
+point estimates favour it. Someone who needs 190K of context more than two
+points of pass@1 should read this table and choose the other way.
 
 Run through codpiece's own API via lm-evaluation-harness (`local-completions`,
 greedy, 0-shot, the harness's standard stop sequences).
