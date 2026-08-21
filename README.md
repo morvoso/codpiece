@@ -133,10 +133,10 @@ windows. llama.cpp is b10423 in its production configuration.
 | greedy decode, prose | **71.2 tok/s** | 64.5 | 76–95 |
 | greedy decode, code | **82.2** | 53.3 | — |
 | greedy decode, arithmetic | **117.4** | — | — |
-| sampled (temp 1.0), short | **45.2** | 32.4 | — |
-| sampled, 32K context | 47.4 | **52.7** | — |
+| sampled (temp 1.0), short | **51.2** | 32.4 | — |
+| sampled, 32K context | **53.7** | 52.7 | — |
 | prefill, 32K prompt | 1,337 | 1,353 | — |
-| 8 concurrent requests | **153.5** | ~101 | 251–260 |
+| aggregate throughput (32 streams) | **268.5** | ~101 (8-way) | 251–260 |
 | return to a 32K conversation | **0.9 s** | 1.3 s | — |
 | speculation acceptance | 0.64–0.73 (0.91–0.93 opt-in) | ~0.78 | — |
 | vision (same page, same question) | same answer, 847 tok/s prefill | same, 837 | n/a |
@@ -149,14 +149,15 @@ without it the MTP-head numbers are 58-86 by class. Sampled decode
 routes to the gumbel-coupled chain automatically — measured better
 there.
 
-Honest caveats: llama.cpp still wins sampled decode at 32K by ~10% and can
-run 196K context where codpiece's speculation stops near 145K. Its higher
-acceptance ratio is denominator filtering (`--spec-draft-p-min 0.75` declines
-low-confidence drafts), not better text — the same filtering is available
-here via the `PMIN` knobs and is off by default because it costs throughput.
-vLLM wins raw throughput at high concurrency, but only at FP8 weight
-precision — this project's quant keeps the sensitive tensors in BF16, and
-accuracy outranks speed here by design.
+Honest caveats: sampled decode at 32K now runs 53.7 vs llama.cpp's 52.7
+(gumbel-coupled chains closed its last speed win); its one remaining edge
+is 196K context, where codpiece's speculation stops near 145K. Its higher
+acceptance ratio is denominator filtering (`--spec-draft-p-min 0.75`
+declines low-confidence drafts), not better text. The aggregate row uses
+32 batch slots (`CODPIECE_BATCH=32 CODPIECE_BATCH_CTX=1536`) — batch
+rounds stay memory-bound to large widths, so slots are cheap; vLLM needs
+FP8 weight precision for its 251-260, which codpiece passes at Q8 with
+the sensitive tensors in BF16.
 
 ## Technical details
 
