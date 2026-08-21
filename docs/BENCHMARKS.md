@@ -181,6 +181,49 @@ to what was actually resident:
 
    Serving serially is slower; taking the process down is worse.
 
+## Anatomy of a single-stream round, and three dead ends
+
+Measured with `CODPIECE_DECODE_TRACE=1` at ctx 16384 and 98304 — which are
+**the same to within noise**, so nothing below is a context effect:
+
+| | baseline | no lattice | 1-token forward |
+|---|---|---|---|
+| verify | 42.1 ms (8 tokens) | 27.5 ms (1 token) | — |
+| draft: inject | 0.73 ms | 0.31 ms | — |
+| draft: block | 14.20 ms | 10.22 ms | — |
+| tokens/round | 5.02 | 1.00 | — |
+
+From which:
+
+- **The marginal cost of a drafted token is 2.1 ms** ((42.1−27.5)/7).
+  Extra drafts are cheap; what is expensive is drafting them. So
+  *acceptance per round* is the lever, not draft depth or attention.
+- **The top-k + selector lattice costs 4.0 ms** (14.20 − 10.22). The other
+  10.2 ms is the drafter's 5 layers plus the shared output head, against a
+  ~3 ms bandwidth floor for the 2.76 GB they read.
+- **A 1-token forward costs 27.5 ms** where llama.cpp does the same work in
+  ~18.8 ms on this box (53.3 tok/s greedy). We are ~46% slower per forward,
+  and that — not communication, not attention, not the scheduler — is the
+  largest remaining single-stream gap.
+
+### Three hypotheses that measurement killed
+
+1. **"Merge the inject and draft graphs."** Estimated at 5–8 ms. The split
+   says `inject 0.73 ms`. Merging saves the inject launch, ~0.6 ms — not
+   worth a refactor of unsafe graph-building code.
+2. **"Attention over a long KV cache is a meaningful cost."** 16K and 98K
+   decode identically (verify 40.5 vs 40.7 ms; code 91.0 vs 90.1 tok/s).
+   Configured context is nearly free and occupied context nearly so.
+3. **"Tensor-parallel all-reduce is the ~20 ms gap."** 130 reductions per
+   forward, host-bounced because GeForce P2P is driver-disabled — a good
+   story, and wrong. `GGML_CUDA_ALLREDUCE=internal` gives 40.7 ms (and
+   changes the output: different reduction order, different rounding).
+   `GGML_CUDA_P2P=1` gives 42.5 ms with a byte-identical hash, i.e. the
+   driver ignored it. And `=none`, which skips reductions entirely and
+   produces provably wrong output, measures **47.5 ms — slower than
+   baseline**. Removing all communication saves nothing, so communication
+   was never the cost.
+
 ## Where a decode round's time actually goes
 
 Measured with `CODPIECE_BATCH_TRACE=1` / `CODPIECE_DECODE_TRACE=1`.
