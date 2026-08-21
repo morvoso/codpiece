@@ -1049,6 +1049,26 @@ fn run_job(
         cfg.max_depth,
     );
     let mut round_depth = picker.choose();
+    // Confidence-driven depth extension: MEASURED WORSE, off by default.
+    // The model said an extra chain link (~6 ms) pays whenever its odds clear
+    // ~0.35, and the in-graph confidences supply the odds. The measurement
+    // said otherwise on all three prompt kinds (code 62.4 vs 64.7, prose 44.9
+    // vs 49.0, arithmetic 80.4 vs 81.1 tok/s): link k only lands if every
+    // earlier link landed, so the joint probability compounds and depth 3
+    // stays the single peak regardless of per-link confidence — the fifth
+    // independent confirmation that deeper/filtered drafting does not beat a
+    // correctly chosen fixed depth on this model. CODPIECE_DEPTH_EXT=N>depth
+    // re-enables it for experiments.
+    const EXT_THRESH: f32 = 0.4;
+    let ext_max = if greedy && !adaptive {
+        std::env::var("CODPIECE_DEPTH_EXT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(fixed)
+            .clamp(fixed, cfg.max_depth)
+    } else {
+        fixed
+    };
     let n_vocab = model.hp.n_vocab as usize;
     // Thinking budget: if the model is still inside a <think> block after this many
     // generated tokens, its close sequence is force-fed so it resumes in answer mode
@@ -1248,6 +1268,15 @@ fn run_job(
             Some(t) => t,
             None if greedy => {
                 round_depth = picker.choose();
+                if ext_max > fixed {
+                    // one link beyond the links the head believes in
+                    let confident = (0..chain.len())
+                        .take_while(|&l| {
+                            conf.get(l).map(|v| v[n_keep]).unwrap_or(0.0) >= EXT_THRESH
+                        })
+                        .count();
+                    round_depth = (confident + 1).clamp(fixed, ext_max);
+                }
                 preds[n_keep]
             }
             None => {

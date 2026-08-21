@@ -23,10 +23,13 @@ index 7654ea1..e051c3a 100644
  // meta backend buffer
  //
  
-+// How many distinct graphs can keep their external views registered at once. A
-+// speculative decode round alternates a verify graph with one rollback graph per
-+// rollback distance, so a handful covers it; beyond that, slots are reused LRU.
-+#define GGML_META_COMPUTE_SLOTS 8
++// How many distinct graphs can keep their external views registered at once.
++// Confidence-driven depth extension widens the working set: fused shapes for
++// depths 3..5 plus their transition shapes, one rollback graph per rollback
++// distance, the cached decode/prefill/MTP graphs — ~15 live uids. Reclaiming a
++// slot that a later replay still needs is what produced the cross-wired
++// K/V-source aborts, so the pool holds the whole set with margin.
++#define GGML_META_COMPUTE_SLOTS 24
 +
  // Container to hold the tensor slices per simple ggml backend buffer.
  struct ggml_backend_meta_simple_tensor_container {
