@@ -544,11 +544,40 @@ fn worker(
     // headroom that only exists once every session is allocated. Readiness is
     // published after it for the same reason: the port opening should mean the
     // server is done taking memory, not that it is about to.
+    let batch_slots = std::env::var("CODPIECE_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1);
+    // Per-slot KV region. 8192 suits long jobs; concurrent short-request
+    // fleets (the vLLM-style workload) fit far more slots at 2-4K, and slots
+    // are what aggregate throughput scales with while rounds stay
+    // memory-bound (measured 16.5 -> 16.3 tok/s/seq from 8-way to 12-way).
+    let batch_seq_ctx = std::env::var("CODPIECE_BATCH_CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8192)
+        .min(cfg.n_ctx);
+
+    // What the batch session will claim when concurrency first happens. The
+    // encoder has to be capped as though that memory were already gone,
+    // because it will be by the time an image and a busy server coincide.
+    let batch_reserve = if batch_slots > 1 {
+        let devs = codpiece_model::device_memory().len().max(1);
+        codpiece_model::qwen35::session_bytes(
+            &model,
+            batch_slots * batch_seq_ctx,
+            batch_slots - 1,
+        ) / devs
+    } else {
+        0
+    };
+
     let vision_prep = vision.as_ref().map(|v| {
         let max_t = std::env::var("CODPIECE_IMAGE_MAX_TOKENS")
             .ok()
             .and_then(|x| x.parse().ok())
-            .unwrap_or_else(vision_token_cap);
+            .unwrap_or_else(|| vision_token_cap(batch_reserve));
         // prod llama.cpp runs --image-min-tokens 1024 (Qwen-VL grounding
         // degrades below that), so that is the default here too — but a floor
         // above the ceiling is nonsense, so the floor yields.
@@ -576,20 +605,6 @@ fn worker(
     let mut clock = 0u64;
     // The batch session is created the first time two requests overlap: it costs
     // ~2.6 GiB of VRAM, and a single-user box that never overlaps never pays it.
-    let batch_slots = std::env::var("CODPIECE_BATCH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4)
-        .max(1);
-    // Per-slot KV region. 8192 suits long jobs; concurrent short-request
-    // fleets (the vLLM-style workload) fit far more slots at 2-4K, and slots
-    // are what aggregate throughput scales with while rounds stay
-    // memory-bound (measured 16.5 -> 16.3 tok/s/seq from 8-way to 12-way).
-    let batch_seq_ctx = std::env::var("CODPIECE_BATCH_CTX")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8192)
-        .min(cfg.n_ctx);
     let mut bsession: Option<Session> = None;
     // Once the batch session has been declined for want of VRAM, stop
     // re-pricing it on every overlapping request.
@@ -1252,8 +1267,14 @@ fn score_row(
 ///
 /// llama.cpp's default ceiling is 4096 tokens; that assumes a card with room
 /// to spare. `CODPIECE_IMAGE_MAX_TOKENS` overrides this.
-fn vision_token_cap() -> u32 {
-    let free_gib = FREE_GIB.get().copied().unwrap_or(0.0);
+fn vision_token_cap(reserved_bytes: usize) -> u32 {
+    // Headroom the encoder may actually claim, after setting aside whatever
+    // the batch session will take when concurrency first happens. Without
+    // that reservation the cap depends on allocation ORDER: measured at ctx
+    // 81920, the batch session was created first, took 0.76 GiB, and a
+    // 1024-token image then failed and left the card at zero for good.
+    let reserved = reserved_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let free_gib = (FREE_GIB.get().copied().unwrap_or(0.0) - reserved).max(0.0);
     let cap = match free_gib {
         f if f > 3.0 => 4096,
         f if f > 2.0 => 2048,
@@ -1263,9 +1284,10 @@ fn vision_token_cap() -> u32 {
     };
     if cap < 1024 {
         eprintln!(
-            "serve: only {free_gib:.2} GiB free — capping images at {cap} tokens. Qwen-VL \
-             grounding degrades below 1024; lower the context or unload the drafter for \
-             full-detail vision."
+            "serve: {free_gib:.2} GiB available to the encoder ({reserved:.2} GiB reserved \
+             for the batch session) — capping images at {cap} tokens. Qwen-VL grounding \
+             degrades below 1024; lower the context, lower CODPIECE_BATCH, or unload the \
+             drafter for full-detail vision."
         );
     }
     cap
