@@ -546,6 +546,33 @@ fn worker(
             }
         }
     }
+    // Scratch session: a small sacrificial slot for short requests that match
+    // no cached conversation. Without it, ANY drive-by request — a LAN
+    // screenshot annotator, a health probe with a prompt, a one-off question —
+    // evicts the long conversation from the (at long context: only) session
+    // and its owner pays a full re-prefill on their next turn. Measured on
+    // production: a 33K coding conversation re-prefilled between every turn,
+    // 35-70s of TTFT per turn, because a timeline annotator interleaved with
+    // it. The scratch is deliberately modest (default 4096, no speculation
+    // slots — plain decode is plenty for short jobs) so it fits beside a
+    // large context; if VRAM cannot cover even that, serving continues
+    // without one, behavior unchanged.
+    let scratch_ctx = std::env::var("CODPIECE_SCRATCH_CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4096);
+    let mut scratch_idx: Option<usize> = None;
+    if scratch_ctx > 0 && fits_in_vram(&model, scratch_ctx, 1, "scratch session") {
+        match Session::new_spec(&model, scratch_ctx, 1) {
+            Ok(s) => {
+                pool.push((s, Vec::new(), 0));
+                scratch_idx = Some(pool.len() - 1);
+                eprintln!("serve: scratch session up ({scratch_ctx} tokens)");
+            }
+            Err(e) => eprintln!("serve: scratch session unavailable ({e})"),
+        }
+    }
+    let caps: Vec<usize> = pool.iter().map(|(s, _, _)| s.n_ctx_max).collect();
     eprintln!("serve: {} session slot(s)", pool.len());
     stats.session_slots.store(pool.len(), Ordering::Relaxed);
     report_vram("after weights, sessions, drafter, vision");
@@ -613,9 +640,11 @@ fn worker(
     // growth becomes visible instead of showing up as a dead process.
     let trace_vram = std::env::var("CODPIECE_TRACE_VRAM").is_ok_and(|v| v == "1");
     let mut dcaches: Vec<Option<DflashCache>> = (0..pool.len())
-        .map(|_| match &dflash {
-            Some(d) => d.new_cache().ok(),
-            None => None,
+        .map(|i| match &dflash {
+            // the scratch session has one snapshot slot and cannot roll back
+            // rejected drafts, so it never speculates and needs no draft cache
+            Some(d) if Some(i) != scratch_idx => d.new_cache().ok(),
+            _ => None,
         })
         .collect();
     let mut store = SessionStore::new();
@@ -690,8 +719,13 @@ fn worker(
         };
         clock += 1;
         let trace_reuse = std::env::var("CODPIECE_TRACE_REUSE").as_deref() == Ok("1");
-        let hit = pool.iter().position(|(_, h, _)| {
-            !h.is_empty() && h.len() < prompt_ids.len() && prompt_ids[..h.len()] == h[..]
+        // A prefix hit is only usable if the slot can also hold the new
+        // prompt: a conversation that outgrew the scratch must move on.
+        let hit = pool.iter().enumerate().position(|(i, (_, h, _))| {
+            !h.is_empty()
+                && h.len() < prompt_ids.len()
+                && prompt_ids.len() < caps[i]
+                && prompt_ids[..h.len()] == h[..]
         });
         if trace_reuse {
             match hit {
@@ -734,13 +768,32 @@ fn worker(
                 }
             }
         }
-        let slot = hit.unwrap_or_else(|| {
-            pool.iter()
-                .enumerate()
-                .min_by_key(|(_, (_, _, used))| *used)
-                .map(|(i, _)| i)
-                .expect("pool is never empty")
-        });
+        // Scoring resets whatever session it runs in, so it must never take a
+        // prefix hit on a live conversation — that would be an eviction wearing
+        // a hit's clothes. It prefers the scratch outright.
+        let scoring = job.req.echo_logprobs.is_some();
+        let scratch_fits = |need: usize| {
+            scratch_idx.is_some_and(|si| prompt_ids.len() + need < caps[si])
+        };
+        let slot = if scoring {
+            if scratch_fits(1) {
+                scratch_idx.unwrap()
+            } else {
+                lru_slot(&pool, scratch_idx)
+            }
+        } else {
+            hit.unwrap_or_else(|| {
+                // No conversation matches. A short request goes to the
+                // sacrificial scratch slot; evicting a long conversation for
+                // it would cost its owner a full re-prefill on their next
+                // turn (measured: 35-70s at 33K).
+                if scratch_fits(256) {
+                    scratch_idx.unwrap()
+                } else {
+                    lru_slot(&pool, scratch_idx)
+                }
+            })
+        };
         let (session, history, used) = &mut pool[slot];
         *used = clock;
         // Scoring replaces generation rather than preceding it: it needs
@@ -750,8 +803,11 @@ fn worker(
             let n = prompt_ids.len();
             let outcome = if n == 0 {
                 Err("cannot score an empty prompt".to_string())
-            } else if n > cfg.n_ctx {
-                Err(format!("prompt of {n} tokens exceeds the {} token context", cfg.n_ctx))
+            } else if n > session.n_ctx_max {
+                Err(format!(
+                    "prompt of {n} tokens exceeds this session's {} token capacity",
+                    session.n_ctx_max
+                ))
             } else {
                 run_score(
                     &model,
@@ -791,9 +847,13 @@ fn worker(
             continue 'serve;
         }
         let dcache = &mut dcaches[slot];
+        // The scratch has one snapshot slot, so rejected drafts could not be
+        // rolled back; it runs plain decode. Short requests do not miss the
+        // speculation much, and it keeps the scratch cheap enough to exist.
+        let speculate_here = can_speculate && Some(slot) != scratch_idx;
         let outcome = run_job(
             &model, &tok, &cfg, vision.as_ref(), dflash.as_ref(), dcache, session, history,
-            &mut store, can_speculate, job, &stats,
+            &mut store, speculate_here, job, &stats,
         );
         if trace_vram {
             report_vram("after request");
@@ -1474,6 +1534,18 @@ fn vision_token_cap(reserved_bytes: usize) -> u32 {
     cap
 }
 
+/// Least-recently-used slot among the full-size sessions. The scratch is
+/// excluded: it is chosen deliberately, never as an eviction victim, and the
+/// pool always holds at least one full-size session.
+fn lru_slot(pool: &[(Session, Vec<u32>, u64)], scratch_idx: Option<usize>) -> usize {
+    pool.iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != scratch_idx)
+        .min_by_key(|(_, (_, _, used))| *used)
+        .map(|(i, _)| i)
+        .expect("pool always holds a full-size session")
+}
+
 /// Whether a request's prompt plus its generation fits one batch slot's
 /// region. Tokenizing here duplicates work `admit` does again, but the
 /// alternative is admitting a request that cannot be served.
@@ -1595,12 +1667,15 @@ fn run_job(
     // both clamp. Only a prompt that does not itself fit is an error, and it
     // says so specifically.
     let mut req = req;
-    let room = cfg.n_ctx.saturating_sub(prompt_ids.len());
+    // capacity comes from the session this request landed in — the scratch
+    // session is smaller than the configured context
+    let cap = session.n_ctx_max;
+    let room = cap.saturating_sub(prompt_ids.len());
     if room == 0 {
         return Err(format!(
-            "prompt of {} tokens does not fit the {} token context",
+            "prompt of {} tokens does not fit this session's {} token capacity",
             prompt_ids.len(),
-            cfg.n_ctx
+            cap
         ));
     }
     if req.max_tokens > room {

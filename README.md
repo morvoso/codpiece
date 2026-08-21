@@ -176,6 +176,7 @@ sampling field — including `"temperature": 0` — and your choice stands.
 | `CODPIECE_IMAGE_MIN_TOKENS` | 1024 | image detail floor; Qwen-VL reads text poorly below this |
 | `CODPIECE_IMAGE_MAX_TOKENS` | from free VRAM | image detail ceiling; see below |
 | `CODPIECE_GRAPH_CACHE_MIB` | 1024 | VRAM the per-session cache of compiled graph shapes may hold |
+| `CODPIECE_SCRATCH_CTX` | 4096 | sacrificial small session for short unmatched requests, so a drive-by request cannot evict a long conversation; `0` disables |
 | `CODPIECE_BATCH_GREEDY` | on | all-greedy batch rounds argmax in the graph instead of reading back full logits |
 
 The image ceiling is derived from measured headroom rather than fixed,
