@@ -1063,7 +1063,19 @@ fn run_job(
     let noise_rx = if use_gumbel {
         let t = req.params.temp;
         let vocab = model.hp.n_vocab as usize;
-        let rows = (cfg.depth.clamp(1, 2) + 1).max(req.think_close.len() + 1);
+        // widest batch a sampled round can present: the chain clamp, the
+        // post-divergence re-draft (which may exceed the chain depth — the
+        // verify batch is allowed to be wider than the chain), or a forced
+        // think-close, plus the committed token
+        let redraft_rows: usize = std::env::var("CODPIECE_REDRAFT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let rows = 1 + cfg
+            .depth
+            .clamp(1, 2)
+            .max(redraft_rows)
+            .max(req.think_close.len());
         let seed = req.params.seed ^ 0x9E37_79B9_7F4A_7C15;
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
         std::thread::Builder::new()
