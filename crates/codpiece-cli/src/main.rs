@@ -1699,11 +1699,23 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
     let out_positions: Vec<i32> = (first..n_ctx - 1).map(|j| j as i32).collect();
 
     let n_vocab = model.hp.n_vocab as usize;
+    // A session reset per chunk gives the same zeroed state as the stateless
+    // rig, and the session path is the one whose cache tensors classify
+    // correctly under tensor parallelism (the stateless zero-state inputs
+    // land in compute buffers, which the meta backend cannot split).
+    let mut session = match codpiece_model::qwen35::Session::new_spec(&model, n_ctx, 1) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("session: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut nll = 0f64;
     let mut count = 0usize;
     for i in 0..n_chunk {
         let chunk = &tokens[i * n_ctx..(i + 1) * n_ctx];
-        let logits = match model.forward(chunk, &out_positions, threads) {
+        session.reset();
+        let logits = match model.step(&mut session, chunk, &out_positions, threads) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("chunk {i}: {e}");
