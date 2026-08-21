@@ -16,10 +16,10 @@ index 5cb49d0..744385c 100644
      GGML_API int                   ggml_graph_size   (struct ggml_cgraph * cgraph);
      GGML_API struct ggml_tensor *  ggml_graph_node   (struct ggml_cgraph * cgraph, int i); // if i < 0, returns nodes[n_nodes + i]
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 7654ea1..e051c3a 100644
+index 7654ea1..0540eb3 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -395,18 +395,32 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
+@@ -395,18 +395,35 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
  // meta backend buffer
  //
  
@@ -56,7 +56,7 @@ index 7654ea1..e051c3a 100644
  };
  
  struct ggml_backend_meta_buffer_context {
-@@ -418,7 +432,17 @@ struct ggml_backend_meta_buffer_context {
+@@ -418,7 +435,17 @@ struct ggml_backend_meta_buffer_context {
      // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
      //     currently not possible due to graph-external operations in the backend scheduler.
      ggml_backend_meta_simple_tensor_container stc_static;
@@ -75,7 +75,7 @@ index 7654ea1..e051c3a 100644
      int stc_compute_index      = 0;
      int stc_compute_index_next = 0;
      std::vector<ggml_backend_buffer_ptr> bufs;
-@@ -433,10 +457,10 @@ struct ggml_backend_meta_buffer_context {
+@@ -433,10 +460,10 @@ struct ggml_backend_meta_buffer_context {
  
      ggml_backend_meta_buffer_context(
              ggml_backend_meta_simple_tensor_container & stc_static,
@@ -89,7 +89,7 @@ index 7654ea1..e051c3a 100644
          this->bufs.reserve(bufs.size());
          for (ggml_backend_buffer_t buf : bufs) {
              this->bufs.emplace_back(buf);
-@@ -449,7 +473,44 @@ struct ggml_backend_meta_buffer_context {
+@@ -449,7 +476,44 @@ struct ggml_backend_meta_buffer_context {
          if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
              return stc_static;
          }
@@ -135,7 +135,7 @@ index 7654ea1..e051c3a 100644
      }
  };
  
-@@ -1511,8 +1572,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1511,18 +1575,29 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
          /*.no_alloc   =*/ true,
      };
      ggml_backend_meta_simple_tensor_container stc_static;
@@ -145,8 +145,21 @@ index 7654ea1..e051c3a 100644
  
      size_t max_size = 0;
      std::vector<ggml_backend_buffer_t> bufs;
-@@ -1522,7 +1582,9 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
-         GGML_ASSERT(bufs.back() != nullptr);
+     bufs.reserve(n_simple_bufts);
+     for (size_t i = 0; i < n_simple_bufts; i++) {
+         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
+-        GGML_ASSERT(bufs.back() != nullptr);
++        // [codpiece] an out-of-memory device must fail the allocation, not
++        // abort the process: gallocr propagates nullptr and the engine turns
++        // it into a request error while the server keeps serving
++        if (bufs.back() == nullptr) {
++            for (auto * b : bufs) {
++                if (b) {
++                    ggml_backend_buffer_free(b);
++                }
++            }
++            return nullptr;
++        }
          max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
      }
 -    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
@@ -156,7 +169,7 @@ index 7654ea1..e051c3a 100644
  
      return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
  }
-@@ -1541,12 +1603,13 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
+@@ -1541,12 +1616,13 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
          /*.mem_buffer =*/ nullptr,
          /*.no_alloc   =*/ true,
      };
@@ -174,7 +187,7 @@ index 7654ea1..e051c3a 100644
  
      ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
      for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-@@ -1811,15 +1874,45 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -1811,15 +1887,45 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  used_buffers.emplace(cgraph->nodes[i]->buffer);
              }
          }
@@ -225,7 +238,7 @@ index 7654ea1..e051c3a 100644
          size_t n_subgraphs  = 0;
          size_t max_tmp_size = 0;
  
-@@ -1988,6 +2081,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -1988,6 +2094,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
          backend_ctx->uid         = cgraph->uid;
          backend_ctx->n_subgraphs = n_subgraphs;
  
@@ -246,7 +259,7 @@ index 7654ea1..e051c3a 100644
          if (max_tmp_size > backend_ctx->max_tmp_size) {
              for (size_t j = 0; j < n_backends; j++) {
                  auto & bcj = backend_ctx->backend_configs[j];
-@@ -2011,10 +2118,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2011,10 +2131,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  /*.no_alloc   =*/ true,
              };
              backend_ctx->ctx.reset(ggml_init(params));
