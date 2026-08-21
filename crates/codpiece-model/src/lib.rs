@@ -13,6 +13,7 @@ use std::path::Path;
 use codpiece_ggml_sys as ffi;
 use codpiece_gguf::GgufFile;
 
+pub mod dflash;
 pub mod meta;
 pub mod mtp_graph;
 pub mod oracle;

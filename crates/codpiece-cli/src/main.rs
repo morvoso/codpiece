@@ -29,6 +29,7 @@ fn main() -> ExitCode {
         Some("serve") => cmd_serve(&args[1..]),
         Some("batchtest") => cmd_batchtest(&args[1..]),
         Some("vision") => cmd_vision(&args[1..]),
+        Some("dflash-test") => cmd_dflash_test(&args[1..]),
         _ => {
             eprintln!(
                 "usage: codpiece inspect <file.gguf> [--tensors] [--kv <key>] [--dump-template <out>]\n\
@@ -42,6 +43,92 @@ fn main() -> ExitCode {
 }
 
 
+
+/// Dev smoke for the DFlash2 drafter: load trunk + draft on CPU, inject
+/// deterministic synthetic features, draft one block, walk it greedily,
+/// and check the whole thing is finite and repeatable. Not a semantic
+/// gate — that comes from the acceptance A/B on the real engine.
+fn cmd_dflash_test(args: &[String]) -> ExitCode {
+    let (Some(trunk_path), Some(draft_path)) = (args.first(), args.get(1)) else {
+        eprintln!("usage: codpiece dflash-test <trunk.gguf> <draft.gguf>");
+        return ExitCode::from(2);
+    };
+    let t0 = std::time::Instant::now();
+    let trunk = match codpiece_model::qwen35::Qwen35::load_on(
+        Path::new(trunk_path),
+        codpiece_model::Device::Cpu,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("trunk load: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("trunk loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    let dfl = match codpiece_model::dflash::Dflash::load(
+        Path::new(draft_path),
+        codpiece_model::Device::Cpu,
+        &trunk,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("dflash load: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "dflash loaded: {} layers, block {}, top-k {}, taps {:?}, mask id {}",
+        dfl.hp.n_layer, dfl.hp.block_size, dfl.hp.selector_top_k, dfl.hp.target_layers,
+        dfl.hp.mask_token
+    );
+    let mut run = || -> Result<Vec<u32>, String> {
+        let mut cache = dfl.new_cache().map_err(|e| format!("{e:?}"))?;
+        let n_feat = dfl.hp.n_feat() as usize;
+        let t = 24usize;
+        let feats: Vec<f32> = (0..t * n_feat)
+            .map(|i| ((i % 251) as f32 * 0.017).sin() * 0.05)
+            .collect();
+        dfl.inject(&mut cache, &feats, 0, 8).map_err(|e| format!("{e:?}"))?;
+        let lat = dfl
+            .draft_block(&cache, 9906, t, 8)
+            .map_err(|e| format!("{e:?}"))?;
+        for (p, c) in lat.cand.iter().enumerate().take(3) {
+            eprintln!("  pos {p}: cand[0..4] = {:?}", &c[..4]);
+        }
+        let drafts = lat.walk_greedy(7);
+        if drafts.len() != 7 {
+            return Err(format!("walk produced {} drafts", drafts.len()));
+        }
+        for s in lat.scores.iter().skip(1) {
+            if s.iter().any(|v| !v.is_finite()) {
+                return Err("non-finite scores".into());
+            }
+        }
+        Ok(drafts)
+    };
+    let a = match run() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("run 1: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let b = match run() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("run 2: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("drafts: {a:?}");
+    if a == b {
+        println!("deterministic: OK");
+        ExitCode::SUCCESS
+    } else {
+        println!("NON-DETERMINISTIC <<< {b:?}");
+        ExitCode::FAILURE
+    }
+}
 
 /// Encode a synthetic image through the vision tower and print the result in
 /// exactly the format of clip.cpp's MTMD_DEBUG_EMBEDDINGS dump, so the two
