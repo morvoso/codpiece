@@ -29,7 +29,7 @@ index 7654ea1..e051c3a 100644
 +// distance, the cached decode/prefill/MTP graphs — ~15 live uids. Reclaiming a
 +// slot that a later replay still needs is what produced the cross-wired
 +// K/V-source aborts, so the pool holds the whole set with margin.
-+#define GGML_META_COMPUTE_SLOTS 24
++#define GGML_META_COMPUTE_SLOTS 32
 +
  // Container to hold the tensor slices per simple ggml backend buffer.
  struct ggml_backend_meta_simple_tensor_container {

@@ -707,7 +707,7 @@ pub struct FusedOut {
 /// before it is a hit-rate one. Six is enough that a session bounded to three depths
 /// never evicts, which matters for more than hit rate: eviction frees a compute buffer
 /// the backend may still hold registrations against.
-const FUSED_CACHE: usize = 6;
+const FUSED_CACHE: usize = 12;
 
 
 /// A session's state, lifted to host RAM.
@@ -1638,14 +1638,20 @@ impl Qwen35 {
                         ffi::ggml_gallocr_free(c.galloc);
                         session.graveyard.push(c.built.ctx);
                     }
-                    let tail = MtpTail {
-                        k_cache: session.mtp_k,
-                        v_cache: session.mtp_v,
-                        n_ctx_max: session.n_ctx_max,
-                        n_past: 0,
-                        n_kv: mtp_bucket,
-                        depth,
-                        n_cand,
+                    // depth 0 = verify-only: an external drafter (DFlash2)
+                    // supplies the drafts, so no MTP tail is built at all
+                    let tail = if depth == 0 {
+                        None
+                    } else {
+                        Some(MtpTail {
+                            k_cache: session.mtp_k,
+                            v_cache: session.mtp_v,
+                            n_ctx_max: session.n_ctx_max,
+                            n_past: 0,
+                            n_kv: mtp_bucket,
+                            depth,
+                            n_cand,
+                        })
                     };
                     let built = self.build_inner(
                         t_len,
@@ -1655,7 +1661,7 @@ impl Qwen35 {
                         /* use_set_rows */ true,
                         0,
                         /* greedy */ true,
-                        Some(tail),
+                        tail,
                         SeqMode::Single,
                         false,
                         gumbel,
@@ -1706,25 +1712,27 @@ impl Qwen35 {
             let rows: Vec<i64> = (0..t).map(|i| (session.n_past + i) as i64).collect();
             ffi::ggml_backend_tensor_set(b.row_ids, rows.as_ptr().cast(), 0, t * 8);
 
-            let mut mpos = vec![0i32; no * 4];
-            for i in 0..no {
-                let p = (session.rope_base() + first_out + i + 1) as i32;
-                mpos[i] = p;
-                mpos[no + i] = p;
-                mpos[2 * no + i] = p;
-            }
-            ffi::ggml_backend_tensor_set(b.mtp_pos, mpos.as_ptr().cast(), 0, mpos.len() * 4);
-            let mrows: Vec<i64> = (0..no).map(|i| (session.mtp_past + i) as i64).collect();
-            ffi::ggml_backend_tensor_set(b.mtp_rows, mrows.as_ptr().cast(), 0, no * 8);
-
-            let nkv = b.mtp_n_kv as usize;
-            let mut mask = vec![0xFC00u16; nkv * no];
-            for q in 0..no {
-                for kv in 0..=(session.mtp_past + q).min(nkv - 1) {
-                    mask[q * nkv + kv] = 0;
+            if !b.mtp_pos.is_null() {
+                let mut mpos = vec![0i32; no * 4];
+                for i in 0..no {
+                    let p = (session.rope_base() + first_out + i + 1) as i32;
+                    mpos[i] = p;
+                    mpos[no + i] = p;
+                    mpos[2 * no + i] = p;
                 }
+                ffi::ggml_backend_tensor_set(b.mtp_pos, mpos.as_ptr().cast(), 0, mpos.len() * 4);
+                let mrows: Vec<i64> = (0..no).map(|i| (session.mtp_past + i) as i64).collect();
+                ffi::ggml_backend_tensor_set(b.mtp_rows, mrows.as_ptr().cast(), 0, no * 8);
+
+                let nkv = b.mtp_n_kv as usize;
+                let mut mask = vec![0xFC00u16; nkv * no];
+                for q in 0..no {
+                    for kv in 0..=(session.mtp_past + q).min(nkv - 1) {
+                        mask[q * nkv + kv] = 0;
+                    }
+                }
+                ffi::ggml_backend_tensor_set(b.mtp_mask, mask.as_ptr().cast(), 0, mask.len() * 2);
             }
-            ffi::ggml_backend_tensor_set(b.mtp_mask, mask.as_ptr().cast(), 0, mask.len() * 2);
             if let (Some(c), false) = (cands, b.cand_ids.is_null()) {
                 ffi::ggml_backend_tensor_set(b.cand_ids, c.as_ptr().cast(), 0, c.len() * 4);
             }
@@ -1741,7 +1749,12 @@ impl Qwen35 {
                 conf.push(c);
             }
             let mut chain: Vec<Vec<u32>> = Vec::new();
-            for tnsr in std::iter::once(b.draft_out).chain(b.draft_chain.iter().copied()) {
+            let chain_srcs: Vec<*mut ffi::ggml_tensor> = if b.draft_out.is_null() {
+                Vec::new()
+            } else {
+                std::iter::once(b.draft_out).chain(b.draft_chain.iter().copied()).collect()
+            };
+            for tnsr in chain_srcs {
                 let mut ids = vec![0i32; no];
                 ffi::ggml_backend_tensor_get(tnsr, ids.as_mut_ptr().cast(), 0, no * 4);
                 // with a shortlist the argmax indexes the shortlist, not the vocab

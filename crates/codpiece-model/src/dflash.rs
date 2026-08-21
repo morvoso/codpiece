@@ -124,11 +124,45 @@ pub struct DflashCache {
     pub ring: usize,
     /// highest injected position + 1 (the drafter's view of history)
     pub n_seen: usize,
+    /// the one draft-graph shape, built once and replayed (uid-stamped so
+    /// the TP meta backend replays its device map instead of rebuilding)
+    draft: Option<CachedDraftGraph>,
+    /// inject graphs keyed by token count, small LRU
+    injects: Vec<CachedInjectGraph>,
+}
+
+struct CachedDraftGraph {
+    ctx: *mut ffi::ggml_context,
+    gf: *mut ffi::ggml_cgraph,
+    galloc: ffi::ggml_gallocr_t,
+    inp_tokens: *mut ffi::ggml_tensor,
+    inp_pos: *mut ffi::ggml_tensor,
+    kq_mask: *mut ffi::ggml_tensor,
+    cand: *mut ffi::ggml_tensor,
+    packed: Vec<*mut ffi::ggml_tensor>,
+}
+
+struct CachedInjectGraph {
+    t: usize,
+    ctx: *mut ffi::ggml_context,
+    gf: *mut ffi::ggml_cgraph,
+    galloc: ffi::ggml_gallocr_t,
+    inp: *mut ffi::ggml_tensor,
+    inp_pos: *mut ffi::ggml_tensor,
+    rows: *mut ffi::ggml_tensor,
 }
 
 impl Drop for DflashCache {
     fn drop(&mut self) {
         unsafe {
+            if let Some(d) = self.draft.take() {
+                ffi::ggml_gallocr_free(d.galloc);
+                ffi::ggml_free(d.ctx);
+            }
+            for g in self.injects.drain(..) {
+                ffi::ggml_gallocr_free(g.galloc);
+                ffi::ggml_free(g.ctx);
+            }
             ffi::ggml_gallocr_free(self.galloc);
             ffi::ggml_backend_buffer_free(self.buffer);
             ffi::ggml_free(self.ctx);
@@ -314,13 +348,24 @@ impl Dflash {
                 ffi::ggml_free(ctx);
                 return Err(ModelError::Load("dflash cache gallocr".into()));
             }
-            Ok(DflashCache { ctx, buffer, galloc, k, v, ring, n_seen: 0 })
+            Ok(DflashCache {
+                ctx,
+                buffer,
+                galloc,
+                k,
+                v,
+                ring,
+                n_seen: 0,
+                draft: None,
+                injects: Vec::new(),
+            })
         }
     }
 
     /// Inject trunk features for positions `[pos0, pos0 + t)` into the draft
     /// KV ring. `features` is `[n_feat, t]` row-major per position — the
-    /// concatenated layer-input hiddens the trunk graph tapped.
+    /// concatenated layer-input hiddens the trunk graph tapped. Graphs are
+    /// cached per token count and replayed.
     pub fn inject(
         &self,
         cache: &mut DflashCache,
@@ -334,6 +379,38 @@ impl Dflash {
         if t == 0 || features.len() != t * n_feat as usize {
             return Err(ModelError::Load("dflash inject: bad feature buffer".into()));
         }
+        if !cache.injects.iter().any(|g| g.t == t) {
+            let g = self.build_inject(cache, t)?;
+            if cache.injects.len() >= 8 {
+                let old = cache.injects.remove(0);
+                unsafe {
+                    ffi::ggml_gallocr_free(old.galloc);
+                    ffi::ggml_free(old.ctx);
+                }
+            }
+            cache.injects.push(g);
+        }
+        let g = cache.injects.iter().find(|g| g.t == t).unwrap();
+        unsafe {
+            ffi::ggml_backend_tensor_set(g.inp, features.as_ptr().cast(), 0, features.len() * 4);
+            let pos: Vec<i32> = (0..t).map(|i| (pos0 + i) as i32).collect();
+            ffi::ggml_backend_tensor_set(g.inp_pos, pos.as_ptr().cast(), 0, t * 4);
+            let ring_rows: Vec<i64> =
+                (0..t).map(|i| ((pos0 + i) % cache.ring) as i64).collect();
+            ffi::ggml_backend_tensor_set(g.rows, ring_rows.as_ptr().cast(), 0, t * 8);
+            self.compute(g.gf, n_threads)?;
+        }
+        cache.n_seen = cache.n_seen.max(pos0 + t);
+        Ok(())
+    }
+
+    fn build_inject(
+        &self,
+        cache: &DflashCache,
+        t: usize,
+    ) -> Result<CachedInjectGraph, ModelError> {
+        let hp = &self.hp;
+        let n_feat = hp.n_feat();
         unsafe {
             let graph_nodes = hp.n_layer * 16 + 32;
             let params = ffi::ggml_init_params {
@@ -344,13 +421,6 @@ impl Dflash {
             };
             let ctx = ffi::ggml_init(params);
             let gf = ffi::ggml_new_graph_custom(ctx, graph_nodes, false);
-            struct G(*mut ffi::ggml_context);
-            impl Drop for G {
-                fn drop(&mut self) {
-                    unsafe { ffi::ggml_free(self.0) }
-                }
-            }
-            let _g = G(ctx);
             let f32t = ffi::ggml_type_GGML_TYPE_F32;
 
             let inp = ffi::ggml_new_tensor_2d(ctx, f32t, n_feat, t as i64);
@@ -409,30 +479,97 @@ impl Dflash {
                 ffi::ggml_build_forward_expand(gf, vw);
             }
 
-            if !ffi::ggml_gallocr_alloc_graph(cache.galloc, gf) {
+            let galloc = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
+                self.backend,
+            ));
+            if galloc.is_null() || !ffi::ggml_gallocr_alloc_graph(galloc, gf) {
+                if !galloc.is_null() {
+                    ffi::ggml_gallocr_free(galloc);
+                }
+                ffi::ggml_free(ctx);
                 return Err(ModelError::Load("dflash inject alloc".into()));
             }
-            ffi::ggml_backend_tensor_set(inp, features.as_ptr().cast(), 0, features.len() * 4);
-            let pos: Vec<i32> = (0..t).map(|i| (pos0 + i) as i32).collect();
-            ffi::ggml_backend_tensor_set(inp_pos, pos.as_ptr().cast(), 0, t * 4);
-            let ring_rows: Vec<i64> = (0..t).map(|i| ((pos0 + i) % cache.ring) as i64).collect();
-            ffi::ggml_backend_tensor_set(rows, ring_rows.as_ptr().cast(), 0, t * 8);
-            self.compute(gf, n_threads)?;
+            ffi::ggml_graph_set_new_uid(gf);
+            Ok(CachedInjectGraph { t, ctx, gf, galloc, inp, inp_pos, rows })
         }
-        cache.n_seen = cache.n_seen.max(pos0 + t);
-        Ok(())
     }
 
     /// One block-diffusion draft call: `[anchor @ pos0, MASK x (block-1)]`,
-    /// non-causal over the injected window plus the block itself. Returns
-    /// the selector lattice for the host walk.
+    /// non-causal over the injected window plus the block itself. The single
+    /// graph shape is built once and replayed.
     pub fn draft_block(
         &self,
-        cache: &DflashCache,
+        cache: &mut DflashCache,
         anchor: u32,
         pos0: usize,
         n_threads: i32,
     ) -> Result<Lattice, ModelError> {
+        let hp = &self.hp;
+        if cache.draft.is_none() {
+            cache.draft = Some(self.build_draft(cache)?);
+        }
+        let g = cache.draft.as_ref().unwrap();
+        unsafe {
+            let mut toks = vec![hp.mask_token as i32; hp.block_size];
+            toks[0] = anchor as i32;
+            ffi::ggml_backend_tensor_set(g.inp_tokens, toks.as_ptr().cast(), 0, toks.len() * 4);
+            let pos: Vec<i32> = (0..hp.block_size).map(|i| (pos0 + i) as i32).collect();
+            ffi::ggml_backend_tensor_set(g.inp_pos, pos.as_ptr().cast(), 0, pos.len() * 4);
+
+            // mask: ring slots hold positions in (n_seen - ring, n_seen); a
+            // key at pk is visible iff pk < pos0 and within the window of
+            // the query. Block keys are mutually visible (non-causal).
+            let n_keys = cache.ring + hp.block_size;
+            let mut mask = vec![f32::NEG_INFINITY; n_keys * hp.block_size];
+            for qi in 0..hp.block_size {
+                let pq = pos0 + qi;
+                for slot in 0..cache.ring {
+                    let held = if cache.n_seen == 0 {
+                        None
+                    } else {
+                        let top = cache.n_seen - 1;
+                        let cand = top - ((top + cache.ring - slot) % cache.ring);
+                        if cand + cache.ring >= cache.n_seen { Some(cand) } else { None }
+                    };
+                    if let Some(pk) = held {
+                        if pk < pos0 && pq >= pk && (pq - pk) < hp.n_swa as usize {
+                            mask[qi * n_keys + slot] = 0.0;
+                        }
+                    }
+                }
+                for bi in 0..hp.block_size {
+                    mask[qi * n_keys + cache.ring + bi] = 0.0;
+                }
+            }
+            ffi::ggml_backend_tensor_set(g.kq_mask, mask.as_ptr().cast(), 0, mask.len() * 4);
+
+            self.compute(g.gf, n_threads)?;
+
+            let mut cand_ids = vec![0i32; hp.block_size * hp.selector_top_k];
+            ffi::ggml_backend_tensor_get(
+                g.cand,
+                cand_ids.as_mut_ptr().cast(),
+                0,
+                cand_ids.len() * 4,
+            );
+            let k = hp.selector_top_k;
+            let mut lat = Lattice {
+                cand: (0..hp.block_size)
+                    .map(|p| cand_ids[p * k..(p + 1) * k].iter().map(|&x| x as u32).collect())
+                    .collect(),
+                scores: vec![Vec::new(); hp.block_size],
+                top_k: k,
+            };
+            for (i, t) in g.packed.iter().enumerate() {
+                let mut sc = vec![0f32; k * k];
+                ffi::ggml_backend_tensor_get(*t, sc.as_mut_ptr().cast(), 0, sc.len() * 4);
+                lat.scores[i + 1] = sc;
+            }
+            Ok(lat)
+        }
+    }
+
+    fn build_draft(&self, cache: &DflashCache) -> Result<CachedDraftGraph, ModelError> {
         let hp = &self.hp;
         let b = hp.block_size as i64;
         let top_k = hp.selector_top_k as i64;
@@ -447,20 +584,12 @@ impl Dflash {
             };
             let ctx = ffi::ggml_init(params);
             let gf = ffi::ggml_new_graph_custom(ctx, graph_nodes, false);
-            struct G(*mut ffi::ggml_context);
-            impl Drop for G {
-                fn drop(&mut self) {
-                    unsafe { ffi::ggml_free(self.0) }
-                }
-            }
-            let _g = G(ctx);
             let f32t = ffi::ggml_type_GGML_TYPE_F32;
 
             let inp_tokens = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I32, b);
             ffi::ggml_set_input(inp_tokens);
             let inp_pos = ffi::ggml_new_tensor_1d(ctx, ffi::ggml_type_GGML_TYPE_I32, b);
             ffi::ggml_set_input(inp_pos);
-            // keys: the whole ring plus the in-batch block; mask selects
             let n_kv = cache.ring as i64;
             let kq_mask = ffi::ggml_new_tensor_2d(ctx, f32t, n_kv + b, b);
             ffi::ggml_set_input(kq_mask);
@@ -474,16 +603,12 @@ impl Dflash {
 
             let mut inp_l = ffi::ggml_get_rows(ctx, self.tok_embd, inp_tokens);
 
-            // grouped dynamic conv, block-internal shift (reference
-            // build_dflash2_conv with n_blocks = 1)
             let conv = |ctx: *mut ffi::ggml_context,
-                        gf: *mut ffi::ggml_cgraph,
                         hidden: *mut ffi::ggml_tensor,
                         dynamic: *mut ffi::ggml_tensor,
                         base: *mut ffi::ggml_tensor,
                         side: i64|
              -> *mut ffi::ggml_tensor {
-                let _ = gf;
                 let n_embd = hp.n_embd;
                 let n_groups = n_embd / hp.conv_group;
                 let kernel = hp.conv_kernel;
@@ -491,7 +616,6 @@ impl Dflash {
                 let coeffs = ffi::ggml_reshape_4d(ctx, dynamic, n_groups, kernel, 2, b);
                 let mut result: *mut ffi::ggml_tensor = std::ptr::null_mut();
                 for tap in 0..kernel {
-                    // values: hidden shifted down `tap` positions inside the block
                     let values = if tap == 0 {
                         hidden
                     } else {
@@ -521,8 +645,6 @@ impl Dflash {
                             zeros
                         }
                     };
-                    // coeff for this tap/side: [n_groups] per token -> repeat
-                    // to n_embd rows
                     let c4 = coeffs;
                     let coeff = ffi::ggml_cont(
                         ctx,
@@ -540,7 +662,6 @@ impl Dflash {
                         ffi::ggml_new_tensor_3d(ctx, f32t, hp.conv_group, n_groups, b);
                     let coeff = ffi::ggml_repeat(ctx, coeff, grouped_shape);
                     let coeff = ffi::ggml_reshape_2d(ctx, coeff, n_embd, b);
-                    // static base for this tap/side: [n_embd]
                     let base_tap = ffi::ggml_view_1d(
                         ctx,
                         base,
@@ -564,7 +685,7 @@ impl Dflash {
                 let residual = inp_l;
                 let mut x = rms(ctx, inp_l, self.blk(il, "attn_norm.weight")?);
                 let dynamic = ffi::ggml_mul_mat(ctx, self.blk(il, "attn_conv_proj.weight")?, x);
-                x = conv(ctx, gf, x, dynamic, self.blk(il, "attn_conv_base")?, 0);
+                x = conv(ctx, x, dynamic, self.blk(il, "attn_conv_base")?, 0);
 
                 let mut q = ffi::ggml_mul_mat(ctx, self.blk(il, "attn_q.weight")?, x);
                 let mut k = ffi::ggml_mul_mat(ctx, self.blk(il, "attn_k.weight")?, x);
@@ -593,7 +714,6 @@ impl Dflash {
                 q = rope(ctx, q);
                 k = rope(ctx, k);
 
-                // keys/values = cached ring (f16 -> f32) ++ this block
                 let kv_dim = hp.head_dim * hp.n_head_kv;
                 let ring_k = ffi::ggml_cast(ctx, cache.k[il], f32t);
                 let ring_v = ffi::ggml_cast(ctx, cache.v[il], f32t);
@@ -628,25 +748,24 @@ impl Dflash {
                 let mut o = ffi::ggml_permute(ctx, kqv, 0, 2, 1, 3);
                 o = ffi::ggml_cont_2d(ctx, o, hp.head_dim * hp.n_head, b);
                 o = ffi::ggml_mul_mat(ctx, self.blk(il, "attn_output.weight")?, o);
-                o = conv(ctx, gf, o, dynamic, self.blk(il, "attn_conv_base")?, 1);
+                o = conv(ctx, o, dynamic, self.blk(il, "attn_conv_base")?, 1);
 
                 let ffn_inp = ffi::ggml_add(ctx, o, residual);
                 let mut f = rms(ctx, ffn_inp, self.blk(il, "ffn_norm.weight")?);
                 let ffn_dynamic =
                     ffi::ggml_mul_mat(ctx, self.blk(il, "ffn_conv_proj.weight")?, f);
-                f = conv(ctx, gf, f, ffn_dynamic, self.blk(il, "ffn_conv_base")?, 0);
+                f = conv(ctx, f, ffn_dynamic, self.blk(il, "ffn_conv_base")?, 0);
                 let up = ffi::ggml_mul_mat(ctx, self.blk(il, "ffn_up.weight")?, f);
                 let gate = ffi::ggml_mul_mat(ctx, self.blk(il, "ffn_gate.weight")?, f);
                 let act = ffi::ggml_mul(ctx, ffi::ggml_silu(ctx, gate), up);
                 let mut down = ffi::ggml_mul_mat(ctx, self.blk(il, "ffn_down.weight")?, act);
-                down = conv(ctx, gf, down, ffn_dynamic, self.blk(il, "ffn_conv_base")?, 1);
+                down = conv(ctx, down, ffn_dynamic, self.blk(il, "ffn_conv_base")?, 1);
                 inp_l = ffi::ggml_add(ctx, down, ffn_inp);
             }
 
             let h_out = rms(ctx, inp_l, self.t("output_norm.weight")?);
             let logits = ffi::ggml_mul_mat(ctx, self.output, h_out);
 
-            // selector lattice
             let cand = ffi::ggml_top_k(ctx, logits, top_k as i32);
             ffi::ggml_set_output(cand);
             ffi::ggml_build_forward_expand(gf, cand);
@@ -657,8 +776,7 @@ impl Dflash {
                 ffi::ggml_reshape_2d(ctx, cand, top_k, b),
             );
             let unary = ffi::ggml_reshape_2d(ctx, unary, top_k, b);
-            let hidden =
-                ffi::ggml_mul_mat(ctx, self.t("selector_hidden.weight")?, h_out); // [rank, b]
+            let hidden = ffi::ggml_mul_mat(ctx, self.t("selector_hidden.weight")?, h_out);
 
             let sel_prev = self.t("selector_predecessor.weight")?;
             let sel_next = self.t("selector_successor.weight")?;
@@ -671,7 +789,7 @@ impl Dflash {
                     ctx,
                     ffi::ggml_view_1d(ctx, cand, top_k, (pos as usize) * (*cand).nb[1]),
                 );
-                let successor = ffi::ggml_get_rows(ctx, sel_next, ids_pos); // [rank, k]
+                let successor = ffi::ggml_get_rows(ctx, sel_next, ids_pos);
                 let hidden_pos = ffi::ggml_view_2d(
                     ctx,
                     hidden,
@@ -681,7 +799,7 @@ impl Dflash {
                     (pos as usize) * (*hidden).nb[1],
                 );
                 let predecessor = if pos == 1 {
-                    ffi::ggml_get_rows(ctx, sel_prev, anchor_ids) // [rank, 1]
+                    ffi::ggml_get_rows(ctx, sel_prev, anchor_ids)
                 } else {
                     let prev_ids = ffi::ggml_cont(
                         ctx,
@@ -692,14 +810,14 @@ impl Dflash {
                             (pos as usize - 1) * (*cand).nb[1],
                         ),
                     );
-                    ffi::ggml_get_rows(ctx, sel_prev, prev_ids) // [rank, k]
+                    ffi::ggml_get_rows(ctx, sel_prev, prev_ids)
                 };
                 let conditioned = ffi::ggml_mul(
                     ctx,
                     predecessor,
                     ffi::ggml_repeat(ctx, hidden_pos, predecessor),
                 );
-                let mut scores = ffi::ggml_mul_mat(ctx, successor, conditioned); // [k, P]
+                let mut scores = ffi::ggml_mul_mat(ctx, successor, conditioned);
                 if pos == 1 {
                     scores = ffi::ggml_repeat_4d(ctx, scores, top_k, top_k, 1, 1);
                 }
@@ -711,7 +829,6 @@ impl Dflash {
                     ffi::ggml_row_size(f32t, top_k),
                     (pos as usize) * (*unary).nb[1],
                 );
-                // scores[succ j, pred i] += unary[j]
                 let scores = ffi::ggml_add(
                     ctx,
                     scores,
@@ -727,82 +844,18 @@ impl Dflash {
                 packed.push(flat);
             }
 
-            if !ffi::ggml_gallocr_alloc_graph(cache.galloc, gf) {
+            let galloc = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
+                self.backend,
+            ));
+            if galloc.is_null() || !ffi::ggml_gallocr_alloc_graph(galloc, gf) {
+                if !galloc.is_null() {
+                    ffi::ggml_gallocr_free(galloc);
+                }
+                ffi::ggml_free(ctx);
                 return Err(ModelError::Load("dflash draft alloc".into()));
             }
-
-            // inputs
-            let mut toks = vec![hp.mask_token as i32; hp.block_size];
-            toks[0] = anchor as i32;
-            ffi::ggml_backend_tensor_set(inp_tokens, toks.as_ptr().cast(), 0, toks.len() * 4);
-            let pos: Vec<i32> = (0..hp.block_size).map(|i| (pos0 + i) as i32).collect();
-            ffi::ggml_backend_tensor_set(inp_pos, pos.as_ptr().cast(), 0, pos.len() * 4);
-
-            // mask: ring slots hold positions in (n_seen - ring, n_seen);
-            // a key at position pk is visible to query at position pq iff
-            // pk < pos0 (already injected; the block itself provides pos0..)
-            // and pq - pk < n_swa. Block keys are all mutually visible.
-            let n_keys = (cache.ring + hp.block_size) as usize;
-            let mut mask = vec![f32::NEG_INFINITY; n_keys * hp.block_size];
-            for qi in 0..hp.block_size {
-                let pq = pos0 + qi;
-                for s in 0..cache.ring {
-                    // the position currently held by ring slot s
-                    let held = if cache.n_seen == 0 {
-                        None
-                    } else {
-                        let top = cache.n_seen - 1;
-                        let cand = top - ((top + cache.ring - s) % cache.ring);
-                        // cand is the largest pos <= top with pos % ring == s
-                        if cand + cache.ring > cache.n_seen || cand > top {
-                            Some(cand)
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(pk) = held {
-                        if pk < pos0 && pq >= pk && (pq - pk) < hp.n_swa as usize {
-                            mask[qi * n_keys + s] = 0.0;
-                        }
-                    }
-                }
-                for bi in 0..hp.block_size {
-                    mask[qi * n_keys + cache.ring + bi] = 0.0;
-                }
-            }
-            ffi::ggml_backend_tensor_set(kq_mask, mask.as_ptr().cast(), 0, mask.len() * 4);
-
-            self.compute(gf, n_threads)?;
-
-            // readback
-            let mut cand_ids = vec![0i32; hp.block_size * hp.selector_top_k];
-            ffi::ggml_backend_tensor_get(
-                cand,
-                cand_ids.as_mut_ptr().cast(),
-                0,
-                cand_ids.len() * 4,
-            );
-            let k = hp.selector_top_k;
-            let mut lat = Lattice {
-                cand: (0..hp.block_size)
-                    .map(|p| cand_ids[p * k..(p + 1) * k].iter().map(|&x| x as u32).collect())
-                    .collect(),
-                scores: vec![Vec::new(); hp.block_size],
-                top_k: k,
-            };
-            for (i, t) in packed.iter().enumerate() {
-                let mut s = vec![0f32; k * k];
-                ffi::ggml_backend_tensor_get(*t, s.as_mut_ptr().cast(), 0, s.len() * 4);
-                // graph layout: [succ, pred]; host walk wants pred-major rows
-                let mut rows = vec![0f32; k * k];
-                for pred in 0..k {
-                    for succ in 0..k {
-                        rows[pred * k + succ] = s[pred * k + succ];
-                    }
-                }
-                lat.scores[i + 1] = rows;
-            }
-            Ok(lat)
+            ffi::ggml_graph_set_new_uid(gf);
+            Ok(CachedDraftGraph { ctx, gf, galloc, inp_tokens, inp_pos, kq_mask, cand, packed })
         }
     }
 

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::Arc;
 
+use codpiece_model::dflash::{Dflash, DflashCache};
 use codpiece_model::qwen35::{Qwen35, Session};
 use codpiece_sample::{Sampler, SamplerParams};
 use codpiece_vision::preprocess::{PreparedImage, Preprocessor};
@@ -185,6 +186,8 @@ pub struct Stats {
 
 pub struct EngineConfig {
     pub model_path: String,
+    /// DFlash2 draft model (GGUF); None keeps the MTP-head drafter.
+    pub dflash: Option<String>,
     /// Vision tower (mmproj GGUF); None serves text only.
     pub mmproj: Option<String>,
     /// Device for the vision tower: a CUDA ordinal, or None for the CPU.
@@ -334,13 +337,34 @@ fn worker(
         (None, Some(i)) => codpiece_model::Device::Cuda(i),
         (None, None) => codpiece_model::Device::Cpu,
     };
-    let model = match Qwen35::load_on(std::path::Path::new(&cfg.model_path), device) {
+    let mut model = match Qwen35::load_on(std::path::Path::new(&cfg.model_path), device) {
         Ok(m) => m,
         Err(e) => {
             let _ = ready.send(Err(format!("load: {e}")));
             return;
         }
     };
+    // The drafter loads into the trunk's backend and turns on the trunk's
+    // layer taps — BEFORE any session or graph exists, so every shape is
+    // built with the taps attached.
+    let dflash: Option<Dflash> = match &cfg.dflash {
+        Some(p) => match Dflash::load_into(&mut model, std::path::Path::new(p)) {
+            Ok(d) => {
+                model.tap_layers = d.hp.target_layers.clone();
+                eprintln!(
+                    "serve: DFlash2 drafter up ({} layers, block {}, window {}, taps {:?})",
+                    d.hp.n_layer, d.hp.block_size, d.hp.n_swa, d.hp.target_layers
+                );
+                Some(d)
+            }
+            Err(e) => {
+                let _ = ready.send(Err(format!("dflash: {e}")));
+                return;
+            }
+        },
+        None => None,
+    };
+    let model = model;
     let tok = match codpiece_tok::Tokenizer::from_gguf(&model.weights.gguf) {
         Ok(t) => t,
         Err(e) => {
@@ -414,13 +438,15 @@ fn worker(
     // Not every model has a draft head; without one the fused round cannot be built and
     // decoding falls back to one token per step.
     // depth 0 means the caller asked for no speculation at all
-    let can_speculate = model.has_mtp() && cfg.depth != 0;
+    let can_speculate = dflash.is_some() || (model.has_mtp() && cfg.depth != 0);
     if !can_speculate {
         eprintln!("serve: model has no MTP head; decoding without speculation");
     }
     let slots = if cfg.depth == usize::MAX { cfg.max_depth } else { cfg.depth }
         .max(cfg.max_depth)
-        .max(1);
+        .max(1)
+        // a rejected DFlash block rolls back up to block_size-1 tokens
+        .max(dflash.as_ref().map(|d| d.hp.block_size - 1).unwrap_or(0));
     let session = match Session::new_spec(&model, cfg.n_ctx, slots) {
         Ok(s) => s,
         Err(e) => {
@@ -454,6 +480,12 @@ fn worker(
         }
     }
     eprintln!("serve: {} session slot(s)", pool.len());
+    let mut dcaches: Vec<Option<DflashCache>> = (0..pool.len())
+        .map(|_| match &dflash {
+            Some(d) => d.new_cache().ok(),
+            None => None,
+        })
+        .collect();
     let mut store = SessionStore::new();
     let mut clock = 0u64;
     // The batch session is created the first time two requests overlap: it costs
@@ -545,9 +577,10 @@ fn worker(
             });
         let (session, history, used) = &mut pool[slot];
         *used = clock;
+        let dcache = &mut dcaches[slot];
         let outcome = run_job(
-            &model, &tok, &cfg, vision.as_ref(), session, history, &mut store, can_speculate,
-            job, &stats,
+            &model, &tok, &cfg, vision.as_ref(), dflash.as_ref(), dcache, session, history,
+            &mut store, can_speculate, job, &stats,
         );
         // Drop the busy flag *before* the client is told the request finished. A client
         // that polls /slots the instant it has its answer — which is exactly what the
@@ -821,6 +854,8 @@ fn run_job(
     tok: &codpiece_tok::Tokenizer,
     cfg: &EngineConfig,
     vision: Option<&VisionCtx>,
+    dflash: Option<&Dflash>,
+    dcache: &mut Option<DflashCache>,
     session: &mut Session,
     history: &mut Vec<u32>,
     store: &mut SessionStore,
@@ -878,6 +913,12 @@ fn run_job(
             session.restore(&hit.snap);
             history.extend_from_slice(&hit.history);
         }
+        // the draft ring belonged to whatever conversation this session held
+        // before; n_seen = 0 makes its mask hide everything until this
+        // conversation's features refill the window
+        if let Some(c) = dcache.as_mut() {
+            c.n_seen = 0;
+        }
     }
     let cached_n = history.len();
 
@@ -893,6 +934,38 @@ fn run_job(
     // sampler likewise sees only the text chunks
     let text_ids: Vec<u32> = prompt_ids.iter().copied().filter(|&t| t < 0x8000_0000).collect();
     sampler.accept_all(&text_ids);
+    // DFlash2 drafter mode — GREEDY requests only. Measured split: the
+    // block drafter wins structured greedy text by 30-37% (code 85 vs 65,
+    // arithmetic 115 vs 84 tok/s) but loses temperature sampling to the
+    // gumbel-coupled chain (45.6 vs 49.5): a sampled commit lands on a
+    // draft with the target's own probability of it, and block positions
+    // past ~3 compound to nothing on flat text while still paying vocab
+    // noise and a wide verify. Sampled requests keep the chain path, which
+    // also keeps the MTP cache warm exactly where it is used.
+    let df_mode = dflash.is_some() && dcache.is_some() && greedy;
+    let df_nmax: usize = std::env::var("CODPIECE_DFLASH_NMAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| dflash.map(|d| d.hp.block_size - 1).unwrap_or(0));
+    let df_nmin: usize = std::env::var("CODPIECE_DFLASH_NMIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    // At temperature a draft lands with the target's own probability of it,
+    // so deep block positions compound to nothing on flat text — and every
+    // extra batch row also costs a vocab of gumbel noise. Same economics as
+    // the MTP chain clamp.
+    let df_cap = if greedy {
+        df_nmax
+    } else {
+        df_nmax.min(
+            std::env::var("CODPIECE_DFLASH_NMAX_SAMPLED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+        )
+    };
+
 
     let mut text = String::new();
     let mut emitted = 0usize; // bytes of `text` already sent
@@ -965,6 +1038,12 @@ fn run_job(
                 model
                     .step_embd(session, &emb, nx, ny, cfg.threads)
                     .map_err(|e| format!("vision inject: {e}"))?;
+                if df_mode {
+                    let (dm, c) = (dflash.unwrap(), dcache.as_mut().unwrap());
+                    let base = session.n_past - nx * ny;
+                    dm.inject(c, &session.last_taps, base, cfg.threads)
+                        .map_err(|e| format!("dflash inject: {e}"))?;
+                }
             }
             Seg::Text(r) => {
                 let lo = r.start.max(cached_n);
@@ -988,6 +1067,12 @@ fn run_job(
                             return Err(format!("prefill: {e}"));
                         }
                     }
+                    if df_mode {
+                        let (dm, c) = (dflash.unwrap(), dcache.as_mut().unwrap());
+                        let base = session.n_past - chunk.len();
+                        dm.inject(c, &session.last_taps, base, cfg.threads)
+                            .map_err(|e| format!("dflash inject: {e}"))?;
+                    }
                 }
             }
         }
@@ -995,7 +1080,13 @@ fn run_job(
     if can_speculate {
         let tail = &prompt_ids[split..];
         debug_assert!(!tail.is_empty());
-        let d0 = if cfg.depth == usize::MAX { cfg.max_depth } else { cfg.depth };
+        let d0 = if df_mode {
+            0
+        } else if cfg.depth == usize::MAX {
+            cfg.max_depth
+        } else {
+            cfg.depth
+        };
         match model.step_fused_cached(session, tail, d0, None, false, !greedy, None, cfg.threads)
         {
             Ok(o) => {
@@ -1013,6 +1104,23 @@ fn run_job(
             }
             Err(e) => {
                 return Err(format!("prefill: {e}"));
+            }
+        }
+        if df_mode {
+            let (dm, c) = (dflash.unwrap(), dcache.as_mut().unwrap());
+            dm.inject(c, &session.last_taps, session.n_past - tail.len(), cfg.threads)
+                .map_err(|e| format!("dflash inject: {e}"))?;
+            let lat = dm
+                .draft_block(c, next, session.n_past, cfg.threads)
+                .map_err(|e| format!("dflash draft: {e}"))?;
+            // ALWAYS the greedy walk, even at temperature: coupled
+            // verification accepts draft x with probability p_trunk(x), so
+            // the optimal draft is the mode — a temperature walk only
+            // decorrelates the draft from the commit (measured: acceptance
+            // 0.119 sampled-walk vs ~0.5 greedy-walk on the same text).
+            drafts = lat.walk_greedy(df_cap);
+            if drafts.len() < df_nmin {
+                drafts.clear();
             }
         }
     }
@@ -1075,7 +1183,8 @@ fn run_job(
             .depth
             .clamp(1, 2)
             .max(redraft_rows)
-            .max(req.think_close.len());
+            .max(req.think_close.len())
+            .max(df_cap);
         let seed = req.params.seed ^ 0x9E37_79B9_7F4A_7C15;
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
         std::thread::Builder::new()
@@ -1240,10 +1349,11 @@ fn run_job(
             noise_t.truncate(batch.len() * n_vocab);
         }
         let t_round = std::time::Instant::now();
+        let round_chain = if df_mode { 0 } else { round_depth };
         let out_round = match model.step_fused_cached(
             session,
             &batch,
-            round_depth,
+            round_chain,
             None,
             false,
             !greedy,
@@ -1312,7 +1422,9 @@ fn run_job(
             sampler.accept(*draft);
         }
         accepted += n_keep;
-        if !forcing {
+        if !forcing && !df_mode {
+            // the depth picker prices MTP chain depths; DFlash rounds are
+            // verify-only and can be wider than its bookkeeping
             picker.observe(round_drafts.len(), round_depth, n_keep, round_secs);
         }
 
@@ -1443,13 +1555,38 @@ fn run_job(
         // exactly the tokens that stayed in the caches this round
         history.extend_from_slice(&batch[..n_keep + 1]);
 
+        if df_mode && !forcing {
+            let (dm, c) = (dflash.unwrap(), dcache.as_mut().unwrap());
+            let committed = n_keep + 1;
+            let n_feat = dm.hp.n_feat() as usize;
+            dm.inject(
+                c,
+                &session.last_taps[..committed * n_feat],
+                session.n_past - committed,
+                cfg.threads,
+            )
+            .map_err(|e| format!("dflash inject: {e}"))?;
+            let lat = dm
+                .draft_block(c, next, session.n_past, cfg.threads)
+                .map_err(|e| format!("dflash draft: {e}"))?;
+            // ALWAYS the greedy walk, even at temperature: coupled
+            // verification accepts draft x with probability p_trunk(x), so
+            // the optimal draft is the mode — a temperature walk only
+            // decorrelates the draft from the commit (measured: acceptance
+            // 0.119 sampled-walk vs ~0.5 greedy-walk on the same text).
+            drafts = lat.walk_greedy(df_cap);
+            if drafts.len() < df_nmin {
+                drafts.clear();
+            }
+        }
+
         // Post-commit re-draft: when the sampled token diverged from the argmax the
         // in-graph chain assumed, the chain's drafts were dropped — and without this,
         // the next round commits a single token for a full weight read. Re-drafting
         // from the token actually committed keeps speculation alive on sampled
         // requests; it is exactly what the standalone spec path always did, priced at
         // one draft-head pass (~6 ms) per chain link, and only on divergent rounds.
-        if !greedy && drafts.is_empty() && !forcing && redraft_depth > 0 {
+        if !greedy && drafts.is_empty() && !forcing && redraft_depth > 0 && !df_mode {
             let base = n_keep * n_embd;
             let mut h = hidden[base..base + n_embd].to_vec();
             let mut tok_in = next;

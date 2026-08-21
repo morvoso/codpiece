@@ -24,6 +24,8 @@ pub struct ServeConfig {
     pub draft_gate: f32,
     /// Vision tower (mmproj GGUF path); None serves text only.
     pub mmproj: Option<String>,
+    /// DFlash2 draft model (GGUF path); None keeps the MTP drafter.
+    pub dflash: Option<String>,
     /// CUDA ordinal for the vision tower; None runs it on the CPU.
     pub mmproj_gpu: Option<i32>,
     pub default_max_tokens: usize,
@@ -45,6 +47,7 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
         draft_gate: cfg.draft_gate,
         mmproj: cfg.mmproj.clone(),
         mmproj_gpu: cfg.mmproj_gpu,
+        dflash: cfg.dflash.clone(),
     })?;
 
     // A template that fails to parse is worth saying out loud rather than silently

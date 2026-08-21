@@ -86,7 +86,7 @@ fn cmd_dflash_test(args: &[String]) -> ExitCode {
             .collect();
         dfl.inject(&mut cache, &feats, 0, 8).map_err(|e| format!("{e:?}"))?;
         let lat = dfl
-            .draft_block(&cache, 9906, t, 8)
+            .draft_block(&mut cache, 9906, t, 8)
             .map_err(|e| format!("{e:?}"))?;
         for (p, c) in lat.cand.iter().enumerate().take(3) {
             eprintln!("  pos {p}: cand[0..4] = {:?}", &c[..4]);
@@ -456,6 +456,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let mut tp: Option<Vec<i32>> = None;
     let mut mmproj: Option<String> = None;
     let mut mmproj_gpu: Option<i32> = None;
+    let mut dflash: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -482,6 +483,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             "--mmproj-gpu" => {
                 mmproj_gpu = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or(0))
             }
+            "--dflash" => dflash = it.next().cloned(),
             "--tp" => {
                 tp = it.next().map(|v| {
                     v.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect::<Vec<_>>()
@@ -507,10 +509,12 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let mmproj = mmproj.or_else(|| std::env::var("CODPIECE_MMPROJ").ok().filter(|s| !s.is_empty()));
     let mmproj_gpu = mmproj_gpu
         .or_else(|| std::env::var("CODPIECE_MMPROJ_GPU").ok().and_then(|s| s.parse().ok()));
+    let dflash = dflash.or_else(|| std::env::var("CODPIECE_DFLASH").ok().filter(|s| !s.is_empty()));
     match codpiece_server::run(codpiece_server::ServeConfig {
         model_path: path.to_string(),
         mmproj,
         mmproj_gpu,
+        dflash,
         host,
         port,
         n_ctx,
