@@ -715,6 +715,29 @@ impl Session {
         }
     }
 
+    /// Evict the least-recently-used cached graph shape, freeing its device
+    /// buffer. Returns false when the cache is empty. Used when a graph
+    /// allocation fails: cached shapes are pure caches, and failing a request
+    /// while holding evictable memory would be refusing work to keep a
+    /// convenience.
+    pub fn evict_one_graph(&mut self) -> bool {
+        let Some(victim) = self
+            .fused
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, c)| c.used)
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        let c = self.fused.remove(victim);
+        unsafe {
+            ffi::ggml_gallocr_free(c.galloc);
+        }
+        self.graveyard.push(c.built.ctx);
+        true
+    }
+
     pub fn reset(&mut self) {
         unsafe {
             ffi::ggml_backend_buffer_clear(self.buffer, 0);
@@ -1772,12 +1795,27 @@ impl Qwen35 {
                     let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                         self.weights.backend(),
                     ));
-                    if ga.is_null() || !ffi::ggml_gallocr_alloc_graph(ga, built.gf) {
-                        return Err(ModelError::Load(format!(
-                            "fused graph alloc failed (t_len {t_len}, depth {depth}, \
-                             {} shapes cached) — likely out of device memory",
+                    if ga.is_null() {
+                        return Err(ModelError::Load("fused gallocr".into()));
+                    }
+                    // An alloc failure while cached shapes exist is not an
+                    // error yet: they are caches. Evict LRU shapes one at a
+                    // time and retry; only a failure with nothing left to
+                    // evict is real memory pressure. Observed in production
+                    // as a mid-conversation 500 with 8 shapes cached.
+                    while !ffi::ggml_gallocr_alloc_graph(ga, built.gf) {
+                        if !session.evict_one_graph() {
+                            ffi::ggml_gallocr_free(ga);
+                            return Err(ModelError::Load(format!(
+                                "fused graph alloc failed (t_len {t_len}, depth {depth}) \
+                                 with the graph cache already empty — out of device memory"
+                            )));
+                        }
+                        eprintln!(
+                            "serve: graph alloc retry after evicting a cached shape \
+                             ({} left)",
                             session.fused.len()
-                        )));
+                        );
                     }
                     trace_mem("fused", ga, bucket, t_len);
                     // Frozen from here on: give it an identity so the backend can tell
@@ -2090,8 +2128,17 @@ impl Qwen35 {
                 let ga = ffi::ggml_gallocr_new(ffi::ggml_backend_get_default_buffer_type(
                     self.weights.backend(),
                 ));
-                if ga.is_null() || !ffi::ggml_gallocr_alloc_graph(ga, g.gf) {
-                    return Err(ModelError::Load("mtp graph alloc".into()));
+                if ga.is_null() {
+                    return Err(ModelError::Load("mtp gallocr".into()));
+                }
+                while !ffi::ggml_gallocr_alloc_graph(ga, g.gf) {
+                    if !session.evict_one_graph() {
+                        ffi::ggml_gallocr_free(ga);
+                        return Err(ModelError::Load(
+                            "mtp graph alloc failed with the graph cache empty".into(),
+                        ));
+                    }
+                    eprintln!("serve: mtp graph alloc retry after evicting a cached shape");
                 }
                 // frozen shape: let the backend recognise replays (uid 0 would force a
                 // per-device rebuild every call)
@@ -2263,10 +2310,15 @@ impl Qwen35 {
                     ffi::ggml_free(built.ctx);
                     return Err(ModelError::Load("decode gallocr".into()));
                 }
-                if !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
-                    ffi::ggml_gallocr_free(galloc);
-                    ffi::ggml_free(built.ctx);
-                    return Err(ModelError::Load("decode graph alloc".into()));
+                while !ffi::ggml_gallocr_alloc_graph(galloc, built.gf) {
+                    if !session.evict_one_graph() {
+                        ffi::ggml_gallocr_free(galloc);
+                        ffi::ggml_free(built.ctx);
+                        return Err(ModelError::Load(
+                            "decode graph alloc failed with the graph cache empty".into(),
+                        ));
+                    }
+                    eprintln!("serve: decode graph alloc retry after evicting a cached shape");
                 }
                 trace_mem("decode", galloc, bucket, t_len);
                 ffi::ggml_graph_set_new_uid(built.gf);
