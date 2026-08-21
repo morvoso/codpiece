@@ -175,6 +175,26 @@ impl SamplingFields {
             None => vec![],
         }
     }
+
+    /// True when the client expressed no opinion about sampling at all. Only
+    /// then may the model's own recommendation be substituted — a request that
+    /// asked for temperature 0 means it.
+    fn unspecified(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.min_p.is_none()
+    }
+
+    fn params_for_thinking(&self, model: Option<ModelSampling>) -> SamplerParams {
+        let mut p = self.params();
+        if let Some(m) = model.filter(|_| self.unspecified()) {
+            p.temp = m.temp;
+            p.top_k = m.top_k;
+            p.top_p = m.top_p;
+        }
+        p
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,8 +237,31 @@ struct ChatBody {
     sampling: SamplingFields,
 }
 
+/// The sampling the model itself recommends, from `general.sampling.*`.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelSampling {
+    pub temp: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+}
+
+impl ModelSampling {
+    pub fn from_gguf(g: &codpiece_gguf::GgufFile) -> Option<Self> {
+        let f = |k: &str| g.kv(k).and_then(|v| v.as_f64());
+        // temperature is the one that matters; the filters are optional
+        let temp = f("general.sampling.temp")? as f32;
+        Some(Self {
+            temp,
+            top_k: f("general.sampling.top_k").unwrap_or(0.0) as usize,
+            top_p: f("general.sampling.top_p").unwrap_or(1.0) as f32,
+        })
+    }
+}
+
 pub struct Ctx {
     pub engine: Engine,
+    /// Applied only to thinking requests that specify no sampling of their own.
+    pub model_sampling: Option<ModelSampling>,
     /// The tokenization of the think-block close, computed once. `<think>` opens the
     /// generation prompt, so the model only has to emit the closer.
     pub think_close: Vec<u32>,
@@ -388,7 +431,11 @@ pub fn handle(ctx: &Ctx, req: &Request, w: &mut TcpStream) -> std::io::Result<()
                 prompt,
                 prompt_ids: None,
                 images,
-                params: body.sampling.params(),
+                params: if thinking {
+                    body.sampling.params_for_thinking(ctx.model_sampling)
+                } else {
+                    body.sampling.params()
+                },
                 max_tokens: body.sampling.max_tokens(ctx.default_max_tokens),
                 stop: body.sampling.stop(),
                 ignore_eos: body.sampling.ignore_eos.unwrap_or(false),
@@ -799,5 +846,43 @@ mod tests {
         let (r, c) = run(&["plain ", "text</think>still plain"], false);
         assert_eq!(r, "");
         assert_eq!(c, "plain text</think>still plain");
+    }
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    use super::*;
+
+    fn fields(json: &str) -> SamplingFields {
+        serde_json::from_str(json).expect("parse")
+    }
+
+    const MODEL: ModelSampling = ModelSampling { temp: 1.0, top_k: 20, top_p: 0.95 };
+
+    #[test]
+    fn thinking_with_no_sampling_adopts_the_models_recommendation() {
+        let p = fields(r#"{}"#).params_for_thinking(Some(MODEL));
+        assert_eq!(p.temp, 1.0);
+        assert_eq!(p.top_k, 20);
+        assert_eq!(p.top_p, 0.95);
+    }
+
+    /// A request that asked for greedy means greedy — benchmarks depend on it.
+    #[test]
+    fn an_explicit_temperature_is_never_overridden() {
+        let p = fields(r#"{"temperature": 0}"#).params_for_thinking(Some(MODEL));
+        assert_eq!(p.temp, 0.0);
+        assert_eq!(p.top_k, 0);
+        // any one sampling field is enough to mean "I chose these"
+        let p = fields(r#"{"top_p": 0.5}"#).params_for_thinking(Some(MODEL));
+        assert_eq!(p.temp, 0.0);
+        assert_eq!(p.top_p, 0.5);
+    }
+
+    #[test]
+    fn a_model_without_recommendations_stays_greedy() {
+        let p = fields(r#"{}"#).params_for_thinking(None);
+        assert_eq!(p.temp, 0.0);
+        assert_eq!(p.top_k, 0);
     }
 }

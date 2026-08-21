@@ -1067,6 +1067,45 @@ fn run_score(
     Ok(out)
 }
 
+/// `CODPIECE_DECODE_TRACE=1`: where a single-stream round's time goes —
+/// the verify step against the drafting that follows it — and how many tokens
+/// the round actually committed. Printed every 64 rounds.
+fn decode_trace(
+    verify: f64,
+    draft: std::time::Duration,
+    committed: usize,
+    proposed: usize,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("CODPIECE_DECODE_TRACE").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    static VERIFY: AtomicU64 = AtomicU64::new(0);
+    static DRAFT: AtomicU64 = AtomicU64::new(0);
+    static TOK: AtomicU64 = AtomicU64::new(0);
+    static PROP: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    VERIFY.fetch_add((verify * 1e6) as u64, Relaxed);
+    DRAFT.fetch_add(draft.as_micros() as u64, Relaxed);
+    TOK.fetch_add(committed as u64, Relaxed);
+    PROP.fetch_add(proposed as u64, Relaxed);
+    let n = N.fetch_add(1, Relaxed) + 1;
+    if n % 64 == 0 {
+        let (v, d) = (VERIFY.swap(0, Relaxed), DRAFT.swap(0, Relaxed));
+        let (t, p) = (TOK.swap(0, Relaxed), PROP.swap(0, Relaxed));
+        eprintln!(
+            "[decode-trace] 64 rounds: verify {:.2}ms  draft {:.2}ms  {:.2} tok/round \
+             ({p} proposed, {t} committed) => {:.1} tok/s",
+            v as f64 / 64_000.0,
+            d as f64 / 64_000.0,
+            t as f64 / 64.0,
+            t as f64 * 1e6 / (v + d) as f64,
+        );
+    }
+}
+
 /// Log partition function of one logit row, in f64 with the max subtracted —
 /// the same shape the perplexity path uses, so scores agree between them.
 fn log_z(row: &[f32]) -> f64 {
@@ -1839,6 +1878,7 @@ fn run_job(
         // exactly the tokens that stayed in the caches this round
         history.extend_from_slice(&batch[..n_keep + 1]);
 
+        let t_draft = std::time::Instant::now();
         if df_mode && !forcing {
             let (dm, c) = (dflash.unwrap(), dcache.as_mut().unwrap());
             let committed = n_keep + 1;
@@ -1863,6 +1903,7 @@ fn run_job(
                 drafts.clear();
             }
         }
+        decode_trace(round_secs, t_draft.elapsed(), n_keep + 1, round_drafts.len());
 
         // Post-commit re-draft: when the sampled token diverged from the argmax the
         // in-graph chain assumed, the chain's drafts were dropped — and without this,

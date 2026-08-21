@@ -79,6 +79,23 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
     // `<think>\n` is opened by the generation prompt, so the model only emits the
     // closer; tokenize it once for the budget's forced continuation.
     let think_close = tokenizer.encode("\n</think>\n\n", false);
+
+    // Qwen ships its recommended sampling in the GGUF and warns that greedy
+    // decoding with thinking enabled degrades into repetition. A client that
+    // sends no sampling fields and leaves thinking on would otherwise get
+    // exactly that, so those requests — and only those — adopt the model's
+    // own settings. Everything else stays greedy: deterministic by default is
+    // what keeps benchmarks and the in-graph argmax honest.
+    let model_sampling = api::ModelSampling::from_gguf(&gguf);
+    match &model_sampling {
+        Some(s) => eprintln!(
+            "serve: model recommends temp {} top_k {} top_p {} (applied to thinking \
+             requests that set no sampling fields)",
+            s.temp, s.top_k, s.top_p
+        ),
+        None => eprintln!("serve: model carries no recommended sampling; defaults stay greedy"),
+    }
+
     let ctx = Arc::new(api::Ctx {
         engine,
         tokenizer,
@@ -86,6 +103,7 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
         default_max_tokens: cfg.default_max_tokens,
         think_close,
         think_budget: cfg.think_budget,
+        model_sampling,
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
